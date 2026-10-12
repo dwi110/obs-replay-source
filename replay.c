@@ -2,6 +2,7 @@
 #include <math.h>
 #include <util/platform.h>
 #include "replay.h"
+#include "replay-pool.h"
 
 void free_audio_data(struct replay_filter *filter)
 {
@@ -26,13 +27,14 @@ void free_video_data(struct replay_filter *filter)
 
 void replay_frame_addref(struct obs_source_frame *frame)
 {
-	os_atomic_inc_long(&frame->refs);
+	if (frame)
+		os_atomic_inc_long(&frame->refs);
 }
 
 void replay_frame_release(struct obs_source_frame *frame)
 {
 	if (frame && os_atomic_dec_long(&frame->refs) <= 0)
-		obs_source_frame_destroy(frame);
+		replay_pool_release_frame(frame);
 }
 static inline uint64_t uint64_diff(uint64_t ts1, uint64_t ts2)
 {
@@ -142,6 +144,8 @@ const char *obs_module_author(void)
 void replay_filter_check(void *data)
 {
 	struct replay_filter *filter = data;
+	if (!obs_initialized())
+		return;
 	if (filter->last_check && filter->last_check + 3 * SEC_TO_NSEC > obs_get_video_frame_time())
 		return;
 	filter->last_check = obs_get_video_frame_time();

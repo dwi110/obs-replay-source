@@ -21,6 +21,8 @@
 extern "C" {
 #endif
 
+struct replay_pool;
+
 struct replay_filter {
 
 #if LIBOBS_API_VER >= MAKE_SEMANTIC_VERSION(30, 1, 0)
@@ -60,6 +62,19 @@ struct replay_filter {
 	void *threshold_data;
 	uint64_t last_check;
 	size_t target_offset;
+
+	struct replay_pool *pool;
+	int storage_format;
+	int downscale;
+
+	obs_weak_source_t *tap_parent;
+	volatile bool tap_active;
+	bool tap_checked;
+
+	uint32_t capture_count;
+	uint64_t capture_sum_ns;
+	uint64_t capture_max_ns;
+	uint64_t capture_log_ts;
 };
 
 void free_audio_packet(struct obs_audio_data *audio);
@@ -118,6 +133,16 @@ void replay_filter_check(void *data);
 #define SETTING_AUDIO_THRESHOLD_MAX 0.0f
 #define SETTING_LOAD_SWITCH_SCENE "load_switch_scene"
 #define SETTING_EXECUTE_ACTION "execute_action"
+#define SETTING_STORAGE_FORMAT "storage_format"
+#define STORAGE_FORMAT_NV12 0
+#define STORAGE_FORMAT_ORIGINAL 1
+#define SETTING_DOWNSCALE "downscale"
+#define DOWNSCALE_NONE 0
+#define DOWNSCALE_MAX_1080P 1
+#define SETTING_KEEP_BUFFER "keep_buffer"
+#define SETTING_AUTO_RELEASE "auto_release"
+#define AUTO_RELEASE_NEVER 0
+#define AUTO_RELEASE_DEACTIVATE_HIDE 1
 
 #ifndef SEC_TO_NSEC
 #define SEC_TO_NSEC 1000000000ULL
