@@ -66,6 +66,13 @@ void free_audio_packet(struct obs_audio_data *audio);
 struct obs_audio_data *replay_filter_audio(void *data, struct obs_audio_data *audio);
 void free_video_data(struct replay_filter *filter);
 void free_audio_data(struct replay_filter *filter);
+
+/* Frame ownership: every struct obs_source_frame stored by a replay filter, a loaded
+ * replay or a pending save is referenced through these helpers only. A stored frame
+ * starts with refs == 1; each additional holder calls replay_frame_addref and every
+ * holder drops its reference with replay_frame_release. */
+void replay_frame_addref(struct obs_source_frame *frame);
+void replay_frame_release(struct obs_source_frame *frame);
 void replay_trigger_threshold(void *data);
 void replay_filter_check(void *data);
 

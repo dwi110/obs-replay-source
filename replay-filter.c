@@ -53,10 +53,8 @@ void replay_filter_raw_video(void *data, struct video_data *frame)
 
 		circlebuf_pop_front(&filter->video_frames, NULL, sizeof(struct obs_source_frame *));
 
-		if (os_atomic_dec_long(&output->refs) <= 0) {
-			obs_source_frame_destroy(output);
-			output = NULL;
-		}
+		replay_frame_release(output);
+		output = NULL;
 		if (filter->video_frames.size) {
 			circlebuf_peek_front(&filter->video_frames, &output, sizeof(struct obs_source_frame *));
 			cur_duration = frame->timestamp - output->timestamp;

@@ -546,8 +546,8 @@ static void replay_free_replay(struct replay *replay, struct replay_source *cont
 	}
 	for (uint64_t i = 0; i < replay->video_frame_count; i++) {
 		struct obs_source_frame *frame = replay->video_frames[i];
-		if (frame && os_atomic_dec_long(&frame->refs) <= 0) {
-			obs_source_frame_destroy(frame);
+		if (frame) {
+			replay_frame_release(frame);
 			replay->video_frames[i] = NULL;
 		}
 	}
