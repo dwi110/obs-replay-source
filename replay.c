@@ -107,6 +107,8 @@ extern struct obs_source_info replay_filter_audio_info;
 extern struct obs_source_info replay_filter_async_info;
 extern struct obs_source_info replay_source_info;
 
+#include "replay-save-queue.h"
+
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "[Replay Source] loaded version %s", PROJECT_VERSION);
@@ -114,7 +116,13 @@ bool obs_module_load(void)
 	obs_register_source(&replay_filter_info);
 	obs_register_source(&replay_filter_audio_info);
 	obs_register_source(&replay_filter_async_info);
+	replay_save_queue_init();
 	return true;
+}
+
+void obs_module_unload(void)
+{
+	replay_save_queue_shutdown();
 }
 
 void free_audio_packet(struct obs_audio_data *audio)

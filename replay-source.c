@@ -8,6 +8,7 @@
 #include <media-io/video-scaler.h>
 #include <obs-frontend-api.h>
 #include "replay.h"
+#include "replay-save-queue.h"
 #include <inttypes.h>
 #include <string.h>
 
@@ -136,19 +137,11 @@ struct replay_source {
 	pthread_mutex_t audio_mutex;
 	pthread_mutex_t replay_mutex;
 
-	uint32_t known_width;
-	uint32_t known_height;
-
-	video_t *video_output;
-	obs_output_t *fileOutput;
-	obs_encoder_t *h264Recording;
-	audio_t *audio_t;
-	video_scaler_t *scaler;
 	bool lossless;
 	char *file_format;
 	char *directory;
-	uint64_t start_save_timestamp;
-	obs_encoder_t *aac;
+	char *save_encoder;
+	char *save_container;
 	char *progress_source_name;
 	char *text_source_name;
 	char *text_format;
@@ -620,6 +613,8 @@ static void replay_source_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, SETTING_BACKWARD, false);
 	obs_data_set_default_string(settings, SETTING_FILE_FORMAT, "%CCYY-%MM-%DD %hh.%mm.%ss");
 	obs_data_set_default_bool(settings, SETTING_LOSSLESS, false);
+	obs_data_set_default_string(settings, SETTING_SAVE_ENCODER, SAVE_ENCODER_AUTO);
+	obs_data_set_default_string(settings, SETTING_SAVE_CONTAINER, SAVE_CONTAINER_MP4);
 }
 
 static void replay_source_show(void *data)
@@ -774,286 +769,49 @@ static void replay_pause_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotk
 		replay_play_pause(data, true);
 }
 
-static void InitFileOutputLossless(struct replay_source *context)
-{
-	context->fileOutput = obs_output_create("ffmpeg_output", "replay_ffmpeg_output", NULL, NULL);
-	obs_data_t *foSettings = obs_data_create();
-	obs_data_set_string(foSettings, "format_name", "avi");
-	obs_data_set_string(foSettings, "video_encoder", "utvideo");
-	obs_data_set_string(foSettings, "audio_encoder", "pcm_s16le");
-	obs_output_update(context->fileOutput, foSettings);
-	obs_data_release(foSettings);
-	obs_output_set_media(context->fileOutput, context->video_output, context->audio_t);
-}
-
-static void InitFileOutput(struct replay_source *context)
-{
-	context->fileOutput = obs_output_create("ffmpeg_muxer", "replay_ffmpeg_output", NULL, NULL);
-	context->h264Recording = obs_video_encoder_create("obs_x264", "replay_h264_recording", NULL, NULL);
-	obs_data_t *xsettings = obs_data_create();
-	obs_data_set_int(xsettings, "crf", 23);
-	obs_data_set_bool(xsettings, "use_bufsize", true);
-	obs_data_set_string(xsettings, "rate_control", "CRF");
-	obs_data_set_string(xsettings, "profile", "high");
-	obs_data_set_string(xsettings, "preset", "veryfast");
-	obs_encoder_update(context->h264Recording, xsettings);
-	obs_data_release(xsettings);
-	obs_encoder_set_video(context->h264Recording, context->video_output);
-	obs_output_set_video_encoder(context->fileOutput, context->h264Recording);
-	context->aac = obs_audio_encoder_create("ffmpeg_aac", "aac", NULL, 0, NULL);
-	obs_encoder_set_audio(context->aac, context->audio_t);
-	obs_output_set_audio_encoder(context->fileOutput, context->aac, 0);
-}
-
-static inline size_t convert_time_to_frames(size_t sample_rate, uint64_t t)
-{
-	return (size_t)(t * (uint64_t)sample_rate / 1000000000ULL);
-}
-
-bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end_ts_in, uint64_t *out_ts, uint32_t mixers,
-			  struct audio_output_data *mixes)
-{
-	UNUSED_PARAMETER(mixers);
-	struct replay_source *context = param;
-
-	*out_ts = start_ts_in;
-
-	if (!context->audio_t)
-		return true;
-
-	if (!context->start_save_timestamp || start_ts_in < context->start_save_timestamp)
-		return true;
-
-	uint64_t end_timestamp = context->start_save_timestamp + context->saving_replay.last_frame_timestamp -
-				 context->saving_replay.first_frame_timestamp;
-	if (start_ts_in > end_timestamp)
-		return true;
-
-	size_t channels = audio_output_get_channels(context->audio_t);
-	size_t sample_rate = audio_output_get_sample_rate(context->audio_t);
-
-	pthread_mutex_lock(&context->audio_mutex);
-
-	uint64_t i = 0;
-	uint64_t duration_start = start_ts_in - context->start_save_timestamp;
-	uint64_t duration_end = end_ts_in - context->start_save_timestamp;
-	while (i < context->saving_replay.audio_frame_count &&
-	       context->saving_replay.audio_frames[i].timestamp < context->saving_replay.first_frame_timestamp) {
-		i++;
-	}
-	if (i == context->saving_replay.audio_frame_count) {
-		pthread_mutex_unlock(&context->audio_mutex);
-		return true;
-	}
-
-	while (i < context->saving_replay.audio_frame_count &&
-	       context->saving_replay.audio_frames[i].timestamp - context->saving_replay.first_frame_timestamp < duration_start) {
-		i++;
-	}
-	if (i == context->saving_replay.audio_frame_count) {
-		pthread_mutex_unlock(&context->audio_mutex);
-		return true;
-	}
-	if (i)
-		i--;
-
-	while (i < context->saving_replay.audio_frame_count &&
-	       duration_end >= context->saving_replay.audio_frames[i].timestamp - context->saving_replay.first_frame_timestamp) {
-		size_t total_floats = AUDIO_OUTPUT_FRAMES;
-		size_t start_point = 0;
-		size_t start_point2 = 0;
-		if (context->saving_replay.audio_frames[i].timestamp - context->saving_replay.first_frame_timestamp >
-		    duration_start) {
-			start_point = convert_time_to_frames(sample_rate, context->saving_replay.audio_frames[i].timestamp -
-										  context->saving_replay.first_frame_timestamp -
-										  duration_start);
-			if (start_point >= AUDIO_OUTPUT_FRAMES) {
-				pthread_mutex_unlock(&context->audio_mutex);
-				return true;
-			}
-
-			total_floats -= start_point;
-		} else if (context->saving_replay.audio_frames[i].timestamp - context->saving_replay.first_frame_timestamp <
-			   duration_start) {
-			start_point2 = convert_time_to_frames(sample_rate,
-							      duration_start - (context->saving_replay.audio_frames[i].timestamp -
-										context->saving_replay.first_frame_timestamp));
-			if (start_point2 >= context->saving_replay.audio_frames[i].frames) {
-				i++;
-				continue;
-			}
-		}
-		if (context->saving_replay.audio_frames[i].frames - start_point2 < total_floats) {
-			total_floats = context->saving_replay.audio_frames[i].frames - start_point2;
-		}
-
-		for (size_t mix_idx = 0; mix_idx < MAX_AUDIO_MIXES; mix_idx++) {
-			for (size_t ch = 0; ch < channels; ch++) {
-				register float *mix = mixes[mix_idx].data[ch];
-				register float *aud = (float *)context->saving_replay.audio_frames[i].data[ch];
-				register float *end;
-
-				if (!aud)
-					continue;
-
-				aud += start_point2;
-				mix += start_point;
-				end = aud + total_floats;
-
-				while (aud < end)
-					*(mix++) += *(aud++);
-			}
-		}
-		i++;
-	}
-	pthread_mutex_unlock(&context->audio_mutex);
-
-	return true;
-}
-
 void replay_save(struct replay_source *context)
 {
-	if (context->current_replay.video_frame_count == 0) {
-		context->saving_status = SAVING_STATUS_NONE;
-		return;
-	}
-	if (context->saving_status != SAVING_STATUS_NONE && context->saving_status != SAVING_STATUS_STARTING)
+	if (!context)
 		return;
 
 	pthread_mutex_lock(&context->video_mutex);
+	pthread_mutex_lock(&context->audio_mutex);
 
-	memcpy(&context->saving_replay, &context->current_replay, sizeof context->current_replay);
+	context->saving_status = SAVING_STATUS_NONE;
 
-	const uint32_t width = context->saving_replay.video_frames[0]->width;
-	const uint32_t height = context->saving_replay.video_frames[0]->height;
-	if (context->known_width != width || context->known_height != height) {
-		video_t *t = obs_get_video();
-		const struct video_output_info *ovi = video_output_get_info(t);
-
-		struct video_output_info vi = {0};
-		vi.format = ovi->format;
-		vi.width = width;
-		vi.height = height;
-		vi.fps_den = ovi->fps_den;
-		vi.fps_num = ovi->fps_num;
-		vi.cache_size = 16;
-		vi.colorspace = ovi->colorspace;
-		vi.range = ovi->range;
-		vi.name = "ReplayOutput";
-
-		video_output_close(context->video_output);
-		const int r = video_output_open(&context->video_output, &vi);
-		if (r != VIDEO_OUTPUT_SUCCESS) {
-			context->saving_status = SAVING_STATUS_NONE;
-			pthread_mutex_unlock(&context->video_mutex);
-			if (context->free_after_save) {
-				replay_free_replay(&context->saving_replay, context);
-			}
-			return;
-		}
-
-		context->known_width = width;
-		context->known_height = height;
-
-		if (context->scaler) {
-			video_scaler_destroy(context->scaler);
-			context->scaler = NULL;
-		}
-
-		struct video_scale_info ssi;
-		ssi.format = context->saving_replay.video_frames[0]->format;
-		ssi.colorspace = ovi->colorspace;
-		ssi.range = ovi->range;
-		ssi.width = context->saving_replay.video_frames[0]->width;
-		ssi.height = context->saving_replay.video_frames[0]->height;
-		struct video_scale_info dsi;
-		dsi.format = vi.format;
-		dsi.colorspace = ovi->colorspace;
-		dsi.range = ovi->range;
-		dsi.height = height;
-		dsi.width = width;
-		video_scaler_create(&context->scaler, &dsi, &ssi, VIDEO_SCALE_DEFAULT);
-	}
-	if (!context->audio_t) {
-		struct audio_output_info oi;
-		oi.name = "ReplayAudio";
-		oi.speakers = context->saving_replay.oai.speakers;
-		oi.samples_per_sec = context->saving_replay.oai.samples_per_sec;
-		oi.format = context->saving_replay.oai.format;
-		oi.input_param = context;
-		oi.input_callback = audio_input_callback;
-		const int r = audio_output_open(&context->audio_t, &oi);
-		if (r != AUDIO_OUTPUT_SUCCESS) {
-			context->saving_status = SAVING_STATUS_NONE;
-			pthread_mutex_unlock(&context->video_mutex);
-			if (context->free_after_save) {
-				replay_free_replay(&context->saving_replay, context);
-			}
-			return;
-		}
-	}
-	if (!context->fileOutput) {
-		if (context->lossless) {
-			InitFileOutputLossless(context);
-		} else {
-			InitFileOutput(context);
-		}
-	}
-
-	char *filename = os_generate_formatted_filename(context->lossless ? "avi" : "flv", true, context->file_format);
-	struct dstr path = {NULL, 0, 0};
-	dstr_copy(&path, context->directory);
-	dstr_replace(&path, "\\", "/");
-	if (dstr_end(&path) != '/')
-		dstr_cat_ch(&path, '/');
-	dstr_cat(&path, filename);
-	blog(LOG_INFO, "[replay_source: '%s'] start saving '%s'", obs_source_get_name(context->source), filename);
-	bfree(filename);
-	obs_data_t *settings = obs_data_create();
-	obs_data_set_string(settings, "path", path.array);
-	obs_data_set_string(settings, "url", path.array);
-
-	obs_output_update(context->fileOutput, settings);
-	dstr_free(&path);
-	obs_data_release(settings);
-
-	context->video_save_position = 0;
-	context->start_save_timestamp = obs_get_video_frame_time();
-
-	struct obs_source_frame *frame = context->saving_replay.video_frames[0];
-	if (context->saving_replay.trim_front) {
-		while (frame->timestamp < context->saving_replay.first_frame_timestamp + context->saving_replay.trim_front) {
-			context->video_save_position++;
-			if (context->video_save_position >= context->saving_replay.video_frame_count) {
-				context->saving_status = SAVING_STATUS_STOPPING;
-				pthread_mutex_unlock(&context->video_mutex);
-				return;
-			}
-			frame = context->saving_replay.video_frames[context->video_save_position];
-		}
-	}
-	struct video_frame output_frame;
-	if (video_output_lock_frame(context->video_output, &output_frame, 1, context->start_save_timestamp)) {
-		video_scaler_scale(context->scaler, output_frame.data, output_frame.linesize, (const uint8_t *const *)frame->data,
-				   frame->linesize);
-		video_output_unlock_frame(context->video_output);
-	}
-	pthread_mutex_unlock(&context->video_mutex);
-	if (!obs_output_start(context->fileOutput)) {
-		const char *error = obs_output_get_last_error(context->fileOutput);
-		if (error)
-			blog(LOG_WARNING, "[replay_source: '%s'] error output start: %s", obs_source_get_name(context->source),
-			     error);
-		else
-			blog(LOG_WARNING, "[replay_source: '%s'] error output start", obs_source_get_name(context->source));
-
-		context->saving_status = SAVING_STATUS_NONE;
-		if (context->free_after_save) {
-			replay_free_replay(&context->saving_replay, context);
-		}
+	if (context->current_replay.video_frame_count == 0 || !context->current_replay.video_frames) {
+		pthread_mutex_unlock(&context->audio_mutex);
+		pthread_mutex_unlock(&context->video_mutex);
 		return;
 	}
-	context->saving_status = SAVING_STATUS_STARTING2;
+
+	const char *src_name = context->source ? obs_source_get_name(context->source) : NULL;
+	if (!src_name || !*src_name)
+		src_name = context->source_name;
+
+	struct replay_save_job_params params = {
+		.source_name = src_name,
+		.directory = context->directory,
+		.file_format = context->file_format,
+		.save_encoder = context->save_encoder,
+		.save_container = context->save_container,
+		.lossless = context->lossless,
+		.video_frames = context->current_replay.video_frames,
+		.video_frame_count = context->current_replay.video_frame_count,
+		.audio_frames = context->current_replay.audio_frames,
+		.audio_frame_count = context->current_replay.audio_frame_count,
+		.oai = context->current_replay.oai,
+		.first_frame_timestamp = context->current_replay.first_frame_timestamp,
+		.last_frame_timestamp = context->current_replay.last_frame_timestamp,
+		.duration = context->current_replay.duration,
+		.trim_front = context->current_replay.trim_front,
+		.trim_end = context->current_replay.trim_end,
+	};
+
+	replay_save_queue_enqueue(&params);
+
+	pthread_mutex_unlock(&context->audio_mutex);
+	pthread_mutex_unlock(&context->video_mutex);
 }
 
 static void *update_scene_thread(void *data)
@@ -1255,8 +1013,7 @@ static void replay_save_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotke
 	if (!pressed)
 		return;
 	blog(LOG_INFO, "[replay_source: '%s'] Save replay pressed", obs_source_get_name(context->source));
-	if (context->saving_status == SAVING_STATUS_NONE)
-		context->saving_status = SAVING_STATUS_STARTING;
+	replay_save(context);
 }
 
 static void replay_disable_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -2212,6 +1969,28 @@ static void replay_source_update(void *data, obs_data_t *settings)
 	} else {
 		context->directory = bstrdup(directory);
 	}
+	const char *save_encoder = obs_data_get_string(settings, SETTING_SAVE_ENCODER);
+	if (!save_encoder || !*save_encoder)
+		save_encoder = SAVE_ENCODER_AUTO;
+	if (context->save_encoder) {
+		if (strcmp(context->save_encoder, save_encoder) != 0) {
+			bfree(context->save_encoder);
+			context->save_encoder = bstrdup(save_encoder);
+		}
+	} else {
+		context->save_encoder = bstrdup(save_encoder);
+	}
+	const char *save_container = obs_data_get_string(settings, SETTING_SAVE_CONTAINER);
+	if (!save_container || !*save_container)
+		save_container = SAVE_CONTAINER_MP4;
+	if (context->save_container) {
+		if (strcmp(context->save_container, save_container) != 0) {
+			bfree(context->save_container);
+			context->save_container = bstrdup(save_container);
+		}
+	} else {
+		context->save_container = bstrdup(save_container);
+	}
 	replay_update_text(context);
 }
 
@@ -2377,6 +2156,12 @@ static void replay_source_destroy(void *data)
 	if (context->file_format)
 		bfree(context->file_format);
 
+	if (context->save_encoder)
+		bfree(context->save_encoder);
+
+	if (context->save_container)
+		bfree(context->save_container);
+
 	if (context->progress_source_name)
 		bfree(context->progress_source_name);
 
@@ -2386,30 +2171,6 @@ static void replay_source_destroy(void *data)
 	if (context->text_format)
 		bfree(context->text_format);
 
-	if (context->h264Recording) {
-		obs_encoder_release(context->h264Recording);
-		context->h264Recording = NULL;
-	}
-
-	if (context->aac) {
-		obs_encoder_release(context->aac);
-		context->aac = NULL;
-	}
-
-	if (context->fileOutput) {
-		obs_output_release(context->fileOutput);
-		context->fileOutput = NULL;
-	}
-
-	if (context->video_output) {
-		video_output_close(context->video_output);
-		context->video_output = NULL;
-	}
-
-	if (context->audio_t) {
-		audio_output_close(context->audio_t);
-		context->audio_t = NULL;
-	}
 	pthread_mutex_lock(&context->replay_mutex);
 	while (context->replays.size) {
 		circlebuf_pop_front(&context->replays, &context->current_replay, sizeof context->current_replay);
@@ -2417,11 +2178,6 @@ static void replay_source_destroy(void *data)
 	}
 	circlebuf_free(&context->replays);
 	pthread_mutex_unlock(&context->replay_mutex);
-
-	if (context->scaler) {
-		video_scaler_destroy(context->scaler);
-		context->scaler = NULL;
-	}
 
 	pthread_mutex_destroy(&context->video_mutex);
 	pthread_mutex_destroy(&context->audio_mutex);
@@ -2566,99 +2322,6 @@ static void replay_source_tick(void *data, float seconds)
 
 	if (context->saving_status == SAVING_STATUS_STARTING) {
 		replay_save(context);
-	} else if (context->saving_status == SAVING_STATUS_STARTING2) {
-		if (obs_output_active(context->fileOutput) || os_timestamp - context->start_save_timestamp > 1000000000UL) {
-			context->saving_status = SAVING_STATUS_SAVING;
-		}
-	} else if (context->saving_status == SAVING_STATUS_SAVING) {
-		if (!obs_output_active(context->fileOutput)) {
-			const char *error = obs_output_get_last_error(context->fileOutput);
-			blog(LOG_ERROR, "[replay_source: '%s'] error output not active: %s", obs_source_get_name(context->source),
-			     error);
-			context->saving_status = SAVING_STATUS_NONE;
-			if (context->free_after_save) {
-				replay_free_replay(&context->saving_replay, context);
-			}
-		} else if (context->video_save_position >= context->saving_replay.video_frame_count) {
-			context->saving_status = SAVING_STATUS_STOPPING;
-			obs_output_stop(context->fileOutput);
-		} else {
-			pthread_mutex_lock(&context->video_mutex);
-			struct obs_source_frame *frame = context->saving_replay.video_frames[context->video_save_position];
-			while (frame->timestamp <
-			       context->saving_replay.first_frame_timestamp + context->saving_replay.trim_front) {
-				context->video_save_position++;
-				if (context->video_save_position >= context->saving_replay.video_frame_count) {
-					context->saving_status = SAVING_STATUS_STOPPING;
-					break;
-				}
-				frame = context->saving_replay.video_frames[context->video_save_position];
-			}
-			uint64_t timestamp = frame->timestamp;
-			if (context->start_save_timestamp > context->saving_replay.first_frame_timestamp) {
-				timestamp += context->start_save_timestamp - context->saving_replay.first_frame_timestamp;
-			}
-			timestamp -= context->saving_replay.trim_front;
-
-			struct video_frame output_frame;
-			if (video_output_lock_frame(context->video_output, &output_frame, 1, timestamp)) {
-				video_scaler_scale(context->scaler, output_frame.data, output_frame.linesize,
-						   (const uint8_t *const *)frame->data, frame->linesize);
-				video_output_unlock_frame(context->video_output);
-			}
-			if (timestamp <= os_timestamp) {
-				context->video_save_position++;
-				if (context->video_save_position >= context->saving_replay.video_frame_count) {
-					context->saving_status = SAVING_STATUS_STOPPING;
-					obs_output_stop(context->fileOutput);
-				} else {
-					frame = context->saving_replay.video_frames[context->video_save_position];
-					if (frame->timestamp >=
-					    context->saving_replay.last_frame_timestamp - context->saving_replay.trim_end) {
-						context->saving_status = SAVING_STATUS_STOPPING;
-						obs_output_stop(context->fileOutput);
-					}
-				}
-			}
-			pthread_mutex_unlock(&context->video_mutex);
-		}
-	} else if (context->saving_status == SAVING_STATUS_STOPPING) {
-		if (!context->fileOutput || !obs_output_active(context->fileOutput)) {
-			context->saving_status = SAVING_STATUS_NONE;
-			if (context->free_after_save) {
-				replay_free_replay(&context->saving_replay, context);
-			}
-		} else {
-
-			if (os_timestamp - context->start_save_timestamp >
-			    context->saving_replay.last_frame_timestamp - context->saving_replay.first_frame_timestamp) {
-				obs_output_stop(context->fileOutput);
-				pthread_mutex_lock(&context->video_mutex);
-				if (context->video_save_position >= context->saving_replay.video_frame_count) {
-					context->video_save_position = context->saving_replay.video_frame_count - 1;
-				}
-				struct obs_source_frame *frame = context->saving_replay.video_frames[context->video_save_position];
-				struct video_frame output_frame;
-				if (video_output_lock_frame(context->video_output, &output_frame, 1, os_timestamp)) {
-					video_scaler_scale(context->scaler, output_frame.data, output_frame.linesize,
-							   (const uint8_t *const *)frame->data, frame->linesize);
-					video_output_unlock_frame(context->video_output);
-				}
-				pthread_mutex_unlock(&context->video_mutex);
-			}
-		}
-	} else if (context->fileOutput) {
-		obs_output_release(context->fileOutput);
-		context->fileOutput = NULL;
-		if (context->h264Recording) {
-			obs_encoder_release(context->h264Recording);
-			context->h264Recording = NULL;
-		}
-		if (context->aac) {
-			obs_encoder_release(context->aac);
-			context->aac = NULL;
-		}
-		blog(LOG_INFO, "[replay_source: '%s'] stopped saving", obs_source_get_name(context->source));
 	}
 
 	pthread_mutex_lock(&context->video_mutex);
@@ -3069,6 +2732,18 @@ static obs_properties_t *replay_source_properties(void *data)
 
 	obs_properties_add_path(props, SETTING_DIRECTORY, obs_module_text("Directory"), OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_text(props, SETTING_FILE_FORMAT, obs_module_text("FilenameFormatting"), OBS_TEXT_DEFAULT);
+	prop = obs_properties_add_list(props, SETTING_SAVE_ENCODER, obs_module_text("SaveEncoder"), OBS_COMBO_TYPE_LIST,
+				       OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(prop, obs_module_text("SaveEncoderAuto"), SAVE_ENCODER_AUTO);
+	obs_property_list_add_string(prop, obs_module_text("SaveEncoderHevcNvenc"), SAVE_ENCODER_HEVC_NVENC);
+	obs_property_list_add_string(prop, obs_module_text("SaveEncoderH264Nvenc"), SAVE_ENCODER_H264_NVENC);
+	obs_property_list_add_string(prop, obs_module_text("SaveEncoderX264"), SAVE_ENCODER_X264);
+
+	prop = obs_properties_add_list(props, SETTING_SAVE_CONTAINER, obs_module_text("SaveContainer"), OBS_COMBO_TYPE_LIST,
+				       OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(prop, obs_module_text("SaveContainerMp4"), SAVE_CONTAINER_MP4);
+	obs_property_list_add_string(prop, obs_module_text("SaveContainerMkv"), SAVE_CONTAINER_MKV);
+
 	obs_properties_add_bool(props, SETTING_LOSSLESS, obs_module_text("Lossless"));
 
 	prop = obs_properties_add_list(props, SETTING_PROGRESS_SOURCE, obs_module_text("ProgressCropSource"),

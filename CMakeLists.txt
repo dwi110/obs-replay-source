@@ -23,6 +23,8 @@ target_sources(${PROJECT_NAME} PRIVATE
 	replay-filter.c
 	replay-filter-audio.c
 	replay-filter-async.c
+	replay-save-queue.c
+	replay-save-queue.h
 	replay.h
 	version.h)
 
@@ -82,4 +84,10 @@ else()
         set_target_properties(${PROJECT_NAME} PROPERTIES FOLDER "plugins/exeldro")
         setup_plugin_target(${PROJECT_NAME})
     endif()
+endif()
+
+option(REPLAY_BUILD_TESTS "Build unit tests" OFF)
+if(BUILD_OUT_OF_TREE AND REPLAY_BUILD_TESTS)
+	enable_testing()
+	add_subdirectory(tests)
 endif()
