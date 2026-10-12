@@ -19,10 +19,13 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/version.h.in ${CMAKE_CURRENT_SOURCE_D
 
 target_sources(${PROJECT_NAME} PRIVATE
 	replay.c
+	replay-module.c
 	replay-source.c
 	replay-filter.c
 	replay-filter-audio.c
 	replay-filter-async.c
+	replay-save-queue.c
+	replay-save-queue.h
 	replay.h
 	replay-pool.c
 	replay-pool.h

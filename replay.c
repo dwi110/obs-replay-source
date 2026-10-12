@@ -104,21 +104,6 @@ struct obs_audio_data *replay_filter_audio(void *data, struct obs_audio_data *au
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("replay-source", "en-US")
 
-extern struct obs_source_info replay_filter_info;
-extern struct obs_source_info replay_filter_audio_info;
-extern struct obs_source_info replay_filter_async_info;
-extern struct obs_source_info replay_source_info;
-
-bool obs_module_load(void)
-{
-	blog(LOG_INFO, "[Replay Source] loaded version %s", PROJECT_VERSION);
-	obs_register_source(&replay_source_info);
-	obs_register_source(&replay_filter_info);
-	obs_register_source(&replay_filter_audio_info);
-	obs_register_source(&replay_filter_async_info);
-	return true;
-}
-
 void free_audio_packet(struct obs_audio_data *audio)
 {
 	for (size_t i = 0; i < MAX_AV_PLANES; i++)
