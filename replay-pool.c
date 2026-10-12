@@ -81,7 +81,9 @@ size_t replay_frame_byte_size(enum video_format format, uint32_t width, uint32_t
 	case VIDEO_FORMAT_BGRA:
 	case VIDEO_FORMAT_BGRX:
 	case VIDEO_FORMAT_AYUV:
+#if LIBOBS_API_VER >= MAKE_SEMANTIC_VERSION(30, 0, 0)
 	case VIDEO_FORMAT_R10L:
+#endif
 		size = (size_t)width * height * 4;
 		ALIGN_SIZE(size, alignment);
 		return size;

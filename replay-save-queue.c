@@ -911,7 +911,7 @@ static bool collect_replay_sources_cb(void *param, obs_source_t *source)
 	if (id && strcmp(id, REPLAY_SOURCE_ID) == 0) {
 		obs_source_t *ref = obs_source_get_ref(source);
 		if (ref)
-			da_push_back(*list, &ref);
+			da_push_back((*list), &ref);
 	}
 	return true;
 }
