@@ -5,6 +5,7 @@
 #include <media-io/video-frame.h>
 #include <media-io/audio-resampler.h>
 #include "replay.h"
+#include "replay-pool.h"
 
 #define TEXFORMAT GS_BGRA
 
@@ -23,6 +24,18 @@ static inline void copy_frame_data_line(struct obs_source_frame *dst, const stru
 	memcpy(dst->data[plane] + pos_dst, src->data[plane] + pos_src, bytes);
 }
 
+static uint32_t estimate_bgra_pool_frames(const struct replay_filter *filter)
+{
+	if (filter->duration == 0)
+		return 0;
+	const uint32_t fps_num = filter->ovi.fps_num ? filter->ovi.fps_num : 60;
+	const uint32_t fps_den = filter->ovi.fps_den ? filter->ovi.fps_den : 1;
+	uint64_t frames = (filter->duration * (uint64_t)fps_num) / (SEC_TO_NSEC * (uint64_t)fps_den) + 4;
+	if (frames > 36000)
+		frames = 36000;
+	return (uint32_t)frames;
+}
+
 void replay_filter_raw_video(void *data, struct video_data *frame)
 {
 	struct replay_filter *filter = data;
@@ -32,8 +45,18 @@ void replay_filter_raw_video(void *data, struct video_data *frame)
 
 	struct obs_source_frame *output;
 
-	struct obs_source_frame *new_frame = obs_source_frame_create(VIDEO_FORMAT_BGRA, filter->known_width, filter->known_height);
-	new_frame->refs = 1;
+	pthread_mutex_lock(&filter->mutex);
+	if (!filter->pool || replay_pool_get_format(filter->pool) != VIDEO_FORMAT_BGRA ||
+	    replay_pool_get_width(filter->pool) != filter->known_width ||
+	    replay_pool_get_height(filter->pool) != filter->known_height) {
+		replay_pool_close(filter->pool);
+		filter->pool = replay_pool_create(VIDEO_FORMAT_BGRA, filter->known_width, filter->known_height,
+						  estimate_bgra_pool_frames(filter));
+	}
+	struct obs_source_frame *new_frame = replay_pool_acquire(filter->pool);
+	pthread_mutex_unlock(&filter->mutex);
+	if (!new_frame)
+		return;
 	new_frame->timestamp = frame->timestamp;
 
 	if (new_frame->linesize[0] != frame->linesize[0])
@@ -151,13 +174,14 @@ static void replay_filter_update(void *data, obs_data_t *settings)
 
 	uint64_t new_duration = (uint64_t)obs_data_get_int(settings, SETTING_DURATION) * MSEC_TO_NSEC;
 
+	pthread_mutex_lock(&filter->mutex);
 	if (new_duration < filter->duration) {
-		pthread_mutex_lock(&filter->mutex);
 		free_video_data(filter);
-		pthread_mutex_unlock(&filter->mutex);
 	}
-
 	filter->duration = new_duration;
+	if (filter->pool)
+		replay_pool_warmup(filter->pool, estimate_bgra_pool_frames(filter));
+	pthread_mutex_unlock(&filter->mutex);
 
 	obs_add_main_render_callback(replay_filter_offscreen_render, filter);
 
@@ -206,6 +230,8 @@ static void replay_filter_destroy(void *data)
 
 	free_video_data(filter);
 	free_audio_data(filter);
+	replay_pool_close(filter->pool);
+	filter->pool = NULL;
 	pthread_mutex_unlock(&filter->mutex);
 	circlebuf_free(&filter->video_frames);
 	circlebuf_free(&filter->audio_frames);
@@ -235,6 +261,8 @@ static void replay_filter_remove(void *data, obs_source_t *parent)
 	pthread_mutex_lock(&filter->mutex);
 	free_video_data(filter);
 	free_audio_data(filter);
+	replay_pool_close(filter->pool);
+	filter->pool = NULL;
 	pthread_mutex_unlock(&filter->mutex);
 }
 

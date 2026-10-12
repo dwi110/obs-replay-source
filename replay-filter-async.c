@@ -1,7 +1,11 @@
 #include <obs-module.h>
+#include <util/platform.h>
 #include <util/threading.h>
 #include "media-io/audio-math.h"
+#include "obs-frame-tap.h"
 #include "replay.h"
+#include "replay-pool.h"
+#include "replay-convert.h"
 
 static const char *replay_filter_get_name(void *unused)
 {
@@ -9,21 +13,265 @@ static const char *replay_filter_get_name(void *unused)
 	return obs_module_text("ReplayFilterAsync");
 }
 
+static inline uint64_t uint64_diff(uint64_t ts1, uint64_t ts2)
+{
+	return (ts1 < ts2) ? (ts2 - ts1) : (ts1 - ts2);
+}
+
+static inline uint64_t safe_video_frame_time(void)
+{
+	if (obs_initialized()) {
+		uint64_t t = obs_get_video_frame_time();
+		if (t)
+			return t;
+	}
+	return os_gettime_ns();
+}
+
+static uint32_t estimate_pool_frames(const struct replay_filter *filter)
+{
+	if (filter->duration == 0)
+		return 0;
+	struct obs_video_info ovi;
+	uint32_t fps_num = 60;
+	uint32_t fps_den = 1;
+	if (obs_initialized() && obs_get_video_info(&ovi) && ovi.fps_num > 0 && ovi.fps_den > 0) {
+		fps_num = ovi.fps_num;
+		fps_den = ovi.fps_den;
+	}
+	uint64_t frames = (filter->duration * (uint64_t)fps_num) / (SEC_TO_NSEC * (uint64_t)fps_den) + 4;
+	if (frames > 36000)
+		frames = 36000;
+	return (uint32_t)frames;
+}
+
+static struct replay_pool *ensure_filter_pool_locked(struct replay_filter *filter, enum video_format dst_format,
+						     uint32_t dst_width, uint32_t dst_height)
+{
+	if (!filter->pool || replay_pool_get_format(filter->pool) != dst_format ||
+	    replay_pool_get_width(filter->pool) != dst_width || replay_pool_get_height(filter->pool) != dst_height) {
+		replay_pool_close(filter->pool);
+		filter->pool = replay_pool_create(dst_format, dst_width, dst_height, estimate_pool_frames(filter));
+	}
+	return filter->pool;
+}
+
+static void record_capture_timing_locked(struct replay_filter *filter, uint64_t t0_ns, uint64_t elapsed_ns)
+{
+	filter->capture_count++;
+	filter->capture_sum_ns += elapsed_ns;
+	if (elapsed_ns > filter->capture_max_ns)
+		filter->capture_max_ns = elapsed_ns;
+	if (filter->capture_log_ts == 0) {
+		filter->capture_log_ts = t0_ns;
+	} else if (t0_ns - filter->capture_log_ts >= 60ULL * SEC_TO_NSEC) {
+		struct replay_pool_stats stats = {0};
+		if (filter->pool)
+			replay_pool_get_stats(filter->pool, &stats);
+		const double avg_ms = (double)filter->capture_sum_ns / (double)filter->capture_count / 1e6;
+		const double max_ms = (double)filter->capture_max_ns / 1e6;
+		const double pool_gb = (double)stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0);
+		const char *name = filter->src ? obs_source_get_name(filter->src) : "";
+		blog(LOG_INFO,
+		     "[replay-filter] '%s' capture: frames=%u avg=%.3fms max=%.3fms pool=%u frames %.2f GB peak=%u",
+		     name ? name : "", filter->capture_count, avg_ms, max_ms, stats.allocated_frames, pool_gb,
+		     stats.peak_frames);
+		filter->capture_count = 0;
+		filter->capture_sum_ns = 0;
+		filter->capture_max_ns = 0;
+		filter->capture_log_ts = t0_ns;
+	}
+}
+
+static bool capture_single_frame_locked(struct replay_filter *filter, const struct obs_source_frame *src_frame,
+					uint64_t os_time, uint64_t *last_timestamp)
+{
+	if (!src_frame || !src_frame->data[0] || src_frame->width == 0 || src_frame->height == 0)
+		return false;
+
+	if (src_frame->timestamp + filter->timing_adjust <= *last_timestamp)
+		return false;
+
+	const uint64_t t0 = os_gettime_ns();
+
+	enum video_format dst_format;
+	uint32_t dst_width;
+	uint32_t dst_height;
+	replay_convert_target_format(src_frame->format, src_frame->width, src_frame->height,
+				     filter->storage_format == STORAGE_FORMAT_NV12,
+				     filter->downscale == DOWNSCALE_MAX_1080P, &dst_format, &dst_width, &dst_height);
+
+	struct replay_pool *pool = ensure_filter_pool_locked(filter, dst_format, dst_width, dst_height);
+	if (!pool)
+		return false;
+
+	struct obs_source_frame *new_frame = replay_pool_acquire(pool);
+	if (!new_frame)
+		return false;
+
+	if (!replay_convert_frame(new_frame, src_frame)) {
+		replay_frame_release(new_frame);
+		return false;
+	}
+
+	const uint64_t timestamp = src_frame->timestamp;
+	uint64_t adjusted_time = timestamp + filter->timing_adjust;
+	if (filter->timing_adjust && uint64_diff(os_time, timestamp) < MAX_TS_VAR) {
+		adjusted_time = timestamp;
+		filter->timing_adjust = 0;
+	} else if (uint64_diff(os_time, adjusted_time) > MAX_TS_VAR) {
+		filter->timing_adjust = os_time - timestamp;
+		adjusted_time = os_time;
+	}
+	new_frame->timestamp = adjusted_time;
+	*last_timestamp = adjusted_time;
+	circlebuf_push_back(&filter->video_frames, &new_frame, sizeof(struct obs_source_frame *));
+
+	const uint64_t elapsed = os_gettime_ns() - t0;
+	record_capture_timing_locked(filter, t0, elapsed);
+	return true;
+}
+
+static void evict_expired_frames_locked(struct replay_filter *filter, uint64_t last_timestamp)
+{
+	if (!last_timestamp || !filter->video_frames.size)
+		return;
+
+	struct obs_source_frame *output = NULL;
+	circlebuf_peek_front(&filter->video_frames, &output, sizeof(struct obs_source_frame *));
+
+	uint64_t cur_duration = last_timestamp - output->timestamp;
+	while (cur_duration > 0 && cur_duration > filter->duration) {
+		circlebuf_pop_front(&filter->video_frames, NULL, sizeof(struct obs_source_frame *));
+		replay_frame_release(output);
+		output = NULL;
+		if (filter->video_frames.size) {
+			circlebuf_peek_front(&filter->video_frames, &output, sizeof(struct obs_source_frame *));
+			cur_duration = last_timestamp - output->timestamp;
+		} else {
+			cur_duration = 0;
+		}
+	}
+}
+
+static void replay_filter_tap_cb(void *param, obs_source_t *source, const struct obs_source_frame *frame)
+{
+	UNUSED_PARAMETER(source);
+	struct replay_filter *filter = param;
+	if (!filter || !frame)
+		return;
+
+	const uint64_t os_time = safe_video_frame_time();
+
+	pthread_mutex_lock(&filter->mutex);
+	uint64_t last_timestamp = 0;
+	if (filter->video_frames.size) {
+		struct obs_source_frame *output = NULL;
+		circlebuf_peek_back(&filter->video_frames, &output, sizeof(struct obs_source_frame *));
+		last_timestamp = output->timestamp;
+	}
+	if (capture_single_frame_locked(filter, frame, os_time, &last_timestamp))
+		evict_expired_frames_locked(filter, last_timestamp);
+	pthread_mutex_unlock(&filter->mutex);
+}
+
+static void try_attach_frame_tap(struct replay_filter *filter)
+{
+	if (!filter || filter->tap_checked || !filter->src)
+		return;
+
+	obs_source_t *parent = obs_filter_get_parent(filter->src);
+	if (!parent)
+		return;
+
+	filter->tap_checked = true;
+	proc_handler_t *ph = obs_source_get_proc_handler(parent);
+	if (!ph)
+		return;
+
+	struct calldata cd;
+	uint8_t stack[128];
+	calldata_init_fixed(&cd, stack, sizeof(stack));
+	calldata_set_ptr(&cd, "callback", (void *)(uintptr_t)replay_filter_tap_cb);
+	calldata_set_ptr(&cd, "param", filter);
+
+	if (proc_handler_call(ph, FRAME_TAP_PROC_ADD, &cd)) {
+		filter->tap_parent = obs_source_get_weak_source(parent);
+		os_atomic_set_bool(&filter->tap_active, true);
+		const char *fname = obs_source_get_name(filter->src);
+		const char *pname = obs_source_get_name(parent);
+		blog(LOG_INFO, "[replay-filter] '%s' frame tap active on source '%s'", fname ? fname : "",
+		     pname ? pname : "");
+	}
+}
+
+static void detach_frame_tap(struct replay_filter *filter, obs_source_t *explicit_parent)
+{
+	if (!filter)
+		return;
+
+	if (!os_atomic_set_bool(&filter->tap_active, false)) {
+		if (filter->tap_parent) {
+			obs_weak_source_release(filter->tap_parent);
+			filter->tap_parent = NULL;
+		}
+		return;
+	}
+
+	obs_source_t *strong_parent = NULL;
+	obs_source_t *parent = explicit_parent;
+	if (!parent && filter->tap_parent) {
+		strong_parent = obs_weak_source_get_source(filter->tap_parent);
+		parent = strong_parent;
+	}
+	if (!parent && filter->src)
+		parent = obs_filter_get_parent(filter->src);
+
+	if (parent) {
+		proc_handler_t *ph = obs_source_get_proc_handler(parent);
+		if (ph) {
+			struct calldata cd;
+			uint8_t stack[128];
+			calldata_init_fixed(&cd, stack, sizeof(stack));
+			calldata_set_ptr(&cd, "callback", (void *)(uintptr_t)replay_filter_tap_cb);
+			calldata_set_ptr(&cd, "param", filter);
+			proc_handler_call(ph, FRAME_TAP_PROC_REMOVE, &cd);
+		}
+	}
+
+	if (strong_parent)
+		obs_source_release(strong_parent);
+	if (filter->tap_parent) {
+		obs_weak_source_release(filter->tap_parent);
+		filter->tap_parent = NULL;
+	}
+}
+
 static void replay_filter_update(void *data, obs_data_t *settings)
 {
 	struct replay_filter *filter = data;
 
 	const uint64_t new_duration = (uint64_t)obs_data_get_int(settings, SETTING_DURATION) * MSEC_TO_NSEC;
+	const int new_storage = (int)obs_data_get_int(settings, SETTING_STORAGE_FORMAT);
+	const int new_downscale = (int)obs_data_get_int(settings, SETTING_DOWNSCALE);
 
-	if (new_duration < filter->duration) {
-		pthread_mutex_lock(&filter->mutex);
+	pthread_mutex_lock(&filter->mutex);
+	if (new_duration < filter->duration || new_storage != filter->storage_format ||
+	    new_downscale != filter->downscale) {
 		free_video_data(filter);
-		pthread_mutex_unlock(&filter->mutex);
 	}
 	filter->duration = new_duration;
+	filter->storage_format = new_storage;
+	filter->downscale = new_downscale;
+	if (filter->pool)
+		replay_pool_warmup(filter->pool, estimate_pool_frames(filter));
+	pthread_mutex_unlock(&filter->mutex);
+
 	filter->internal_frames = obs_data_get_bool(settings, SETTING_INTERNAL_FRAMES);
 	const double db = obs_data_get_double(settings, SETTING_AUDIO_THRESHOLD);
 	filter->threshold = db_to_mul((float)db);
+
+	try_attach_frame_tap(filter);
 }
 
 static void *replay_filter_create(obs_data_t *settings, obs_source_t *source)
@@ -31,7 +279,7 @@ static void *replay_filter_create(obs_data_t *settings, obs_source_t *source)
 	struct replay_filter *context = bzalloc(sizeof(struct replay_filter));
 	context->src = source;
 	pthread_mutex_init(&context->mutex, NULL);
-	context->last_check = obs_get_video_frame_time();
+	context->last_check = safe_video_frame_time();
 
 	replay_filter_update(context, settings);
 
@@ -42,9 +290,13 @@ static void replay_filter_destroy(void *data)
 {
 	struct replay_filter *filter = data;
 
+	detach_frame_tap(filter, NULL);
+
 	pthread_mutex_lock(&filter->mutex);
 	free_video_data(filter);
 	free_audio_data(filter);
+	replay_pool_close(filter->pool);
+	filter->pool = NULL;
 	pthread_mutex_unlock(&filter->mutex);
 	circlebuf_free(&filter->video_frames);
 	circlebuf_free(&filter->audio_frames);
@@ -54,17 +306,17 @@ static void replay_filter_destroy(void *data)
 
 static void replay_filter_remove(void *data, obs_source_t *parent)
 {
-	UNUSED_PARAMETER(parent);
 	struct replay_filter *filter = data;
+
+	detach_frame_tap(filter, parent);
+	filter->tap_checked = false;
+
 	pthread_mutex_lock(&filter->mutex);
 	free_video_data(filter);
 	free_audio_data(filter);
+	replay_pool_close(filter->pool);
+	filter->pool = NULL;
 	pthread_mutex_unlock(&filter->mutex);
-}
-
-static inline uint64_t uint64_diff(uint64_t ts1, uint64_t ts2)
-{
-	return (ts1 < ts2) ? (ts2 - ts1) : (ts1 - ts2);
 }
 
 struct async_frame {
@@ -76,13 +328,16 @@ struct async_frame {
 static struct obs_source_frame *replay_filter_video(void *data, struct obs_source_frame *frame)
 {
 	struct replay_filter *filter = data;
-	struct obs_source_frame *output;
+	if (!filter->tap_checked)
+		try_attach_frame_tap(filter);
+	if (os_atomic_load_bool(&filter->tap_active))
+		return frame;
 
+	struct obs_source_frame *output;
 	uint64_t last_timestamp = 0;
 
 	obs_source_t *target = filter->internal_frames ? obs_filter_get_parent(filter->src) : NULL;
-	const uint64_t os_time = obs_get_video_frame_time();
-	struct obs_source_frame *new_frame = NULL;
+	const uint64_t os_time = safe_video_frame_time();
 
 	pthread_mutex_lock(&filter->mutex);
 	if (filter->video_frames.size) {
@@ -109,63 +364,12 @@ static struct obs_source_frame *replay_filter_video(void *data, struct obs_sourc
 		pthread_mutex_lock(async_mutex);
 		for (size_t i = 0; i < async_cache->num; i++) {
 			struct obs_source_frame *extra_frame = ((struct async_frame *)async_cache->array)[i].frame;
-			if (extra_frame->timestamp + filter->timing_adjust > last_timestamp) {
-				new_frame = obs_source_frame_create(extra_frame->format, extra_frame->width, extra_frame->height);
-				new_frame->refs = 1;
-				obs_source_frame_copy(new_frame, extra_frame);
-				const uint64_t timestamp = extra_frame->timestamp;
-				uint64_t adjusted_time = timestamp + filter->timing_adjust;
-				if (filter->timing_adjust && uint64_diff(os_time, timestamp) < MAX_TS_VAR) {
-					adjusted_time = timestamp;
-					filter->timing_adjust = 0;
-				} else if (uint64_diff(os_time, adjusted_time) > MAX_TS_VAR) {
-					filter->timing_adjust = os_time - timestamp;
-					adjusted_time = os_time;
-				}
-				new_frame->timestamp = adjusted_time;
-				last_timestamp = adjusted_time;
-				circlebuf_push_back(&filter->video_frames, &new_frame, sizeof(struct obs_source_frame *));
-			}
+			capture_single_frame_locked(filter, extra_frame, os_time, &last_timestamp);
 		}
 		pthread_mutex_unlock(async_mutex);
 	}
-	if (frame->timestamp + filter->timing_adjust > last_timestamp) {
-		new_frame = obs_source_frame_create(frame->format, frame->width, frame->height);
-		new_frame->refs = 1;
-		obs_source_frame_copy(new_frame, frame);
-		const uint64_t timestamp = frame->timestamp;
-		uint64_t adjusted_time = timestamp + filter->timing_adjust;
-		if (filter->timing_adjust && uint64_diff(os_time, timestamp) < MAX_TS_VAR) {
-			adjusted_time = timestamp;
-			filter->timing_adjust = 0;
-		} else if (uint64_diff(os_time, adjusted_time) > MAX_TS_VAR) {
-			filter->timing_adjust = os_time - timestamp;
-			adjusted_time = os_time;
-		}
-		new_frame->timestamp = adjusted_time;
-		last_timestamp = adjusted_time;
-		circlebuf_push_back(&filter->video_frames, &new_frame, sizeof(struct obs_source_frame *));
-	}
-	if (!last_timestamp) {
-		pthread_mutex_unlock(&filter->mutex);
-		return frame;
-	}
-	circlebuf_peek_front(&filter->video_frames, &output, sizeof(struct obs_source_frame *));
-
-	uint64_t cur_duration = last_timestamp - output->timestamp;
-	while (cur_duration > 0 && cur_duration > filter->duration) {
-
-		circlebuf_pop_front(&filter->video_frames, NULL, sizeof(struct obs_source_frame *));
-
-		replay_frame_release(output);
-		output = NULL;
-		if (filter->video_frames.size) {
-			circlebuf_peek_front(&filter->video_frames, &output, sizeof(struct obs_source_frame *));
-			cur_duration = last_timestamp - output->timestamp;
-		} else {
-			cur_duration = 0;
-		}
-	}
+	capture_single_frame_locked(filter, frame, os_time, &last_timestamp);
+	evict_expired_frames_locked(filter, last_timestamp);
 	pthread_mutex_unlock(&filter->mutex);
 	return frame;
 }
@@ -189,6 +393,7 @@ static obs_properties_t *replay_filter_properties(void *unused)
 static void replay_filter_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
+	try_attach_frame_tap(data);
 	replay_filter_check(data);
 }
 
