@@ -113,6 +113,8 @@ struct fake_ws_event_entry {
 	char *type;
 	char *source;
 	int64_t duration_ms;
+	char *trigger;
+	char *path;
 };
 
 struct fake_ws_state {
@@ -171,15 +173,29 @@ static void fake_ws_vendor_event_emit_proc(void *data, calldata_t *cd)
 		return;
 	}
 	const char *src = obs_data_get_string(ev_data, "source");
+	const char *trig = obs_data_get_string(ev_data, "trigger");
+	const char *pth = obs_data_get_string(ev_data, "path");
 	struct fake_ws_event_entry ev = {
 		.type = bstrdup(type),
 		.source = bstrdup(src ? src : ""),
 		.duration_ms = (int64_t)obs_data_get_int(ev_data, "durationMs"),
+		.trigger = bstrdup(trig ? trig : ""),
+		.path = bstrdup(pth ? pth : ""),
 	};
 	da_push_back(ws->events, &ev);
 	calldata_set_bool(cd, "success", true);
 }
 
+static void clear_fake_events(void)
+{
+	for (size_t i = 0; i < g_fake_ws.events.num; i++) {
+		bfree(g_fake_ws.events.array[i].type);
+		bfree(g_fake_ws.events.array[i].source);
+		bfree(g_fake_ws.events.array[i].trigger);
+		bfree(g_fake_ws.events.array[i].path);
+	}
+	da_resize(g_fake_ws.events, 0);
+}
 static const struct fake_ws_req_entry *find_ws_request(const char *type)
 {
 	for (size_t i = 0; i < g_fake_ws.requests.num; i++) {
@@ -393,7 +409,8 @@ int main(int argc, char **argv)
 	const char *const expected_global_hotkeys[] = {
 		"ReplaySource.SaveAll",        "ReplaySource.LoadAll",         "ReplaySource.AllNormalSpeed",
 		"ReplaySource.AllHalfSpeed",   "ReplaySource.AllQuarterSpeed", "ReplaySource.AllRestart",
-		"ReplaySource.AllPause",
+		"ReplaySource.AllPause",       "ReplaySource.AllMarkIn",       "ReplaySource.AllMarkOut",
+		"ReplaySource.AllMarkReset",
 	};
 	for (size_t i = 0; i < sizeof(expected_global_hotkeys) / sizeof(expected_global_hotkeys[0]); i++) {
 		CHECK(count_hotkey_name(&snap, expected_global_hotkeys[i]) == 1,
@@ -630,6 +647,206 @@ int main(int argc, char **argv)
 	      "expected Replay Cam 2 speed 40.0, got %.2f", st2.speed_percent);
 	obs_data_release(csv_req);
 	obs_data_release(csv_res);
+	/* Reset speed to 100% after Section 3 SetSpeed tests */
+	replay_control_set_all_speed(100.0f);
+
+	/* =====================================================================
+	 * 4. Multi-Angle Mark In/Out & Alignment-Aware Trims
+	 * ===================================================================== */
+	CHECK(replay_source_get_status(ctx1, &st1) && replay_source_get_status(ctx2, &st2),
+	      "replay_source_get_status failed");
+	CHECK(st1.mark_in_ms == 0 && st2.mark_in_ms == 0,
+	      "initial markInMs after LoadAll must be 0, got %" PRId64 " / %" PRId64, st1.mark_in_ms, st2.mark_in_ms);
+	CHECK(st1.mark_out_ms == st1.duration_ms && st2.mark_out_ms == st2.duration_ms,
+	      "initial markOutMs after LoadAll must match durationMs");
+
+	/* Drive Cam 1 playback to a deterministic timestamp inside the common aligned window */
+	const uint64_t mark_in_ts = cam2_start + 6ULL * interval_ns;
+	replay_source_test_set_playback_pos(ctx1, mark_in_ts, cam1_start);
+
+	/* Trigger AllMarkIn: reference is Cam 1 */
+	replay_control_all_mark_in();
+	CHECK(replay_source_get_status(ctx1, &st1) && replay_source_get_status(ctx2, &st2),
+	      "replay_source_get_status failed after AllMarkIn");
+	CHECK(st1.effective_start_ns == st2.effective_start_ns,
+	      "AllMarkIn effective_start_ns mismatch: %" PRIu64 " vs %" PRIu64, st1.effective_start_ns,
+	      st2.effective_start_ns);
+	CHECK(st1.mark_in_ms == st2.mark_in_ms, "AllMarkIn markInMs mismatch: %" PRId64 " vs %" PRId64, st1.mark_in_ms,
+	      st2.mark_in_ms);
+	CHECK(st1.mark_in_ms > 0, "AllMarkIn markInMs must be > 0");
+
+	/* Trigger AllMarkOut at another deterministic position */
+	const uint64_t mark_out_ts = cam2_start + 22ULL * interval_ns;
+	replay_source_test_set_playback_pos(ctx1, mark_out_ts, cam1_start);
+	replay_control_all_mark_out();
+	CHECK(replay_source_get_status(ctx1, &st1) && replay_source_get_status(ctx2, &st2),
+	      "replay_source_get_status failed after AllMarkOut");
+	CHECK(st1.effective_end_ns == st2.effective_end_ns,
+	      "AllMarkOut effective_end_ns mismatch: %" PRIu64 " vs %" PRIu64, st1.effective_end_ns,
+	      st2.effective_end_ns);
+	CHECK(st1.mark_out_ms == st2.mark_out_ms, "AllMarkOut markOutMs mismatch: %" PRId64 " vs %" PRId64,
+	      st1.mark_out_ms, st2.mark_out_ms);
+
+	/* Vendor Request: MarkReset restores the aligned window, not the full buffer */
+	obs_data_t *rst_res = obs_data_create();
+	CHECK(call_ws_request("MarkReset", NULL, rst_res), "MarkReset request failed");
+	CHECK(obs_data_get_bool(rst_res, "ok"), "MarkReset ok != true");
+	obs_data_release(rst_res);
+
+	CHECK(replay_source_get_status(ctx1, &st1) && replay_source_get_status(ctx2, &st2),
+	      "replay_source_get_status failed after MarkReset");
+	CHECK(st1.effective_start_ns == st2.effective_start_ns, "MarkReset must restore aligned base start");
+	CHECK(st1.effective_start_ns > cam1_start, "MarkReset must restore aligned base, not reset to full buffer 0");
+	CHECK(st1.mark_in_ms == 0 && st2.mark_in_ms == 0, "markInMs after MarkReset must be 0");
+
+	/* Mark clamping: In outside (before) the aligned window is clamped to aligned base */
+	replay_source_test_set_playback_pos(ctx1, cam1_start, cam1_start);
+	replay_control_all_mark_in();
+	CHECK(replay_source_get_status(ctx1, &st1) && replay_source_get_status(ctx2, &st2),
+	      "replay_source_get_status failed after clamped In");
+	CHECK(st1.effective_start_ns == st2.effective_start_ns, "effective_start_ns after clamped In must match");
+	CHECK(st1.mark_in_ms == 0 && st2.mark_in_ms == 0, "clamped In must clamp to aligned start (markInMs == 0)");
+
+	/* Vendor Request: MarkIn returns per-source timing */
+	replay_source_test_set_playback_pos(ctx1, mark_in_ts, cam1_start);
+	obs_data_t *min_req = obs_data_create();
+	obs_data_t *min_res = obs_data_create();
+	obs_data_set_string(min_req, "source", "Replay Cam 1");
+	CHECK(call_ws_request("MarkIn", min_req, min_res), "MarkIn request failed");
+	CHECK(obs_data_get_bool(min_res, "ok"), "MarkIn ok != true");
+	obs_data_array_t *min_srcs = obs_data_get_array(min_res, "sources");
+	CHECK(obs_data_array_count(min_srcs) == 1, "expected 1 source in MarkIn response");
+	obs_data_t *min_item = obs_data_array_item(min_srcs, 0);
+	CHECK(obs_data_get_int(min_item, "inMs") > 0, "MarkIn inMs must be > 0");
+	obs_data_release(min_item);
+	obs_data_array_release(min_srcs);
+	obs_data_release(min_req);
+	obs_data_release(min_res);
+
+	/* =====================================================================
+	 * 5. Auto-Save Tests (ON_LOAD, ON_RELEASE, OFF)
+	 * ===================================================================== */
+	/* 5a: AUTO_SAVE_ON_LOAD */
+	obs_data_t *s1_as = obs_source_get_settings(rs1);
+	obs_data_set_int(s1_as, SETTING_AUTO_SAVE, AUTO_SAVE_ON_LOAD);
+	obs_source_update(rs1, s1_as);
+	obs_source_load(rs1);
+	obs_data_release(s1_as);
+
+	obs_data_t *s2_as = obs_source_get_settings(rs2);
+	obs_data_set_int(s2_as, SETTING_AUTO_SAVE, AUTO_SAVE_ON_LOAD);
+	obs_source_update(rs2, s2_as);
+	obs_source_load(rs2);
+	obs_data_release(s2_as);
+
+	clear_fake_events();
+	const uint64_t as_base_ts = mark_out_ts + 10ULL * interval_ns;
+	feed_nv12_frames(cam1, 320, 180, 30, as_base_ts, interval_ns);
+	feed_nv12_frames(cam2, 320, 180, 30, as_base_ts + 4ULL * interval_ns, interval_ns);
+
+	obs_data_t *load_as_res = obs_data_create();
+	CHECK(call_ws_request("LoadAll", NULL, load_as_res), "LoadAll with AUTO_SAVE_ON_LOAD failed");
+	CHECK(obs_data_get_bool(load_as_res, "ok"), "LoadAll ok != true");
+	obs_data_release(load_as_res);
+
+	CHECK(replay_save_queue_wait_idle(5000), "replay_save_queue_wait_idle failed for auto-load");
+
+	size_t auto_load_events = 0;
+	for (size_t i = 0; i < g_fake_ws.events.num; i++) {
+		if (strcmp(g_fake_ws.events.array[i].type, "SaveStarted") == 0 &&
+		    strcmp(g_fake_ws.events.array[i].trigger, "auto-load") == 0) {
+			auto_load_events++;
+		}
+	}
+	CHECK(auto_load_events >= 2, "expected at least 2 SaveStarted events with trigger 'auto-load', got %zu",
+	      auto_load_events);
+
+	/* 5b: AUTO_SAVE_ON_RELEASE */
+	obs_data_t *s1_rel = obs_source_get_settings(rs1);
+	obs_data_set_int(s1_rel, SETTING_AUTO_SAVE, AUTO_SAVE_ON_RELEASE);
+	obs_source_update(rs1, s1_rel);
+	obs_source_load(rs1);
+	obs_data_release(s1_rel);
+
+	clear_fake_events();
+	const uint64_t rel_base_ts = as_base_ts + 50ULL * interval_ns;
+	feed_nv12_frames(cam1, 320, 180, 30, rel_base_ts, interval_ns);
+
+	obs_data_t *load_act_req = obs_data_create();
+	obs_data_t *load_act_res = obs_data_create();
+	obs_data_set_string(load_act_req, "action", "Load");
+	obs_data_set_string(load_act_req, "source", "Replay Cam 1");
+	CHECK(call_ws_request("Action", load_act_req, load_act_res), "Action Load failed");
+	obs_data_release(load_act_req);
+	obs_data_release(load_act_res);
+
+	replay_source_test_set_playback_pos(ctx1, rel_base_ts + 5ULL * interval_ns, rel_base_ts);
+	obs_data_t *mark_act_req = obs_data_create();
+	obs_data_t *mark_act_res = obs_data_create();
+	obs_data_set_string(mark_act_req, "action", "MarkIn");
+	obs_data_set_string(mark_act_req, "source", "Replay Cam 1");
+	CHECK(call_ws_request("Action", mark_act_req, mark_act_res), "Action MarkIn failed");
+	obs_data_release(mark_act_req);
+	obs_data_release(mark_act_res);
+
+	clear_fake_events();
+	obs_data_t *clr_act_req = obs_data_create();
+	obs_data_t *clr_act_res = obs_data_create();
+	obs_data_set_string(clr_act_req, "action", "Clear");
+	obs_data_set_string(clr_act_req, "source", "Replay Cam 1");
+	CHECK(call_ws_request("Action", clr_act_req, clr_act_res), "Action Clear failed");
+	obs_data_release(clr_act_req);
+	obs_data_release(clr_act_res);
+
+	CHECK(replay_save_queue_wait_idle(5000), "replay_save_queue_wait_idle failed for auto-release");
+	size_t auto_rel_events = 0;
+	for (size_t i = 0; i < g_fake_ws.events.num; i++) {
+		if (strcmp(g_fake_ws.events.array[i].type, "SaveStarted") == 0 &&
+		    strcmp(g_fake_ws.events.array[i].trigger, "auto-release") == 0) {
+			auto_rel_events++;
+		}
+	}
+	CHECK(auto_rel_events == 1, "expected 1 SaveStarted event with trigger 'auto-release', got %zu",
+	      auto_rel_events);
+
+	/* Second Clear of the same replay must not enqueue again */
+	clear_fake_events();
+	obs_data_t *clr2_act_req = obs_data_create();
+	obs_data_t *clr2_act_res = obs_data_create();
+	obs_data_set_string(clr2_act_req, "action", "Clear");
+	obs_data_set_string(clr2_act_req, "source", "Replay Cam 1");
+	CHECK(call_ws_request("Action", clr2_act_req, clr2_act_res), "second Clear call failed");
+	obs_data_release(clr2_act_req);
+	obs_data_release(clr2_act_res);
+	CHECK(replay_save_queue_pending_count() == 0, "second Clear must not enqueue job");
+	CHECK(g_fake_ws.events.num == 0, "second Clear must emit no SaveStarted events");
+
+	/* 5c: AUTO_SAVE_OFF -> Clear does not enqueue */
+	obs_data_t *s1_off = obs_source_get_settings(rs1);
+	obs_data_set_int(s1_off, SETTING_AUTO_SAVE, AUTO_SAVE_OFF);
+	obs_source_update(rs1, s1_off);
+	obs_source_load(rs1);
+	obs_data_release(s1_off);
+
+	feed_nv12_frames(cam1, 320, 180, 30, rel_base_ts + 100ULL * interval_ns, interval_ns);
+	obs_data_t *load3_req = obs_data_create();
+	obs_data_t *load3_res = obs_data_create();
+	obs_data_set_string(load3_req, "action", "Load");
+	obs_data_set_string(load3_req, "source", "Replay Cam 1");
+	CHECK(call_ws_request("Action", load3_req, load3_res), "Action Load failed for AUTO_SAVE_OFF");
+	obs_data_release(load3_req);
+	obs_data_release(load3_res);
+
+	clear_fake_events();
+	obs_data_t *clr3_req = obs_data_create();
+	obs_data_t *clr3_res = obs_data_create();
+	obs_data_set_string(clr3_req, "action", "Clear");
+	obs_data_set_string(clr3_req, "source", "Replay Cam 1");
+	CHECK(call_ws_request("Action", clr3_req, clr3_res), "Action Clear failed for AUTO_SAVE_OFF");
+	obs_data_release(clr3_req);
+	obs_data_release(clr3_res);
+	CHECK(replay_save_queue_pending_count() == 0, "AUTO_SAVE_OFF Clear must not enqueue job");
+	CHECK(g_fake_ws.events.num == 0, "AUTO_SAVE_OFF Clear must emit no SaveStarted events");
 
 	/* Cleanup */
 	obs_source_release(rs1);
@@ -643,10 +860,7 @@ int main(int argc, char **argv)
 	for (size_t i = 0; i < g_fake_ws.requests.num; i++)
 		bfree(g_fake_ws.requests.array[i].type);
 	da_free(g_fake_ws.requests);
-	for (size_t i = 0; i < g_fake_ws.events.num; i++) {
-		bfree(g_fake_ws.events.array[i].type);
-		bfree(g_fake_ws.events.array[i].source);
-	}
+	clear_fake_events();
 	da_free(g_fake_ws.events);
 	bfree(g_fake_ws.vendor_name);
 	proc_handler_destroy(g_fake_ws.ph);

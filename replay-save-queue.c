@@ -19,6 +19,7 @@ struct replay_save_job {
 	char *output_path;
 	char *save_encoder;
 	char *save_container;
+	char *trigger;
 	int save_quality;
 	bool lossless;
 	struct obs_source_frame **video_frames;
@@ -132,6 +133,7 @@ static void free_save_job(struct replay_save_job *job)
 	bfree(job->output_path);
 	bfree(job->save_encoder);
 	bfree(job->save_container);
+	bfree(job->trigger);
 	bfree(job);
 }
 
@@ -874,7 +876,7 @@ static void *save_queue_worker(void *param)
 		     job->source_name, job->output_path, job->video_frame_count, (double)job->duration_ns / 1e9,
 		     remaining_before, pinned_before, (double)pinned_before / (1024.0 * 1024.0));
 
-		replay_control_emit_save_started(job->source_name, job->output_path);
+		replay_control_emit_save_started(job->source_name, job->output_path, job->trigger);
 		bool aborted = false;
 		const bool ok = run_save_job(job, &aborted);
 		const double elapsed_s = (double)(os_gettime_ns() - start_ns) / 1e9;
@@ -942,7 +944,7 @@ size_t replay_save_all_loaded_replays(void)
 		obs_source_t *s = sources.array[i];
 		struct replay_source *ctx = obs_obj_get_data(s);
 		if (ctx)
-			replay_save(ctx);
+			replay_save_with_trigger(ctx, "save-all");
 		obs_source_release(s);
 	}
 	const size_t total_sources = sources.num;
@@ -1092,6 +1094,7 @@ bool replay_save_queue_enqueue(const struct replay_save_job_params *params)
 		bstrdup((params->save_encoder && *params->save_encoder) ? params->save_encoder : SAVE_ENCODER_AUTO);
 	job->save_container = bstrdup(
 		(params->save_container && *params->save_container) ? params->save_container : SAVE_CONTAINER_MP4);
+	job->trigger = bstrdup((params->trigger && *params->trigger) ? params->trigger : "manual");
 	int save_quality = params->save_quality ? params->save_quality : SETTING_SAVE_QUALITY_DEFAULT;
 	if (save_quality < SETTING_SAVE_QUALITY_MIN)
 		save_quality = SETTING_SAVE_QUALITY_MIN;
