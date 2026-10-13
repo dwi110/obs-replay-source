@@ -533,6 +533,8 @@ static obs_output_t *create_save_output(const struct replay_save_job *job, const
 		if (job->lossless) {
 			obs_data_set_string(fo_settings, "format_name", "avi");
 			obs_data_set_string(fo_settings, "audio_encoder", "pcm_s16le");
+			/* Frame-threaded UtVideo also retains a final packet; raw ffmpeg_output cannot drain it. */
+			obs_data_set_string(fo_settings, "video_settings", "threads=1");
 		} else {
 			const bool mkv = job->save_container && astrcmpi(job->save_container, SAVE_CONTAINER_MKV) == 0;
 			char vs[128];
@@ -704,7 +706,7 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 	}
 
 	bool started = false;
-	bool ffmpeg_nvenc = false;
+	bool raw_ffmpeg_output = false;
 	for (size_t p = 0; p < plan_count && !started; p++) {
 		const struct save_plan *plan = &plans[p];
 		const char *backend_name = plan->backend == SAVE_BACKEND_FFMPEG_OUTPUT ? "ffmpeg_output" : "obs encoder";
@@ -747,7 +749,7 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 			continue;
 		}
 		started = true;
-		ffmpeg_nvenc = !job->lossless && plan->backend == SAVE_BACKEND_FFMPEG_OUTPUT;
+		raw_ffmpeg_output = plan->backend == SAVE_BACKEND_FFMPEG_OUTPUT;
 	}
 	if (!started) {
 		blog(LOG_ERROR, "[replay_save_queue] No encoder could be started for '%s'", job->output_path);
@@ -764,8 +766,15 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 
 	uint64_t prev_target_ts = base_ts;
 	uint64_t locked_frames = 0;
+	/* File encoders use a constant frame rate. Preserve source time even when reception misses frames: repeat
+	 * the nearest preceding frame at the missing slots rather than speeding up the video relative to audio. */
+	const uint64_t output_frame_count =
+		util_mul_div64(job->duration_ns + frame_interval_ns / 2, vi.fps_num, 1000000000ULL * vi.fps_den) + 1;
+	uint64_t source_idx = 0;
+	blog(LOG_INFO, "[replay_save_queue] CFR schedule: input=%" PRIu64 " output=%" PRIu64 " frames",
+	     job->video_frame_count, output_frame_count);
 
-	for (uint64_t idx = 0; idx < job->video_frame_count; idx++) {
+	for (uint64_t idx = 0; idx < output_frame_count; idx++) {
 		if (is_shutting_down()) {
 			*aborted_out = true;
 			obs_output_force_stop(file_output);
@@ -778,13 +787,13 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 			goto cleanup;
 		}
 
-		const struct obs_source_frame *frame = job->video_frames[idx];
-		uint64_t rel_ts = (frame->timestamp >= job->first_frame_timestamp)
-					  ? (frame->timestamp - job->first_frame_timestamp)
-					  : (idx * frame_interval_ns);
-		uint64_t target_ts = base_ts + rel_ts;
-		if (idx > 0 && target_ts <= prev_target_ts)
-			target_ts = prev_target_ts + 1000;
+		const uint64_t rel_ts = idx * frame_interval_ns;
+		const uint64_t source_ts = job->first_frame_timestamp + rel_ts + frame_interval_ns / 2;
+		while (source_idx + 1 < job->video_frame_count &&
+		       job->video_frames[source_idx + 1]->timestamp <= source_ts)
+			source_idx++;
+		const struct obs_source_frame *frame = job->video_frames[source_idx];
+		const uint64_t target_ts = base_ts + rel_ts;
 		prev_target_ts = target_ts;
 
 		sleep_until_interruptible(target_ts);
@@ -824,10 +833,10 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 		os_sleep_ms(2);
 	}
 
-	if (ffmpeg_nvenc) {
-		/* ffmpeg_output closes AAC without an encoder drain. Keep its audio callbacks alive for encoder
-		 * priming plus callback/packet scheduling; after the clip they supply only silence. Do not submit
-		 * extra video frames. This preserves the final real audio samples instead of losing ~80 ms. */
+	if (raw_ffmpeg_output) {
+		/* ffmpeg_output closes AAC without an encoder drain and drops queued packets on stop. Allow its
+		 * callbacks/writer to finish; after the clip, audio callbacks supply only silence. This preserves
+		 * final audio samples (~80 ms otherwise) and the last PCM/UtVideo packets without extra video. */
 		const uint64_t audio_tail_ns =
 			util_mul_div64(5ULL * AUDIO_OUTPUT_FRAMES, 1000000000ULL, oi.samples_per_sec);
 		sleep_until_interruptible(base_ts + job->duration_ns + audio_tail_ns);
