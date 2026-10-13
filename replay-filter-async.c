@@ -39,10 +39,36 @@ static uint32_t estimate_pool_frames(const struct replay_filter *filter)
 		fps_num = ovi.fps_num;
 		fps_den = ovi.fps_den;
 	}
-	uint64_t frames = (filter->duration * (uint64_t)fps_num) / (SEC_TO_NSEC * (uint64_t)fps_den) + 4;
-	if (frames > 36000)
-		frames = 36000;
-	return (uint32_t)frames;
+	uint64_t buffer_frames = (filter->duration * (uint64_t)fps_num) / (SEC_TO_NSEC * (uint64_t)fps_den) + 4;
+	if (buffer_frames > 36000)
+		buffer_frames = 36000;
+
+	uint64_t multiplier = 1;
+	if (filter->reserve_mode == RESERVE_BUFFER_PLUS_ONE) {
+		multiplier = 2;
+	} else if (filter->reserve_mode == RESERVE_BUFFER_PLUS_MAX) {
+		const int max_r = filter->max_replays > 0 ? filter->max_replays : 1;
+		multiplier = 1 + (uint64_t)max_r;
+	}
+	return (uint32_t)(buffer_frames * multiplier);
+}
+
+static void log_reserve_target_locked(struct replay_filter *filter, uint32_t target_frames)
+{
+	if (!filter->pool)
+		return;
+	if (filter->logged_reserve_mode == filter->reserve_mode && filter->logged_reserve_target == target_frames)
+		return;
+	filter->logged_reserve_mode = filter->reserve_mode;
+	filter->logged_reserve_target = target_frames;
+
+	const size_t frame_bytes = replay_frame_byte_size(replay_pool_get_format(filter->pool),
+							  replay_pool_get_width(filter->pool),
+							  replay_pool_get_height(filter->pool));
+	const double target_gb = ((double)target_frames * (double)frame_bytes) / (1024.0 * 1024.0 * 1024.0);
+	const char *name = filter->src ? obs_source_get_name(filter->src) : "";
+	blog(LOG_INFO, "[replay-filter] '%s' reserve: mode=%d target=%u frames (%.2f GB)", name ? name : "",
+	     filter->reserve_mode, target_frames, target_gb);
 }
 
 static struct replay_pool *ensure_filter_pool_locked(struct replay_filter *filter, enum video_format dst_format,
@@ -51,7 +77,11 @@ static struct replay_pool *ensure_filter_pool_locked(struct replay_filter *filte
 	if (!filter->pool || replay_pool_get_format(filter->pool) != dst_format ||
 	    replay_pool_get_width(filter->pool) != dst_width || replay_pool_get_height(filter->pool) != dst_height) {
 		replay_pool_close(filter->pool);
-		filter->pool = replay_pool_create(dst_format, dst_width, dst_height, estimate_pool_frames(filter));
+		const uint32_t target = estimate_pool_frames(filter);
+		filter->pool = replay_pool_create(dst_format, dst_width, dst_height, target);
+		filter->logged_reserve_mode = -1;
+		filter->logged_reserve_target = 0;
+		log_reserve_target_locked(filter, target);
 	}
 	return filter->pool;
 }
@@ -97,8 +127,7 @@ static bool capture_single_frame_locked(struct replay_filter *filter, const stru
 	enum video_format dst_format;
 	uint32_t dst_width;
 	uint32_t dst_height;
-	replay_convert_target_format(src_frame->format, src_frame->width, src_frame->height,
-				     filter->storage_format == STORAGE_FORMAT_NV12,
+	replay_convert_target_format(src_frame->format, src_frame->width, src_frame->height, filter->storage_format,
 				     filter->downscale == DOWNSCALE_MAX_1080P, &dst_format, &dst_width, &dst_height);
 
 	struct replay_pool *pool = ensure_filter_pool_locked(filter, dst_format, dst_width, dst_height);
@@ -254,17 +283,35 @@ static void replay_filter_update(void *data, obs_data_t *settings)
 	const uint64_t new_duration = (uint64_t)obs_data_get_int(settings, SETTING_DURATION) * MSEC_TO_NSEC;
 	const int new_storage = (int)obs_data_get_int(settings, SETTING_STORAGE_FORMAT);
 	const int new_downscale = (int)obs_data_get_int(settings, SETTING_DOWNSCALE);
+	const int new_reserve = (int)obs_data_get_int(settings, SETTING_RESERVE_MODE);
+	int new_max_replays = (int)obs_data_get_int(settings, SETTING_REPLAYS);
+	if (new_max_replays < 1)
+		new_max_replays = 1;
 
 	pthread_mutex_lock(&filter->mutex);
-	if (new_duration < filter->duration || new_storage != filter->storage_format ||
-	    new_downscale != filter->downscale) {
+	const bool format_or_scale_changed =
+		(new_storage != filter->storage_format || new_downscale != filter->downscale);
+	if (new_duration < filter->duration || format_or_scale_changed) {
 		free_video_data(filter);
+	}
+	if (format_or_scale_changed && filter->pool) {
+		replay_pool_close(filter->pool);
+		filter->pool = NULL;
+		filter->logged_reserve_mode = -1;
+		filter->logged_reserve_target = 0;
 	}
 	filter->duration = new_duration;
 	filter->storage_format = new_storage;
 	filter->downscale = new_downscale;
-	if (filter->pool)
-		replay_pool_warmup(filter->pool, estimate_pool_frames(filter));
+	filter->reserve_mode = new_reserve;
+	filter->max_replays = new_max_replays;
+	/* Changing reserve_mode or duration only grows the pool in the background warm-up
+	 * thread; the pool never shrinks so in-flight frames and existing allocations stay valid. */
+	if (filter->pool) {
+		const uint32_t target = estimate_pool_frames(filter);
+		replay_pool_warmup(filter->pool, target);
+		log_reserve_target_locked(filter, target);
+	}
 	pthread_mutex_unlock(&filter->mutex);
 
 	filter->internal_frames = obs_data_get_bool(settings, SETTING_INTERNAL_FRAMES);
@@ -278,8 +325,12 @@ static void *replay_filter_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct replay_filter *context = bzalloc(sizeof(struct replay_filter));
 	context->src = source;
+	context->logged_reserve_mode = -1;
 	pthread_mutex_init(&context->mutex, NULL);
 	context->last_check = safe_video_frame_time();
+
+	obs_data_set_default_int(settings, SETTING_RESERVE_MODE, RESERVE_BUFFER_PLUS_ONE);
+	obs_data_set_default_int(settings, SETTING_REPLAYS, 1);
 
 	replay_filter_update(context, settings);
 
@@ -316,6 +367,8 @@ static void replay_filter_remove(void *data, obs_source_t *parent)
 	free_audio_data(filter);
 	replay_pool_close(filter->pool);
 	filter->pool = NULL;
+	filter->logged_reserve_mode = -1;
+	filter->logged_reserve_target = 0;
 	pthread_mutex_unlock(&filter->mutex);
 }
 

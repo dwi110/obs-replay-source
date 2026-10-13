@@ -27,8 +27,8 @@ struct replay_save_job_params {
 	const char *file_format;
 	const char *save_encoder;
 	const char *save_container;
+	int save_quality;
 	bool lossless;
-
 	struct obs_source_frame **video_frames;
 	uint64_t video_frame_count;
 

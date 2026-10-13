@@ -66,7 +66,10 @@ struct replay_filter {
 	struct replay_pool *pool;
 	int storage_format;
 	int downscale;
-
+	int reserve_mode;
+	int max_replays;
+	int logged_reserve_mode;
+	uint32_t logged_reserve_target;
 	obs_weak_source_t *tap_parent;
 	volatile bool tap_active;
 	bool tap_checked;
@@ -136,6 +139,7 @@ void replay_filter_check(void *data);
 #define SETTING_STORAGE_FORMAT "storage_format"
 #define STORAGE_FORMAT_NV12 0
 #define STORAGE_FORMAT_ORIGINAL 1
+#define STORAGE_FORMAT_UYVY 2
 #define SETTING_DOWNSCALE "downscale"
 #define DOWNSCALE_NONE 0
 #define DOWNSCALE_MAX_1080P 1
@@ -143,7 +147,14 @@ void replay_filter_check(void *data);
 #define SETTING_AUTO_RELEASE "auto_release"
 #define AUTO_RELEASE_NEVER 0
 #define AUTO_RELEASE_DEACTIVATE_HIDE 1
-
+#define SETTING_RESERVE_MODE "reserve_mode"
+#define RESERVE_BUFFER 0
+#define RESERVE_BUFFER_PLUS_ONE 1
+#define RESERVE_BUFFER_PLUS_MAX 2
+#define SETTING_SAVE_QUALITY "save_quality"
+#define SETTING_SAVE_QUALITY_MIN 10
+#define SETTING_SAVE_QUALITY_MAX 40
+#define SETTING_SAVE_QUALITY_DEFAULT 18
 #ifndef SEC_TO_NSEC
 #define SEC_TO_NSEC 1000000000ULL
 #endif

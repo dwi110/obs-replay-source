@@ -18,8 +18,8 @@ struct replay_save_job {
 	char *output_path;
 	char *save_encoder;
 	char *save_container;
+	int save_quality;
 	bool lossless;
-
 	struct obs_source_frame **video_frames;
 	uint64_t video_frame_count;
 
@@ -495,11 +495,14 @@ static bool write_frame_to_output(video_t *video_output, const struct video_outp
 	return true;
 }
 
-static void configure_video_encoder(obs_encoder_t *venc, const char *enc_id)
+static void configure_video_encoder(obs_encoder_t *venc, const char *enc_id, int save_quality)
 {
+	const int q = (save_quality >= SETTING_SAVE_QUALITY_MIN && save_quality <= SETTING_SAVE_QUALITY_MAX)
+			      ? save_quality
+			      : SETTING_SAVE_QUALITY_DEFAULT;
 	obs_data_t *settings = obs_data_create();
 	if (strcmp(enc_id, "obs_x264") == 0) {
-		obs_data_set_int(settings, "crf", 18);
+		obs_data_set_int(settings, "crf", q);
 		obs_data_set_bool(settings, "use_bufsize", true);
 		obs_data_set_string(settings, "rate_control", "CRF");
 		obs_data_set_string(settings, "profile", "high");
@@ -507,7 +510,7 @@ static void configure_video_encoder(obs_encoder_t *venc, const char *enc_id)
 	} else {
 		const bool is_hevc = strstr(enc_id, "hevc") != NULL;
 		obs_data_set_string(settings, "rate_control", "CQP");
-		obs_data_set_int(settings, "cqp", 18);
+		obs_data_set_int(settings, "cqp", q);
 		obs_data_set_string(settings, "preset", "p5");
 		obs_data_set_string(settings, "preset2", "p5");
 		obs_data_set_string(settings, "tune", "hq");
@@ -655,7 +658,7 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 			blog(LOG_ERROR, "[replay_save_queue] Failed to create video encoder '%s'", enc_id);
 			goto cleanup;
 		}
-		configure_video_encoder(video_encoder, enc_id);
+		configure_video_encoder(video_encoder, enc_id, job->save_quality);
 		obs_encoder_set_video(video_encoder, video_output);
 		obs_output_set_video_encoder(file_output, video_encoder);
 
@@ -1070,8 +1073,13 @@ bool replay_save_queue_enqueue(const struct replay_save_job_params *params)
 		bstrdup((params->save_encoder && *params->save_encoder) ? params->save_encoder : SAVE_ENCODER_AUTO);
 	job->save_container = bstrdup(
 		(params->save_container && *params->save_container) ? params->save_container : SAVE_CONTAINER_MP4);
+	int save_quality = params->save_quality ? params->save_quality : SETTING_SAVE_QUALITY_DEFAULT;
+	if (save_quality < SETTING_SAVE_QUALITY_MIN)
+		save_quality = SETTING_SAVE_QUALITY_MIN;
+	else if (save_quality > SETTING_SAVE_QUALITY_MAX)
+		save_quality = SETTING_SAVE_QUALITY_MAX;
+	job->save_quality = save_quality;
 	job->lossless = params->lossless;
-
 	job->video_frames = bzalloc((size_t)valid_v_count * sizeof(struct obs_source_frame *));
 	uint64_t v_idx = 0;
 	for (uint64_t i = 0; i < params->video_frame_count; i++) {
