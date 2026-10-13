@@ -26,6 +26,9 @@ target_sources(${PROJECT_NAME} PRIVATE
 	replay-filter-async.c
 	replay-save-queue.c
 	replay-save-queue.h
+	replay-control.c
+	replay-control.h
+	obs-websocket-api.h
 	replay.h
 	replay-pool.c
 	replay-pool.h

@@ -1,4 +1,5 @@
 #include "replay-save-queue.h"
+#include "replay-control.h"
 #include <inttypes.h>
 #include <string.h>
 #include <util/bmem.h>
@@ -48,6 +49,7 @@ struct replay_save_queue_state {
 	size_t pending_count;
 	size_t pinned_bytes;
 	uint64_t completed_count;
+	uint64_t enqueued_count;
 
 	volatile long active_encoders;
 	volatile long max_concurrent_encoders;
@@ -872,6 +874,7 @@ static void *save_queue_worker(void *param)
 		     job->source_name, job->output_path, job->video_frame_count, (double)job->duration_ns / 1e9,
 		     remaining_before, pinned_before, (double)pinned_before / (1024.0 * 1024.0));
 
+		replay_control_emit_save_started(job->source_name, job->output_path);
 		bool aborted = false;
 		const bool ok = run_save_job(job, &aborted);
 		const double elapsed_s = (double)(os_gettime_ns() - start_ns) / 1e9;
@@ -895,6 +898,8 @@ static void *save_queue_worker(void *param)
 		     job->video_frame_count, (double)job->duration_ns / 1e9, elapsed_s, remaining_after, pinned_after,
 		     (double)pinned_after / (1024.0 * 1024.0));
 
+
+		replay_control_emit_save_finished(job->source_name, job->output_path, ok);
 		free_save_job(job);
 
 		pthread_mutex_lock(&g_queue.mutex);
@@ -927,6 +932,12 @@ size_t replay_save_all_loaded_replays(void)
 	obs_enum_sources(collect_replay_sources_cb, &sources);
 
 	const size_t before_pending = replay_save_queue_pending_count();
+	uint64_t before_enqueued = 0;
+	if (g_queue.initialized) {
+		pthread_mutex_lock(&g_queue.mutex);
+		before_enqueued = g_queue.enqueued_count;
+		pthread_mutex_unlock(&g_queue.mutex);
+	}
 	for (size_t i = 0; i < sources.num; i++) {
 		obs_source_t *s = sources.array[i];
 		struct replay_source *ctx = obs_obj_get_data(s);
@@ -937,11 +948,18 @@ size_t replay_save_all_loaded_replays(void)
 	const size_t total_sources = sources.num;
 	da_free(sources);
 
+	uint64_t after_enqueued = before_enqueued;
+	if (g_queue.initialized) {
+		pthread_mutex_lock(&g_queue.mutex);
+		after_enqueued = g_queue.enqueued_count;
+		pthread_mutex_unlock(&g_queue.mutex);
+	}
+	const size_t queued = (size_t)(after_enqueued - before_enqueued);
 	const size_t after_pending = replay_save_queue_pending_count();
 	blog(LOG_INFO,
-	     "[replay_save_queue] Save all loaded replays triggered across %zu replay sources (queue length %zu -> %zu)",
-	     total_sources, before_pending, after_pending);
-	return total_sources;
+	     "[replay_save_queue] Save all loaded replays triggered across %zu replay sources (queued=%zu, queue length %zu -> %zu)",
+	     total_sources, queued, before_pending, after_pending);
+	return queued;
 }
 
 static void save_all_replays_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -968,6 +986,7 @@ void replay_save_queue_init(void)
 	g_queue.pending_count = 0;
 	g_queue.pinned_bytes = 0;
 	g_queue.completed_count = 0;
+	g_queue.enqueued_count = 0;
 	os_atomic_set_long(&g_queue.active_encoders, 0);
 	os_atomic_set_long(&g_queue.max_concurrent_encoders, 0);
 	os_atomic_set_bool(&g_queue.shutting_down, false);
@@ -1152,6 +1171,7 @@ bool replay_save_queue_enqueue(const struct replay_save_job_params *params)
 	}
 	g_queue.pending_count++;
 	g_queue.pinned_bytes += job->pinned_bytes;
+	g_queue.enqueued_count++;
 
 	const size_t total_queue_len = g_queue.pending_count + (g_queue.active_job ? 1 : 0);
 	const size_t total_pinned = g_queue.pinned_bytes;

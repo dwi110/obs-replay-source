@@ -10,6 +10,8 @@
 #include "replay.h"
 #include "replay-save-queue.h"
 #include <inttypes.h>
+#include "replay-control.h"
+#include <stddef.h>
 #include <string.h>
 
 #define VISIBILITY_ACTION_RESTART 0
@@ -472,6 +474,8 @@ static void replay_backward_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *h
 	}
 }
 
+uint64_t find_closest_frame(void *data, uint64_t ts, bool le);
+
 static void replay_update_position(struct replay_source *context, bool lock)
 {
 	if (lock)
@@ -511,6 +515,18 @@ static void replay_update_position(struct replay_source *context, bool lock)
 	context->pause_timestamp = 0;
 	if (context->backward && context->current_replay.video_frame_count) {
 		context->video_frame_position = context->current_replay.video_frame_count - 1;
+		if (context->current_replay.trim_end > 0 &&
+		    (uint64_t)context->current_replay.trim_end < context->current_replay.duration) {
+			uint64_t desired_ts =
+				context->current_replay.last_frame_timestamp - (uint64_t)context->current_replay.trim_end;
+			context->video_frame_position = find_closest_frame(context, desired_ts, true);
+		}
+	} else if (!context->backward && context->current_replay.video_frame_count &&
+		   context->current_replay.trim_front > 0 &&
+		   (uint64_t)context->current_replay.trim_front < context->current_replay.duration) {
+		uint64_t desired_ts =
+			context->current_replay.first_frame_timestamp + (uint64_t)context->current_replay.trim_front;
+		context->video_frame_position = find_closest_frame(context, desired_ts, false);
 	}
 	if (context->active || context->visibility_action == VISIBILITY_ACTION_CONTINUE) {
 		if (!context->play && !context->stepped) {
@@ -867,14 +883,19 @@ static void *update_scene_thread(void *data)
 	return NULL;
 }
 
-static void replay_retrieve(struct replay_source *context)
+static bool replay_retrieve_internal(struct replay_source *context, bool emit_event)
 {
-	obs_source_t *s = obs_get_source_by_name(context->source_name);
+	if (!context || context->disabled)
+		return false;
+	obs_source_t *s = (context->source_name && *context->source_name) ? obs_get_source_by_name(context->source_name)
+									  : NULL;
 	context->source_filter = NULL;
 	if (s)
 		obs_source_enum_filters(s, EnumFilter, context);
 
-	obs_source_t *as = obs_get_source_by_name(context->source_audio_name);
+	obs_source_t *as = (context->source_audio_name && *context->source_audio_name)
+				   ? obs_get_source_by_name(context->source_audio_name)
+				   : NULL;
 	context->source_audio_filter = NULL;
 	if (as)
 		obs_source_enum_filters(as, EnumAudioVideoFilter, context);
@@ -891,7 +912,7 @@ static void replay_retrieve(struct replay_source *context)
 			obs_source_release(s);
 		if (as)
 			obs_source_release(as);
-		return;
+		return false;
 	}
 
 	struct replay new_replay;
@@ -1028,6 +1049,23 @@ static void replay_retrieve(struct replay_source *context)
 		}
 	}
 	replay_update_text(context);
+	if (emit_event) {
+		uint64_t eff_start = new_replay.first_frame_timestamp;
+		if (new_replay.trim_front > 0 && (uint64_t)new_replay.trim_front < new_replay.duration)
+			eff_start += (uint64_t)new_replay.trim_front;
+		uint64_t eff_end = new_replay.last_frame_timestamp;
+		if (new_replay.trim_end > 0 && (uint64_t)new_replay.trim_end < new_replay.duration &&
+		    eff_end - (uint64_t)new_replay.trim_end > eff_start)
+			eff_end -= (uint64_t)new_replay.trim_end;
+		const uint64_t eff_dur = (eff_end > eff_start) ? (eff_end - eff_start) : 0;
+		replay_control_emit_replay_loaded(obs_source_get_name(context->source), (int64_t)(eff_dur / 1000000ULL));
+	}
+	return true;
+}
+
+static void replay_retrieve(struct replay_source *context)
+{
+	replay_retrieve_internal(context, true);
 }
 
 // Finds closest frame in the current replay given a desired timestamp.
@@ -1776,87 +1814,143 @@ void update_filter_settings(obs_source_t *filter, obs_data_t *settings)
 		obs_source_update(filter, NULL);
 }
 
+bool replay_source_execute_action(struct replay_source *context, const char *action, bool from_update)
+{
+	if (!action || !*action)
+		return false;
+
+	if (strcmp(action, "Load") == 0) {
+		if (context)
+			replay_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Next") == 0) {
+		if (context)
+			replay_next_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Previous") == 0) {
+		if (context)
+			replay_previous_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "First") == 0) {
+		if (context)
+			replay_first_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Last") == 0) {
+		if (context)
+			replay_last_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Remove") == 0) {
+		if (context)
+			replay_remove_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Clear") == 0) {
+		if (context)
+			replay_clear_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Save") == 0) {
+		if (context)
+			replay_save_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Restart") == 0) {
+		if (context)
+			replay_restart_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Pause") == 0) {
+		if (context)
+			replay_pause_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Faster") == 0) {
+		if (context)
+			replay_faster_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Slower") == 0) {
+		if (context)
+			replay_slower_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Faster5Percent") == 0) {
+		if (context)
+			replay_faster_by_5_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Slower5Percent") == 0) {
+		if (context)
+			replay_slower_by_5_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "NormalOrFaster") == 0) {
+		if (context)
+			replay_normal_or_faster_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "NormalOrSlower") == 0) {
+		if (context)
+			replay_normal_or_slower_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "NormalSpeed") == 0) {
+		if (context)
+			replay_normal_speed_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "HalfSpeed") == 0) {
+		if (context)
+			replay_half_speed_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "DoubleSpeed") == 0) {
+		if (context)
+			replay_double_speed_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "TrimFront") == 0) {
+		if (context)
+			replay_trim_front_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "TrimEnd") == 0) {
+		if (context)
+			replay_trim_end_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "TrimReset") == 0) {
+		if (context)
+			replay_trim_reset_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Reverse") == 0) {
+		if (context)
+			replay_reverse_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Backward") == 0) {
+		if (context)
+			replay_backward_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "Forward") == 0) {
+		if (context)
+			replay_forward_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "ForwardOrFaster") == 0) {
+		if (context)
+			replay_forward_or_faster_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "BackwardOrFaster") == 0) {
+		if (context)
+			replay_backward_or_faster_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "DisableNextScene") == 0) {
+		if (context)
+			context->next_scene_disabled = true;
+	} else if (strcmp(action, "EnableNextScene") == 0) {
+		if (context)
+			context->next_scene_disabled = false;
+	} else if (strcmp(action, "Disable") == 0) {
+		if (context) {
+			if (from_update)
+				context->disabled = true;
+			else
+				replay_disable_hotkey(context, 0, NULL, true);
+		}
+	} else if (strcmp(action, "Enable") == 0) {
+		if (context) {
+			if (from_update)
+				context->disabled = false;
+			else
+				replay_enable_hotkey(context, 0, NULL, true);
+		}
+	} else if (strcmp(action, "SetNextSceneToCurrent") == 0) {
+		if (context)
+			replay_next_scene_current_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "SwitchToNextScene") == 0) {
+		if (context)
+			replay_next_scene_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "NextFrame") == 0) {
+		if (context)
+			replay_next_frame_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "PrevFrame") == 0) {
+		if (context)
+			replay_prev_frame_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "NextNFrames") == 0) {
+		if (context)
+			replay_next_n_frames_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "PrevNFrames") == 0) {
+		if (context)
+			replay_prev_n_frames_hotkey(context, 0, NULL, true);
+	} else {
+		return false;
+	}
+
+	return true;
+}
+
 static void replay_source_update(void *data, obs_data_t *settings)
 {
 	struct replay_source *context = data;
 	const char *execute_action = obs_data_get_string(settings, SETTING_EXECUTE_ACTION);
 	if (execute_action && strlen(execute_action)) {
-		if (strcmp(execute_action, "Load") == 0) {
-			replay_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Next") == 0) {
-			replay_next_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Previous") == 0) {
-			replay_previous_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "First") == 0) {
-			replay_first_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Last") == 0) {
-			replay_last_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Remove") == 0) {
-			replay_remove_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Clear") == 0) {
-			replay_clear_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Save") == 0) {
-			replay_save_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Restart") == 0) {
-			replay_restart_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Pause") == 0) {
-			replay_pause_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Faster") == 0) {
-			replay_faster_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Slower") == 0) {
-			replay_slower_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Faster5Percent") == 0) {
-			replay_faster_by_5_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Slower5Percent") == 0) {
-			replay_slower_by_5_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "NormalOrFaster") == 0) {
-			replay_normal_or_faster_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "NormalOrSlower") == 0) {
-			replay_normal_or_slower_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "NormalSpeed") == 0) {
-			replay_normal_speed_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "HalfSpeed") == 0) {
-			replay_half_speed_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "DoubleSpeed") == 0) {
-			replay_double_speed_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "TrimFront") == 0) {
-			replay_trim_front_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "TrimEnd") == 0) {
-			replay_trim_end_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "TrimReset") == 0) {
-			replay_trim_reset_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Reverse") == 0) {
-			replay_reverse_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Backward") == 0) {
-			replay_backward_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "Forward") == 0) {
-			replay_forward_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "ForwardOrFaster") == 0) {
-			replay_forward_or_faster_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "BackwardOrFaster") == 0) {
-			replay_backward_or_faster_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "DisableNextScene") == 0) {
-			context->next_scene_disabled = true;
-		} else if (strcmp(execute_action, "EnableNextScene") == 0) {
-			context->next_scene_disabled = false;
-		} else if (strcmp(execute_action, "Disable") == 0) {
-			context->disabled = true;
-		} else if (strcmp(execute_action, "Enable") == 0) {
-			context->disabled = false;
-		} else if (strcmp(execute_action, "SetNextSceneToCurrent") == 0) {
-			replay_next_scene_current_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "SwitchToNextScene") == 0) {
-			replay_next_scene_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "NextFrame") == 0) {
-			replay_next_frame_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "PrevFrame") == 0) {
-			replay_prev_frame_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "NextNFrames") == 0) {
-			replay_next_n_frames_hotkey(context, 0, NULL, true);
-		} else if (strcmp(execute_action, "PrevNFrames") == 0) {
-			replay_prev_n_frames_hotkey(context, 0, NULL, true);
-		}
-
+		replay_source_execute_action(context, execute_action, true);
 		obs_data_erase(settings, SETTING_EXECUTE_ACTION);
 	}
 	const char *source_name = obs_data_get_string(settings, SETTING_SOURCE);
@@ -2095,6 +2189,134 @@ static void replay_source_update(void *data, obs_data_t *settings)
 	replay_update_text(context);
 }
 
+struct replay_source_hotkey_def {
+	const char *legacy_name;
+	const char *locale_key;
+	obs_hotkey_func func;
+	size_t field_offset;
+};
+
+static const struct replay_source_hotkey_def g_source_hotkey_defs[] = {
+	{"ReplaySource.Replay", "LoadReplay", replay_hotkey, offsetof(struct replay_source, replay_hotkey)},
+	{"ReplaySource.Next", "Next", replay_next_hotkey, offsetof(struct replay_source, next_hotkey)},
+	{"ReplaySource.Previous", "Previous", replay_previous_hotkey, offsetof(struct replay_source, previous_hotkey)},
+	{"ReplaySource.First", "First", replay_first_hotkey, offsetof(struct replay_source, first_hotkey)},
+	{"ReplaySource.Last", "Last", replay_last_hotkey, offsetof(struct replay_source, last_hotkey)},
+	{"ReplaySource.Remove", "Remove", replay_remove_hotkey, offsetof(struct replay_source, remove_hotkey)},
+	{"ReplaySource.Clear", "Clear", replay_clear_hotkey, offsetof(struct replay_source, clear_hotkey)},
+	{"ReplaySource.Save", "SaveReplay", replay_save_hotkey, offsetof(struct replay_source, save_hotkey)},
+	{"ReplaySource.Restart", "Restart", replay_restart_hotkey, offsetof(struct replay_source, restart_hotkey)},
+	{"ReplaySource.Pause", "Pause", replay_pause_hotkey, offsetof(struct replay_source, pause_hotkey)},
+	{"ReplaySource.Faster", "Faster", replay_faster_hotkey, offsetof(struct replay_source, faster_hotkey)},
+	{"ReplaySource.Slower", "Slower", replay_slower_hotkey, offsetof(struct replay_source, slower_hotkey)},
+	{"ReplaySource.FasterBy5", "Faster5Percent", replay_faster_by_5_hotkey,
+	 offsetof(struct replay_source, faster_by_5_hotkey)},
+	{"ReplaySource.SlowerBy5", "Slower5Percent", replay_slower_by_5_hotkey,
+	 offsetof(struct replay_source, slower_by_5_hotkey)},
+	{"ReplaySource.NormalOrFaster", "NormalOrFaster", replay_normal_or_faster_hotkey,
+	 offsetof(struct replay_source, normal_or_faster_hotkey)},
+	{"ReplaySource.NormalOrSlower", "NormalOrSlower", replay_normal_or_slower_hotkey,
+	 offsetof(struct replay_source, normal_or_slower_hotkey)},
+	{"ReplaySource.NormalSpeed", "NormalSpeed", replay_normal_speed_hotkey,
+	 offsetof(struct replay_source, normal_speed_hotkey)},
+	{"ReplaySource.HalfSpeed", "HalfSpeed", replay_half_speed_hotkey,
+	 offsetof(struct replay_source, half_speed_hotkey)},
+	{"ReplaySource.DoubleSpeed", "DoubleSpeed", replay_double_speed_hotkey,
+	 offsetof(struct replay_source, double_speed_hotkey)},
+	{"ReplaySource.TrimFront", "TrimFront", replay_trim_front_hotkey,
+	 offsetof(struct replay_source, trim_front_hotkey)},
+	{"ReplaySource.TrimEnd", "TrimEnd", replay_trim_end_hotkey, offsetof(struct replay_source, trim_end_hotkey)},
+	{"ReplaySource.TrimReset", "TrimReset", replay_trim_reset_hotkey,
+	 offsetof(struct replay_source, trim_reset_hotkey)},
+	{"ReplaySource.Reverse", "Reverse", replay_reverse_hotkey, offsetof(struct replay_source, reverse_hotkey)},
+	{"ReplaySource.Forward", "Forward", replay_forward_hotkey, offsetof(struct replay_source, forward_hotkey)},
+	{"ReplaySource.Backward", "Backward", replay_backward_hotkey, offsetof(struct replay_source, backward_hotkey)},
+	{"ReplaySource.ForwardOrFaster", "ForwardOrFaster", replay_forward_or_faster_hotkey,
+	 offsetof(struct replay_source, forward_or_faster_hotkey)},
+	{"ReplaySource.BackwardOrFaster", "BackwardOrFaster", replay_backward_or_faster_hotkey,
+	 offsetof(struct replay_source, backward_or_faster_hotkey)},
+	{"ReplaySource.Disable", "Disable", replay_disable_hotkey, offsetof(struct replay_source, disable_hotkey)},
+	{"ReplaySource.Enable", "Enable", replay_enable_hotkey, offsetof(struct replay_source, enable_hotkey)},
+	{"ReplaySource.DisableNextScene", "DisableNextScene", replay_disable_next_scene_hotkey,
+	 offsetof(struct replay_source, disable_next_scene_hotkey)},
+	{"ReplaySource.EnableNextScene", "EnableNextScene", replay_enable_next_scene_hotkey,
+	 offsetof(struct replay_source, enable_next_scene_hotkey)},
+	{"ReplaySource.NextSceneCurrent", "SetNextSceneToCurrent", replay_next_scene_current_hotkey,
+	 offsetof(struct replay_source, next_scene_current_hotkey)},
+	{"ReplaySource.NextScene", "SwitchToNextScene", replay_next_scene_hotkey,
+	 offsetof(struct replay_source, next_scene_hotkey)},
+	{"ReplaySource.PrevFrame", "PrevFrame", replay_prev_frame_hotkey,
+	 offsetof(struct replay_source, prev_frame_hotkey)},
+	{"ReplaySource.NextFrame", "NextFrame", replay_next_frame_hotkey,
+	 offsetof(struct replay_source, next_frame_hotkey)},
+	{"ReplaySource.PrevNFrames", "PrevNFrames", replay_prev_n_frames_hotkey,
+	 offsetof(struct replay_source, prev_n_frames_hotkey)},
+	{"ReplaySource.NextNFrames", "NextNFrames", replay_next_n_frames_hotkey,
+	 offsetof(struct replay_source, next_n_frames_hotkey)},
+};
+
+#define REPLAY_SOURCE_HOTKEY_COUNT (sizeof(g_source_hotkey_defs) / sizeof(g_source_hotkey_defs[0]))
+
+static inline obs_hotkey_id *replay_source_hotkey_slot(struct replay_source *context, size_t offset)
+{
+	return (obs_hotkey_id *)((char *)context + offset);
+}
+
+static void format_source_hotkey_name(struct dstr *out, const char *legacy_name, const char *source_name)
+{
+	if (source_name && *source_name)
+		dstr_printf(out, "%s.%s", legacy_name, source_name);
+	else
+		dstr_copy(out, legacy_name);
+}
+
+struct hotkey_binding_check {
+	obs_hotkey_id id;
+	bool found;
+};
+
+static bool check_hotkey_binding_cb(void *data, size_t idx, obs_hotkey_binding_t *binding)
+{
+	UNUSED_PARAMETER(idx);
+	struct hotkey_binding_check *check = data;
+	if (obs_hotkey_binding_get_hotkey_id(binding) == check->id) {
+		check->found = true;
+		return false;
+	}
+	return true;
+}
+
+static bool replay_hotkey_has_bindings(obs_hotkey_id id)
+{
+	if (id == OBS_INVALID_HOTKEY_ID)
+		return false;
+	struct hotkey_binding_check check = {id, false};
+	obs_enum_hotkey_bindings(check_hotkey_binding_cb, &check);
+	return check.found;
+}
+
+static void replay_source_rename_cb(void *data, calldata_t *cd)
+{
+	struct replay_source *context = data;
+	if (!context || !context->source)
+		return;
+	const char *new_name = calldata_string(cd, "new_name");
+	if (!new_name)
+		new_name = obs_source_get_name(context->source);
+
+	struct dstr hotkey_name;
+	dstr_init(&hotkey_name);
+	for (size_t i = 0; i < REPLAY_SOURCE_HOTKEY_COUNT; i++) {
+		const struct replay_source_hotkey_def *def = &g_source_hotkey_defs[i];
+		obs_hotkey_id id = *replay_source_hotkey_slot(context, def->field_offset);
+		if (id == OBS_INVALID_HOTKEY_ID)
+			continue;
+		format_source_hotkey_name(&hotkey_name, def->legacy_name, new_name);
+		obs_hotkey_set_name(id, hotkey_name.array);
+	}
+	dstr_free(&hotkey_name);
+}
+
 static void *replay_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	UNUSED_PARAMETER(settings);
@@ -2109,123 +2331,41 @@ static void *replay_source_create(obs_data_t *settings, obs_source_t *source)
 	pthread_mutex_init(&context->replay_mutex, NULL);
 
 	circlebuf_init(&context->replays);
+	context->speed_percent = 100.0f;
+	context->replay_max = 1;
 
-	context->replay_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.Replay", obs_module_text("LoadReplay"), replay_hotkey, context);
+	const char *src_name = obs_source_get_name(source);
+	struct dstr hotkey_name;
+	dstr_init(&hotkey_name);
+	for (size_t i = 0; i < REPLAY_SOURCE_HOTKEY_COUNT; i++) {
+		const struct replay_source_hotkey_def *def = &g_source_hotkey_defs[i];
+		obs_hotkey_id *slot = replay_source_hotkey_slot(context, def->field_offset);
+		const char *desc = obs_module_text(def->locale_key);
+		format_source_hotkey_name(&hotkey_name, def->legacy_name, src_name);
 
-	context->next_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.Next", obs_module_text("Next"), replay_next_hotkey, context);
+		obs_hotkey_id new_id = obs_hotkey_register_source(source, hotkey_name.array, desc, def->func, context);
+		*slot = new_id;
 
-	context->previous_hotkey = obs_hotkey_register_source(source, "ReplaySource.Previous", obs_module_text("Previous"),
-							      replay_previous_hotkey, context);
+		if (new_id != OBS_INVALID_HOTKEY_ID && src_name && *src_name && !replay_hotkey_has_bindings(new_id)) {
+			obs_hotkey_id tmp_id =
+				obs_hotkey_register_source(source, def->legacy_name, desc, def->func, context);
+			if (tmp_id != OBS_INVALID_HOTKEY_ID) {
+				if (replay_hotkey_has_bindings(tmp_id)) {
+					obs_data_array_t *saved = obs_hotkey_save(tmp_id);
+					if (saved) {
+						obs_hotkey_load(new_id, saved);
+						obs_data_array_release(saved);
+					}
+				}
+				obs_hotkey_unregister(tmp_id);
+			}
+		}
+	}
+	dstr_free(&hotkey_name);
 
-	context->first_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.First", obs_module_text("First"), replay_first_hotkey, context);
-
-	context->last_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.Last", obs_module_text("Last"), replay_last_hotkey, context);
-
-	context->remove_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.Remove", obs_module_text("Remove"), replay_remove_hotkey, context);
-
-	context->clear_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.Clear", obs_module_text("Clear"), replay_clear_hotkey, context);
-
-	context->save_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.Save", obs_module_text("SaveReplay"), replay_save_hotkey, context);
-
-	context->restart_hotkey = obs_hotkey_register_source(source, "ReplaySource.Restart", obs_module_text("Restart"),
-							     replay_restart_hotkey, context);
-
-	context->pause_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.Pause", obs_module_text("Pause"), replay_pause_hotkey, context);
-
-	context->faster_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.Faster", obs_module_text("Faster"), replay_faster_hotkey, context);
-
-	context->slower_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.Slower", obs_module_text("Slower"), replay_slower_hotkey, context);
-
-	context->faster_by_5_hotkey = obs_hotkey_register_source(
-		source, "ReplaySource.FasterBy5", obs_module_text("Faster5Percent"), replay_faster_by_5_hotkey, context);
-
-	context->slower_by_5_hotkey = obs_hotkey_register_source(
-		source, "ReplaySource.SlowerBy5", obs_module_text("Slower5Percent"), replay_slower_by_5_hotkey, context);
-
-	context->normal_or_faster_hotkey = obs_hotkey_register_source(
-		source, "ReplaySource.NormalOrFaster", obs_module_text("NormalOrFaster"), replay_normal_or_faster_hotkey, context);
-
-	context->normal_or_slower_hotkey = obs_hotkey_register_source(
-		source, "ReplaySource.NormalOrSlower", obs_module_text("NormalOrSlower"), replay_normal_or_slower_hotkey, context);
-
-	context->normal_speed_hotkey = obs_hotkey_register_source(
-		source, "ReplaySource.NormalSpeed", obs_module_text("NormalSpeed"), replay_normal_speed_hotkey, context);
-
-	context->half_speed_hotkey = obs_hotkey_register_source(source, "ReplaySource.HalfSpeed", obs_module_text("HalfSpeed"),
-								replay_half_speed_hotkey, context);
-
-	context->double_speed_hotkey = obs_hotkey_register_source(
-		source, "ReplaySource.DoubleSpeed", obs_module_text("DoubleSpeed"), replay_double_speed_hotkey, context);
-
-	context->trim_front_hotkey = obs_hotkey_register_source(source, "ReplaySource.TrimFront", obs_module_text("TrimFront"),
-								replay_trim_front_hotkey, context);
-
-	context->trim_end_hotkey = obs_hotkey_register_source(source, "ReplaySource.TrimEnd", obs_module_text("TrimEnd"),
-							      replay_trim_end_hotkey, context);
-
-	context->trim_reset_hotkey = obs_hotkey_register_source(source, "ReplaySource.TrimReset", obs_module_text("TrimReset"),
-								replay_trim_reset_hotkey, context);
-
-	context->reverse_hotkey = obs_hotkey_register_source(source, "ReplaySource.Reverse", obs_module_text("Reverse"),
-							     replay_reverse_hotkey, context);
-
-	context->forward_hotkey = obs_hotkey_register_source(source, "ReplaySource.Forward", obs_module_text("Forward"),
-							     replay_forward_hotkey, context);
-
-	context->backward_hotkey = obs_hotkey_register_source(source, "ReplaySource.Backward", obs_module_text("Backward"),
-							      replay_backward_hotkey, context);
-
-	context->forward_or_faster_hotkey = obs_hotkey_register_source(source, "ReplaySource.ForwardOrFaster",
-								       obs_module_text("ForwardOrFaster"),
-								       replay_forward_or_faster_hotkey, context);
-
-	context->backward_or_faster_hotkey = obs_hotkey_register_source(source, "ReplaySource.BackwardOrFaster",
-									obs_module_text("BackwardOrFaster"),
-									replay_backward_or_faster_hotkey, context);
-
-	context->disable_hotkey = obs_hotkey_register_source(source, "ReplaySource.Disable", obs_module_text("Disable"),
-							     replay_disable_hotkey, context);
-
-	context->enable_hotkey =
-		obs_hotkey_register_source(source, "ReplaySource.Enable", obs_module_text("Enable"), replay_enable_hotkey, context);
-
-	context->disable_next_scene_hotkey = obs_hotkey_register_source(source, "ReplaySource.DisableNextScene",
-									obs_module_text("DisableNextScene"),
-									replay_disable_next_scene_hotkey, context);
-
-	context->enable_next_scene_hotkey = obs_hotkey_register_source(source, "ReplaySource.EnableNextScene",
-								       obs_module_text("EnableNextScene"),
-								       replay_enable_next_scene_hotkey, context);
-
-	context->next_scene_current_hotkey = obs_hotkey_register_source(source, "ReplaySource.NextSceneCurrent",
-									obs_module_text("SetNextSceneToCurrent"),
-									replay_next_scene_current_hotkey, context);
-
-	context->next_scene_hotkey = obs_hotkey_register_source(
-		source, "ReplaySource.NextScene", obs_module_text("SwitchToNextScene"), replay_next_scene_hotkey, context);
-
-	context->prev_frame_hotkey = obs_hotkey_register_source(source, "ReplaySource.PrevFrame", obs_module_text("PrevFrame"),
-								replay_prev_frame_hotkey, context);
-
-	context->next_frame_hotkey = obs_hotkey_register_source(source, "ReplaySource.NextFrame", obs_module_text("NextFrame"),
-								replay_next_frame_hotkey, context);
-
-	context->prev_n_frames_hotkey = obs_hotkey_register_source(
-		source, "ReplaySource.PrevNFrames", obs_module_text("PrevNFrames"), replay_prev_n_frames_hotkey, context);
-
-	context->next_n_frames_hotkey = obs_hotkey_register_source(
-		source, "ReplaySource.NextNFrames", obs_module_text("NextNFrames"), replay_next_n_frames_hotkey, context);
-
+	signal_handler_t *sh = obs_source_get_signal_handler(source);
+	if (sh)
+		signal_handler_connect(sh, "rename", replay_source_rename_cb, context);
 	return context;
 }
 
@@ -2233,6 +2373,11 @@ static void replay_source_destroy(void *data)
 {
 	struct replay_source *context = data;
 
+	if (context->source) {
+		signal_handler_t *sh = obs_source_get_signal_handler(context->source);
+		if (sh)
+			signal_handler_disconnect(sh, "rename", replay_source_rename_cb, context);
+	}
 	pthread_mutex_lock(&context->video_mutex);
 	pthread_mutex_lock(&context->audio_mutex);
 	context->current_replay.video_frame_count = 0;
@@ -2981,3 +3126,251 @@ struct obs_source_info replay_source_info = {
 	.media_stop = replay_stop,
 	.media_set_time = replay_set_time,
 };
+
+void replay_source_set_speed(struct replay_source *context, float speed_percent)
+{
+	if (!context)
+		return;
+	pthread_mutex_lock(&context->video_mutex);
+	update_speed(context, speed_percent);
+	pthread_mutex_unlock(&context->video_mutex);
+}
+
+void replay_source_restart_playback(struct replay_source *context)
+{
+	if (!context)
+		return;
+	pthread_mutex_lock(&context->video_mutex);
+	replay_restart(context);
+	pthread_mutex_unlock(&context->video_mutex);
+}
+
+void replay_source_toggle_pause(struct replay_source *context)
+{
+	if (!context)
+		return;
+	pthread_mutex_lock(&context->video_mutex);
+	replay_play_pause(context, true);
+	pthread_mutex_unlock(&context->video_mutex);
+}
+
+struct filter_lookup_ctx {
+	const char *owner_name;
+	bool allow_audio_id;
+	obs_source_t *found;
+};
+
+static void lookup_filter_cb(obs_source_t *parent, obs_source_t *filter, void *param)
+{
+	UNUSED_PARAMETER(parent);
+	struct filter_lookup_ctx *lctx = param;
+	const char *filter_name = obs_source_get_name(filter);
+	const char *id = obs_source_get_unversioned_id(filter);
+	if (!filter_name || !lctx->owner_name || !id || strcmp(filter_name, lctx->owner_name) != 0)
+		return;
+	if (strcmp(id, REPLAY_FILTER_ASYNC_ID) == 0 || strcmp(id, REPLAY_FILTER_ID) == 0 ||
+	    (lctx->allow_audio_id && strcmp(id, REPLAY_FILTER_AUDIO_ID) == 0)) {
+		lctx->found = filter;
+	}
+}
+
+static uint64_t inspect_filter_buffered_ns(const char *target_source_name, const char *owner_name, bool audio_Fallback)
+{
+	if (!target_source_name || !*target_source_name || !owner_name || !*owner_name)
+		return 0;
+	obs_source_t *s = obs_get_source_by_name(target_source_name);
+	if (!s)
+		return 0;
+	struct filter_lookup_ctx lctx = {
+		.owner_name = owner_name,
+		.allow_audio_id = audio_Fallback,
+		.found = NULL,
+	};
+	obs_source_enum_filters(s, lookup_filter_cb, &lctx);
+	uint64_t buffered_ns = 0;
+	struct replay_filter *f = lctx.found ? obs_obj_get_data(lctx.found) : NULL;
+	if (f) {
+		pthread_mutex_lock(&f->mutex);
+		if (f->video_frames.size >= sizeof(struct obs_source_frame *)) {
+			struct obs_source_frame *first = NULL;
+			struct obs_source_frame *last = NULL;
+			circlebuf_peek_front(&f->video_frames, &first, sizeof(first));
+			circlebuf_peek_back(&f->video_frames, &last, sizeof(last));
+			if (first && last && last->timestamp >= first->timestamp)
+				buffered_ns = last->timestamp - first->timestamp;
+		} else if (audio_Fallback && f->audio_frames.size >= sizeof(struct obs_audio_data)) {
+			struct obs_audio_data first = {0};
+			struct obs_audio_data last = {0};
+			circlebuf_peek_front(&f->audio_frames, &first, sizeof(first));
+			circlebuf_peek_back(&f->audio_frames, &last, sizeof(last));
+			if (last.timestamp >= first.timestamp)
+				buffered_ns = last.timestamp - first.timestamp;
+		}
+		pthread_mutex_unlock(&f->mutex);
+	}
+	obs_source_release(s);
+	return buffered_ns;
+}
+
+static void compute_replay_window_ns(const struct replay *r, uint64_t *start_out, uint64_t *end_out,
+				     uint64_t *duration_out)
+{
+	if (!r || (r->video_frame_count == 0 && r->audio_frame_count == 0)) {
+		if (start_out)
+			*start_out = 0;
+		if (end_out)
+			*end_out = 0;
+		if (duration_out)
+			*duration_out = 0;
+		return;
+	}
+	uint64_t start_ns = r->first_frame_timestamp;
+	if (r->trim_front > 0 && (uint64_t)r->trim_front < r->duration)
+		start_ns += (uint64_t)r->trim_front;
+	uint64_t end_ns = r->last_frame_timestamp;
+	if (r->trim_end > 0 && (uint64_t)r->trim_end < r->duration && end_ns - (uint64_t)r->trim_end > start_ns)
+		end_ns -= (uint64_t)r->trim_end;
+	if (start_out)
+		*start_out = start_ns;
+	if (end_out)
+		*end_out = end_ns;
+	if (duration_out)
+		*duration_out = (end_ns > start_ns) ? (end_ns - start_ns) : 0;
+}
+
+bool replay_source_get_status(struct replay_source *context, struct replay_source_status *out)
+{
+	if (!context || !out)
+		return false;
+	memset(out, 0, sizeof(*out));
+
+	pthread_mutex_lock(&context->video_mutex);
+	pthread_mutex_lock(&context->replay_mutex);
+
+	const char *owner_name = context->source ? obs_source_get_name(context->source) : "";
+	out->name = owner_name ? owner_name : "";
+	out->video_source = context->source_name ? context->source_name : "";
+	out->loaded_replays = (int)(context->replays.size / sizeof(struct replay));
+	out->active = context->active;
+	out->playing = context->play;
+	out->speed_percent = context->speed_percent;
+	out->backward = context->backward;
+
+	if (out->loaded_replays > 0) {
+		compute_replay_window_ns(&context->current_replay, &out->effective_start_ns, &out->effective_end_ns,
+					 &out->effective_duration_ns);
+		out->duration_ms = (int64_t)(out->effective_duration_ns / 1000000ULL);
+	}
+
+	char *v_src = context->source_name ? bstrdup(context->source_name) : NULL;
+	char *a_src = context->source_audio_name ? bstrdup(context->source_audio_name) : NULL;
+	char *owner_copy = owner_name ? bstrdup(owner_name) : NULL;
+
+	pthread_mutex_unlock(&context->replay_mutex);
+	pthread_mutex_unlock(&context->video_mutex);
+
+	uint64_t buffered_ns = inspect_filter_buffered_ns(v_src, owner_copy, false);
+	if (buffered_ns == 0 && a_src && *a_src)
+		buffered_ns = inspect_filter_buffered_ns(a_src, owner_copy, true);
+	out->buffered_ms = (int64_t)(buffered_ns / 1000000ULL);
+
+	bfree(v_src);
+	bfree(a_src);
+	bfree(owner_copy);
+	return true;
+}
+
+bool replay_source_load_unaligned(struct replay_source *context, uint64_t *first_ts_out, uint64_t *last_ts_out)
+{
+	if (!context)
+		return false;
+	if (!replay_retrieve_internal(context, false))
+		return false;
+
+	bool ok = false;
+	pthread_mutex_lock(&context->replay_mutex);
+	const size_t count = context->replays.size / sizeof(struct replay);
+	if (count > 0) {
+		struct replay *r = circlebuf_data(&context->replays, (count - 1) * sizeof(struct replay));
+		if (r && (r->video_frame_count > 0 || r->audio_frame_count > 0)) {
+			if (first_ts_out)
+				*first_ts_out = r->first_frame_timestamp;
+			if (last_ts_out)
+				*last_ts_out = r->last_frame_timestamp;
+			ok = true;
+		}
+	}
+	pthread_mutex_unlock(&context->replay_mutex);
+	return ok;
+}
+
+void replay_source_align_loaded_replay(struct replay_source *context, uint64_t common_start_ns, uint64_t common_end_ns,
+				       uint64_t *start_ns_out, uint64_t *duration_ns_out, int64_t *trim_front_ns_out,
+				       int64_t *trim_end_ns_out)
+{
+	if (!context)
+		return;
+
+	uint64_t eff_start = 0;
+	uint64_t eff_dur = 0;
+	int64_t tf = 0;
+	int64_t te = 0;
+	bool updated = false;
+
+	pthread_mutex_lock(&context->replay_mutex);
+	const int count = (int)(context->replays.size / sizeof(struct replay));
+	if (count > 0) {
+		struct replay *r = circlebuf_data(&context->replays, (size_t)(count - 1) * sizeof(struct replay));
+		if (r) {
+			if (common_end_ns > common_start_ns && common_start_ns >= r->first_frame_timestamp &&
+			    common_end_ns <= r->last_frame_timestamp) {
+				r->trim_front = (int64_t)(common_start_ns - r->first_frame_timestamp);
+				r->trim_end = (int64_t)(r->last_frame_timestamp - common_end_ns);
+			}
+			tf = r->trim_front;
+			te = r->trim_end;
+			compute_replay_window_ns(r, &eff_start, NULL, &eff_dur);
+			context->replay_position = count - 1;
+			updated = true;
+		}
+	}
+	pthread_mutex_unlock(&context->replay_mutex);
+
+	if (updated)
+		replay_update_position(context, true);
+
+	if (start_ns_out)
+		*start_ns_out = eff_start;
+	if (duration_ns_out)
+		*duration_ns_out = eff_dur;
+	if (trim_front_ns_out)
+		*trim_front_ns_out = tf;
+	if (trim_end_ns_out)
+		*trim_end_ns_out = te;
+}
+
+bool replay_source_get_active_window_frames(struct replay_source *context, uint64_t *first_frame_ts_out,
+					    uint64_t *last_frame_ts_out)
+{
+	if (!context)
+		return false;
+	pthread_mutex_lock(&context->video_mutex);
+	if (context->current_replay.video_frame_count == 0 || !context->current_replay.video_frames) {
+		pthread_mutex_unlock(&context->video_mutex);
+		return false;
+	}
+	uint64_t eff_start = 0;
+	uint64_t eff_end = 0;
+	compute_replay_window_ns(&context->current_replay, &eff_start, &eff_end, NULL);
+	const uint64_t first_idx = find_closest_frame(context, eff_start, false);
+	const uint64_t last_idx = find_closest_frame(context, eff_end, true);
+	const uint64_t first_ts = context->current_replay.video_frames[first_idx]->timestamp;
+	const uint64_t last_ts = context->current_replay.video_frames[last_idx]->timestamp;
+	pthread_mutex_unlock(&context->video_mutex);
+
+	if (first_frame_ts_out)
+		*first_frame_ts_out = first_ts;
+	if (last_frame_ts_out)
+		*last_frame_ts_out = last_ts;
+	return true;
+}
