@@ -56,7 +56,6 @@ size_t replay_save_queue_pinned_bytes(void);
 uint64_t replay_save_queue_completed_count(void);
 long replay_save_queue_max_concurrent_encoders(void);
 bool replay_save_queue_wait_idle(uint32_t timeout_ms);
-const char *replay_save_select_encoder(const char *save_encoder);
 
 #ifdef __cplusplus
 }

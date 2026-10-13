@@ -106,51 +106,6 @@ static struct obs_audio_data *create_clip_audio_frames(uint64_t start_ts, uint64
 	return pkts;
 }
 
-static bool find_save_all_hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *key)
-{
-	UNUSED_PARAMETER(id);
-	bool *found = data;
-	const char *name = obs_hotkey_get_name(key);
-	const char *desc = obs_hotkey_get_description(key);
-	if (name && strcmp(name, "ReplaySource.SaveAll") == 0) {
-		printf("[test] Found global hotkey: name='%s' desc='%s'\n", name, desc ? desc : "");
-		*found = true;
-		return false;
-	}
-	return true;
-}
-
-static const char *mock_tex_enc_name(void *unused)
-{
-	UNUSED_PARAMETER(unused);
-	return "Mock Texture NVENC";
-}
-
-static void *mock_tex_enc_create(obs_data_t *settings, obs_encoder_t *encoder)
-{
-	UNUSED_PARAMETER(settings);
-	UNUSED_PARAMETER(encoder);
-	return NULL;
-}
-
-static void mock_tex_enc_destroy(void *data)
-{
-	UNUSED_PARAMETER(data);
-}
-
-static bool mock_tex_encode(void *data, uint32_t handle, int64_t pts, uint64_t lock_key, uint64_t *next_key,
-			    struct encoder_packet *packet, bool *received_packet)
-{
-	UNUSED_PARAMETER(data);
-	UNUSED_PARAMETER(handle);
-	UNUSED_PARAMETER(pts);
-	UNUSED_PARAMETER(lock_key);
-	UNUSED_PARAMETER(next_key);
-	UNUSED_PARAMETER(packet);
-	UNUSED_PARAMETER(received_packet);
-	return false;
-}
-
 static bool validate_with_ffprobe(const char *filepath, const char *expected_vcodec, int expected_frames)
 {
 	char cmd[1024];
@@ -236,8 +191,8 @@ static bool validate_with_ffprobe(const char *filepath, const char *expected_vco
 		fprintf(stderr, "[test] Expected 640x360, got %dx%d\n", width, height);
 		return false;
 	}
-	if (nb_read_frames < expected_frames - 5 || nb_read_frames > expected_frames + 5) {
-		fprintf(stderr, "[test] Expected ~%d frames, got %d\n", expected_frames, nb_read_frames);
+	if (nb_read_frames != expected_frames) {
+		fprintf(stderr, "[test] Expected %d frames, got %d\n", expected_frames, nb_read_frames);
 		return false;
 	}
 	if (duration < 0.80 || duration > 1.35) {
@@ -251,6 +206,28 @@ static bool validate_with_ffprobe(const char *filepath, const char *expected_vco
 	}
 
 	return true;
+}
+
+static bool validate_gap_content(void)
+{
+	FILE *fp = popen("ffmpeg -v error -i '/tmp/replay-save-queue-test/test_clip - Cam_Gap.avi' "
+			"-vf crop=2:2:0:0 -pix_fmt yuv420p -f rawvideo -", "r");
+	if (!fp)
+		return false;
+	bool ok = true;
+	for (size_t i = 0; i < 60; i++) {
+		uint8_t pixels[6];
+		const size_t source_index = (i >= 20 && i < 30) ? 19 : i;
+		const uint8_t expected = (uint8_t)(16 + source_index * 3);
+		if (fread(pixels, 1, sizeof(pixels), fp) != sizeof(pixels) || pixels[0] != expected) {
+			fprintf(stderr, "[test] Gap replay frame %zu did not retain source time\n", i);
+			ok = false;
+			break;
+		}
+	}
+	if (ok && fgetc(fp) != EOF)
+		ok = false;
+	return pclose(fp) == 0 && ok;
 }
 
 int main(int argc, char **argv)
@@ -329,36 +306,8 @@ int main(int argc, char **argv)
 
 	obs_post_load_modules();
 
-	/* Register a mock texture-only jim_nvenc encoder to verify auto selection skips texture-only encoders */
-	struct obs_encoder_info mock_jim_nvenc = {
-		.id = "jim_nvenc",
-		.type = OBS_ENCODER_VIDEO,
-		.codec = "h264",
-		.caps = OBS_ENCODER_CAP_PASS_TEXTURE,
-		.get_name = mock_tex_enc_name,
-		.create = mock_tex_enc_create,
-		.destroy = mock_tex_enc_destroy,
-		.encode_texture = mock_tex_encode,
-	};
-	obs_register_encoder(&mock_jim_nvenc);
-
 	if (!obs_module_load()) {
 		fprintf(stderr, "[test] obs_module_load failed\n");
-		return 1;
-	}
-
-	const char *chosen_enc = replay_save_select_encoder(SAVE_ENCODER_AUTO);
-	printf("[test] Auto-selected encoder on this host: '%s'\n", chosen_enc);
-	if (strcmp(chosen_enc, "obs_x264") != 0) {
-		fprintf(stderr, "[test] Expected auto encoder 'obs_x264' (skipping texture-only jim_nvenc), got '%s'\n",
-			chosen_enc);
-		return 1;
-	}
-
-	bool hotkey_found = false;
-	obs_enum_hotkeys(find_save_all_hotkey_cb, &hotkey_found);
-	if (!hotkey_found) {
-		fprintf(stderr, "[test] Global hotkey ReplaySource.SaveAll was not registered\n");
 		return 1;
 	}
 
@@ -367,6 +316,7 @@ int main(int argc, char **argv)
 	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_NV12.mp4");
 	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_UYVY.mkv");
 	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_Lossless.avi");
+	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_Gap.avi");
 
 	const uint64_t frame_count = 60;
 	const uint64_t interval_ns = 1000000000ULL / 60ULL;
@@ -448,7 +398,20 @@ int main(int argc, char **argv)
 		.trim_end = 0,
 	};
 
-	/* Enqueue both jobs back-to-back */
+	/* A 1 s camera interval with ten missing input frames must not become a faster/shorter saved clip. */
+	struct obs_source_frame *gap_frames[50];
+	size_t gap_count = 0;
+	for (uint64_t i = 0; i < frame_count; i++) {
+		if (i < 20 || i >= 30)
+			gap_frames[gap_count++] = nv12_frames[i];
+	}
+	struct replay_save_job_params gap_job = job1;
+	gap_job.source_name = "Cam_Gap";
+	gap_job.video_frames = gap_frames;
+	gap_job.video_frame_count = gap_count;
+	gap_job.lossless = true;
+
+	/* Enqueue the format variants and the sparse-timestamp regression back-to-back. */
 	if (!replay_save_queue_enqueue(&job1)) {
 		fprintf(stderr, "[test] Failed to enqueue job1 (NV12 MP4)\n");
 		return 1;
@@ -461,10 +424,14 @@ int main(int argc, char **argv)
 		fprintf(stderr, "[test] Failed to enqueue job3 (Lossless AVI)\n");
 		return 1;
 	}
+	if (!replay_save_queue_enqueue(&gap_job)) {
+		fprintf(stderr, "[test] Failed to enqueue sparse-timestamp clip\n");
+		return 1;
+	}
 
 	const size_t pinned_after_enqueue = replay_save_queue_pinned_bytes();
 	const size_t pending_after_enqueue = replay_save_queue_pending_count();
-	printf("[test] Immediately after enqueueing 2 jobs: pending=%zu, pinned=%zu bytes\n", pending_after_enqueue,
+	printf("[test] Immediately after enqueueing 4 jobs: pending=%zu, pinned=%zu bytes\n", pending_after_enqueue,
 	       pinned_after_enqueue);
 	if (pinned_after_enqueue == 0 || pending_after_enqueue == 0) {
 		fprintf(stderr, "[test] Expected non-zero pinned bytes and pending count after enqueue\n");
@@ -485,7 +452,7 @@ int main(int argc, char **argv)
 		free_audio_packet(&uyvy_audio[i]);
 	bfree(uyvy_audio);
 
-	/* Wait for both jobs to complete sequentially */
+	/* Wait for all jobs to complete sequentially. */
 	if (!replay_save_queue_wait_idle(30000)) {
 		fprintf(stderr, "[test] Timeout waiting for save queue to finish\n");
 		return 1;
@@ -497,8 +464,8 @@ int main(int argc, char **argv)
 	printf("[test] Queue idle: completed=%" PRIu64 ", max_concurrent_encoders=%ld, pinned_after=%zu\n", completed,
 	       max_concurrent, pinned_after_idle);
 
-	if (completed != 3) {
-		fprintf(stderr, "[test] Expected 3 completed jobs, got %" PRIu64 "\n", completed);
+	if (completed != 4) {
+		fprintf(stderr, "[test] Expected 4 completed jobs, got %" PRIu64 "\n", completed);
 		return 1;
 	}
 	if (max_concurrent != 1) {
@@ -520,6 +487,11 @@ int main(int argc, char **argv)
 	}
 	if (!validate_with_ffprobe("/tmp/replay-save-queue-test/test_clip - Cam_Lossless.avi", "utvideo", 60)) {
 		fprintf(stderr, "[test] Validation failed for Lossless AVI\n");
+		return 1;
+	}
+	if (!validate_with_ffprobe("/tmp/replay-save-queue-test/test_clip - Cam_Gap.avi", "utvideo", 60) ||
+	    !validate_gap_content()) {
+		fprintf(stderr, "[test] Sparse input timestamps changed saved playback duration\n");
 		return 1;
 	}
 

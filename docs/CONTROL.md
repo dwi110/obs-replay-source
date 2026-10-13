@@ -246,6 +246,22 @@ Configured per replay source under settings:
 - **`On Release (with Mark In/Out)` (`2`)**: Enqueue when the loaded replay is released (`Clear`, `Remove`, purge when exceeding `Maximum Replays`, auto-release on deactivate/hide, or replacement by a newer load). This honors any `Mark In` or `Mark Out` set during playback. Not triggered during source destroy or OBS shutdown.
 
 Each replay is auto-saved at most once (tracked via an internal replay flag). Manual saves (`Save`, `SaveAll`) always remain available.
+
+Saving still uses one global sequential queue. NVENC HEVC/H.264 uses OBS's raw `ffmpeg_output` with the bundled
+FFmpeg `hevc_nvenc`/`h264_nvenc` encoders, not OBS's canvas-bound NVENC encoders. The latter crash with the private
+replay `video_t` on OBS 31+ (`cuda_surface_init` calls `obs_encoder_video_tex_active` without a core video mix).
+If a backend cannot start, the next plan is tried before feeding the clip: HEVC NVENC → H.264 NVENC → x264;
+explicit H.264 tries H.264 then x264, and explicit x264 stays on x264.
+
+NVENC uses preset P5 and CQP (quality 10–40, default 18), without B-frames, lookahead or packet delay: `ffmpeg_output`
+does not drain delayed video packets when stopping. This preserves all clip frames at a modest compression-efficiency
+cost. AAC callbacks continue briefly with silence after the selected end to emit the final audio samples; no extra video
+frames are submitted. x264 remains CRF/veryfast through `ffmpeg_muxer`; lossless remains UtVideo/PCM AVI.
+
+Exports preserve source time at the OBS canvas frame rate. Missing reception slots hold the previous available frame;
+they do not shorten the video or shift it ahead of audio. A lossless sparse-input regression decodes the result and
+checks both duration/frame count and the held-frame positions. UtVideo uses one encoding thread to avoid its final
+frame-threading packet delay in `ffmpeg_output`.
 ---
 
 ## 5. Bitfocus Companion Setup
