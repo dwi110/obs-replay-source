@@ -123,11 +123,13 @@ static void parse_sources_string(const char *raw, string_list_t *out)
 	dstr_free(&token);
 }
 
-static void extract_target_names(obs_data_t *request_data, string_list_t *names_out, bool *has_filter_out)
+/* Returns false when a target filter was given but yields no names, e.g. a JSON array of strings, which
+ * obs-websocket drops while converting JSON to obs_data (only arrays of objects survive). */
+static bool extract_target_names(obs_data_t *request_data, string_list_t *names_out, bool *has_filter_out)
 {
 	*has_filter_out = false;
 	if (!request_data)
-		return;
+		return true;
 
 	const char *single = obs_data_get_string(request_data, "source");
 	if (single && *single) {
@@ -170,6 +172,14 @@ static void extract_target_names(obs_data_t *request_data, string_list_t *names_
 			parse_sources_string(sources_str, names_out);
 		}
 	}
+	return !*has_filter_out || names_out->num > 0;
+}
+
+static void set_invalid_sources_error(obs_data_t *response_data)
+{
+	obs_data_set_bool(response_data, "ok", false);
+	obs_data_set_string(response_data, "error",
+			    "sources: use a comma-separated string (\"Cam 1,Cam 2\") or [{\"name\": \"Cam 1\"}]");
 }
 
 static void resolve_target_sources(const char *const *filter_names, size_t filter_count, bool has_filter,
@@ -504,7 +514,11 @@ static void vendor_req_action(obs_data_t *request_data, obs_data_t *response_dat
 	string_list_t filter_names;
 	da_init(filter_names);
 	bool has_filter = false;
-	extract_target_names(request_data, &filter_names, &has_filter);
+	if (!extract_target_names(request_data, &filter_names, &has_filter)) {
+		free_string_darray(&filter_names);
+		set_invalid_sources_error(response_data);
+		return;
+	}
 
 	obs_data_array_t *applied_arr = obs_data_array_create();
 	obs_data_array_t *unknown_arr = obs_data_array_create();
@@ -560,7 +574,11 @@ static void vendor_req_set_speed(obs_data_t *request_data, obs_data_t *response_
 	string_list_t filter_names;
 	da_init(filter_names);
 	bool has_filter = false;
-	extract_target_names(request_data, &filter_names, &has_filter);
+	if (!extract_target_names(request_data, &filter_names, &has_filter)) {
+		free_string_darray(&filter_names);
+		set_invalid_sources_error(response_data);
+		return;
+	}
 
 	obs_data_array_t *applied_arr = obs_data_array_create();
 	obs_data_array_t *unknown_arr = obs_data_array_create();
@@ -604,7 +622,11 @@ static void vendor_req_load_all(obs_data_t *request_data, obs_data_t *response_d
 	string_list_t filter_names;
 	da_init(filter_names);
 	bool has_filter = false;
-	extract_target_names(request_data, &filter_names, &has_filter);
+	if (!extract_target_names(request_data, &filter_names, &has_filter)) {
+		free_string_darray(&filter_names);
+		set_invalid_sources_error(response_data);
+		return;
+	}
 
 	replay_control_load_all_internal((const char *const *)filter_names.array, filter_names.num, has_filter,
 					 response_data);

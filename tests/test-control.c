@@ -603,6 +603,34 @@ int main(int argc, char **argv)
 	CHECK(replay_source_get_status(ctx2, &st2) && st2.speed_percent == 25.0f,
 	      "expected Replay Cam 2 speed 25.0, got %.2f", st2.speed_percent);
 
+	/* A JSON string array ("sources": ["Replay Cam 1"]) reaches the plugin as an empty obs_data array because
+	 * obs-websocket keeps only object items; that must be rejected instead of silently targeting nothing. */
+	obs_data_t *bad_req = obs_data_create();
+	obs_data_t *bad_res = obs_data_create();
+	obs_data_array_t *dropped_strings = obs_data_array_create();
+	obs_data_set_array(bad_req, "sources", dropped_strings);
+	obs_data_array_release(dropped_strings);
+	obs_data_set_double(bad_req, "speedPercent", 50.0);
+	CHECK(call_ws_request("SetSpeed", bad_req, bad_res), "SetSpeed (empty sources) request call failed");
+	CHECK(!obs_data_get_bool(bad_res, "ok"), "expected SetSpeed with empty sources array to fail");
+	CHECK(replay_source_get_status(ctx1, &st1) && st1.speed_percent == 25.0f,
+	      "speed must stay 25.0 after rejected request, got %.2f", st1.speed_percent);
+	obs_data_release(bad_req);
+	obs_data_release(bad_res);
+
+	/* Comma-separated string targets exactly the listed sources */
+	obs_data_t *csv_req = obs_data_create();
+	obs_data_t *csv_res = obs_data_create();
+	obs_data_set_string(csv_req, "sources", "Replay Cam 1, Replay Cam 2");
+	obs_data_set_double(csv_req, "speedPercent", 40.0);
+	CHECK(call_ws_request("SetSpeed", csv_req, csv_res), "SetSpeed (csv) request call failed");
+	CHECK(obs_data_get_bool(csv_res, "ok") && obs_data_get_int(csv_res, "appliedCount") == 2,
+	      "expected SetSpeed csv applied to 2 sources");
+	CHECK(replay_source_get_status(ctx2, &st2) && st2.speed_percent == 40.0f,
+	      "expected Replay Cam 2 speed 40.0, got %.2f", st2.speed_percent);
+	obs_data_release(csv_req);
+	obs_data_release(csv_res);
+
 	/* Cleanup */
 	obs_source_release(rs1);
 	obs_source_release(rs2);
