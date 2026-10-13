@@ -1132,15 +1132,9 @@ bool replay_save_queue_enqueue(const struct replay_save_job_params *params)
 
 			struct obs_audio_data *dst = &job->audio_frames[a_idx++];
 			*dst = *src;
-			const size_t plane_bytes = (size_t)src->frames * sizeof(float);
-			for (size_t p = 0; p < MAX_AV_PLANES; p++) {
-				if (src->data[p]) {
-					dst->data[p] = bmemdup(src->data[p], plane_bytes);
-					job->pinned_bytes += plane_bytes;
-				} else {
-					dst->data[p] = NULL;
-				}
-			}
+			replay_audio_packet_addref(dst);
+			for (size_t p = 0; p < MAX_AV_PLANES && src->data[p]; p++)
+				job->pinned_bytes += (size_t)src->frames * sizeof(float);
 		}
 		job->audio_frame_count = a_idx;
 	}

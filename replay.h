@@ -80,15 +80,21 @@ struct replay_filter {
 	uint64_t capture_log_ts;
 };
 
+/* Audio packet ownership: every struct obs_audio_data stored by a replay filter, a loaded replay or a
+ * pending save points into one refcounted block holding all planes. replay_audio_packet_copy creates a
+ * block with one reference, replay_audio_packet_addref shares it (loading a replay copies no samples) and
+ * free_audio_packet drops one reference. Never bfree the plane pointers directly. */
+void replay_audio_packet_copy(struct obs_audio_data *dst, const struct obs_audio_data *src);
+void replay_audio_packet_addref(struct obs_audio_data *audio);
 void free_audio_packet(struct obs_audio_data *audio);
 struct obs_audio_data *replay_filter_audio(void *data, struct obs_audio_data *audio);
 void free_video_data(struct replay_filter *filter);
 void free_audio_data(struct replay_filter *filter);
 
 /* Frame ownership: every struct obs_source_frame stored by a replay filter, a loaded
- * replay or a pending save is referenced through these helpers only. A stored frame
- * starts with refs == 1; each additional holder calls replay_frame_addref and every
- * holder drops its reference with replay_frame_release. */
+ * replay or a pending save comes from replay_pool_acquire and is referenced through these
+ * helpers only. A stored frame starts with refs == 1; each additional holder calls
+ * replay_frame_addref and every holder drops its reference with replay_frame_release. */
 void replay_frame_addref(struct obs_source_frame *frame);
 void replay_frame_release(struct obs_source_frame *frame);
 void replay_trigger_threshold(void *data);

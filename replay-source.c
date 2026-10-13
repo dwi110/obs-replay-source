@@ -972,13 +972,7 @@ static bool replay_retrieve_internal(struct replay_source *context, bool emit_ev
 					new_replay.last_frame_timestamp = audio.timestamp;
 				}
 				memcpy(&new_replay.audio_frames[i], &audio, sizeof(struct obs_audio_data));
-				for (size_t j = 0; j < MAX_AV_PLANES; j++) {
-					if (!audio.data[j])
-						break;
-
-					new_replay.audio_frames[i].data[j] =
-						bmemdup(audio.data[j], audio.frames * sizeof(float));
-				}
+				replay_audio_packet_addref(&new_replay.audio_frames[i]);
 			}
 		} else {
 			for (uint64_t i = 0; i < new_replay.audio_frame_count; i++) {

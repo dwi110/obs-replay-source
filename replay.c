@@ -56,11 +56,11 @@ struct obs_audio_data *replay_filter_audio(void *data, struct obs_audio_data *au
 		filter->oai.samples_per_sec = oai.samples_per_sec;
 	}
 
-	for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+	replay_audio_packet_copy(&cached, audio);
+
+	for (size_t i = 0; !threshold_trigger && i < MAX_AV_PLANES; i++) {
 		if (!audio->data[i])
 			break;
-
-		cached.data[i] = bmemdup(audio->data[i], audio->frames * sizeof(float));
 
 		for (size_t j = 0; !threshold_trigger && j < audio->frames; j++) {
 			if (fabsf(((float *)audio->data[i])[j]) > filter->threshold)
@@ -104,10 +104,53 @@ struct obs_audio_data *replay_filter_audio(void *data, struct obs_audio_data *au
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("replay-source", "en-US")
 
+/* One allocation per packet: [refcount header][plane 0][plane 1]...; the header size keeps every plane
+ * at the 32-byte alignment bmalloc guarantees. */
+#define REPLAY_AUDIO_HEADER_SIZE 64
+
+struct replay_audio_block {
+	volatile long refs;
+};
+
+static inline struct replay_audio_block *replay_audio_block_of(const struct obs_audio_data *audio)
+{
+	return (struct replay_audio_block *)(audio->data[0] - REPLAY_AUDIO_HEADER_SIZE);
+}
+
+void replay_audio_packet_copy(struct obs_audio_data *dst, const struct obs_audio_data *src)
+{
+	*dst = *src;
+	size_t planes = 0;
+	while (planes < MAX_AV_PLANES && src->data[planes])
+		planes++;
+	for (size_t i = 0; i < MAX_AV_PLANES; i++)
+		dst->data[i] = NULL;
+	if (!planes)
+		return;
+
+	const size_t plane_bytes = (size_t)src->frames * sizeof(float);
+	const size_t stride = (plane_bytes + 31) & ~(size_t)31;
+	uint8_t *mem = bmalloc(REPLAY_AUDIO_HEADER_SIZE + stride * planes);
+	((struct replay_audio_block *)mem)->refs = 1;
+	for (size_t i = 0; i < planes; i++) {
+		dst->data[i] = mem + REPLAY_AUDIO_HEADER_SIZE + stride * i;
+		memcpy(dst->data[i], src->data[i], plane_bytes);
+	}
+}
+
+void replay_audio_packet_addref(struct obs_audio_data *audio)
+{
+	if (audio && audio->data[0])
+		os_atomic_inc_long(&replay_audio_block_of(audio)->refs);
+}
+
 void free_audio_packet(struct obs_audio_data *audio)
 {
-	for (size_t i = 0; i < MAX_AV_PLANES; i++)
-		bfree(audio->data[i]);
+	if (audio->data[0]) {
+		struct replay_audio_block *block = replay_audio_block_of(audio);
+		if (os_atomic_dec_long(&block->refs) == 0)
+			bfree(block);
+	}
 	memset(audio, 0, sizeof(*audio));
 }
 

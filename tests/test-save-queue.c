@@ -12,6 +12,7 @@
 #include <util/dstr.h>
 #include "replay.h"
 #include "replay-save-queue.h"
+#include "replay-pool.h"
 
 extern bool obs_module_load(void);
 extern void obs_module_unload(void);
@@ -52,14 +53,16 @@ static void fill_uyvy_frame(struct obs_source_frame *f, uint32_t frame_idx)
 	}
 }
 
+/* Stored frames always come from a replay pool (see the ownership contract in replay.h); the pool is closed
+ * right away and frees itself once the last frame reference is released. */
 static struct obs_source_frame **create_clip_video_frames(enum video_format fmt, uint32_t width, uint32_t height,
 							  uint64_t count, uint64_t start_ts, uint64_t interval_ns)
 {
+	struct replay_pool *pool = replay_pool_create(fmt, width, height, 0);
 	struct obs_source_frame **frames = bzalloc((size_t)count * sizeof(struct obs_source_frame *));
 	for (uint64_t i = 0; i < count; i++) {
-		struct obs_source_frame *f = obs_source_frame_create(fmt, width, height);
+		struct obs_source_frame *f = replay_pool_acquire(pool);
 		f->timestamp = start_ts + i * interval_ns;
-		f->refs = 1;
 		video_format_get_parameters_for_format(VIDEO_CS_709, VIDEO_RANGE_PARTIAL, fmt, f->color_matrix,
 						       f->color_range_min, f->color_range_max);
 		if (fmt == VIDEO_FORMAT_NV12)
@@ -68,6 +71,7 @@ static struct obs_source_frame **create_clip_video_frames(enum video_format fmt,
 			fill_uyvy_frame(f, (uint32_t)i);
 		frames[i] = f;
 	}
+	replay_pool_close(pool);
 	return frames;
 }
 
@@ -82,20 +86,22 @@ static struct obs_audio_data *create_clip_audio_frames(uint64_t start_ts, uint64
 	double phase = 0.0;
 	const double step = 2.0 * 3.14159265358979323846 * 440.0 / (double)sample_rate;
 
+	float *ch0 = bmalloc(frames_per_pkt * sizeof(float));
+	float *ch1 = bmalloc(frames_per_pkt * sizeof(float));
 	for (uint64_t i = 0; i < count; i++) {
-		pkts[i].frames = frames_per_pkt;
-		pkts[i].timestamp = start_ts + i * pkt_ns;
-		float *ch0 = bmalloc(frames_per_pkt * sizeof(float));
-		float *ch1 = bmalloc(frames_per_pkt * sizeof(float));
 		for (uint32_t s = 0; s < frames_per_pkt; s++) {
 			float v = (float)(0.25 * sin(phase));
 			ch0[s] = v;
 			ch1[s] = v;
 			phase += step;
 		}
-		pkts[i].data[0] = (uint8_t *)ch0;
-		pkts[i].data[1] = (uint8_t *)ch1;
+		struct obs_audio_data src = {.frames = frames_per_pkt, .timestamp = start_ts + i * pkt_ns};
+		src.data[0] = (uint8_t *)ch0;
+		src.data[1] = (uint8_t *)ch1;
+		replay_audio_packet_copy(&pkts[i], &src);
 	}
+	bfree(ch0);
+	bfree(ch1);
 	*out_count = count;
 	return pkts;
 }
