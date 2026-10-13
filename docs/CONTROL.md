@@ -249,7 +249,7 @@ Each replay is auto-saved at most once (tracked via an internal replay flag). Ma
 
 Saving still uses one global sequential queue. NVENC HEVC/H.264 uses OBS's raw `ffmpeg_output` with the bundled
 FFmpeg `hevc_nvenc`/`h264_nvenc` encoders, not OBS's canvas-bound NVENC encoders. The latter crash with the private
-replay `video_t` on OBS 31+ (`cuda_surface_init` calls `obs_encoder_video_tex_active` without a core video mix).
+replay `video_t` on OBS 31.1+ (`cuda_surface_init` calls `obs_encoder_video_tex_active` without a core video mix).
 If a backend cannot start, the next plan is tried before feeding the clip: HEVC NVENC → H.264 NVENC → x264;
 explicit H.264 tries H.264 then x264, and explicit x264 stays on x264.
 
