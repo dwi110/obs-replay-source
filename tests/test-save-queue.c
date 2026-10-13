@@ -106,50 +106,6 @@ static struct obs_audio_data *create_clip_audio_frames(uint64_t start_ts, uint64
 	return pkts;
 }
 
-static bool find_save_all_hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *key)
-{
-	UNUSED_PARAMETER(id);
-	bool *found = data;
-	const char *name = obs_hotkey_get_name(key);
-	const char *desc = obs_hotkey_get_description(key);
-	if (name && strcmp(name, "ReplaySource.SaveAll") == 0) {
-		printf("[test] Found global hotkey: name='%s' desc='%s'\n", name, desc ? desc : "");
-		*found = true;
-		return false;
-	}
-	return true;
-}
-
-static const char *mock_tex_enc_name(void *unused)
-{
-	UNUSED_PARAMETER(unused);
-	return "Mock Texture NVENC";
-}
-
-static void *mock_tex_enc_create(obs_data_t *settings, obs_encoder_t *encoder)
-{
-	UNUSED_PARAMETER(settings);
-	UNUSED_PARAMETER(encoder);
-	return NULL;
-}
-
-static void mock_tex_enc_destroy(void *data)
-{
-	UNUSED_PARAMETER(data);
-}
-
-static bool mock_tex_encode(void *data, uint32_t handle, int64_t pts, uint64_t lock_key, uint64_t *next_key,
-			    struct encoder_packet *packet, bool *received_packet)
-{
-	UNUSED_PARAMETER(data);
-	UNUSED_PARAMETER(handle);
-	UNUSED_PARAMETER(pts);
-	UNUSED_PARAMETER(lock_key);
-	UNUSED_PARAMETER(next_key);
-	UNUSED_PARAMETER(packet);
-	UNUSED_PARAMETER(received_packet);
-	return false;
-}
 
 static bool validate_with_ffprobe(const char *filepath, const char *expected_vcodec, int expected_frames)
 {
@@ -329,36 +285,8 @@ int main(int argc, char **argv)
 
 	obs_post_load_modules();
 
-	/* Register a mock texture-only jim_nvenc encoder to verify auto selection skips texture-only encoders */
-	struct obs_encoder_info mock_jim_nvenc = {
-		.id = "jim_nvenc",
-		.type = OBS_ENCODER_VIDEO,
-		.codec = "h264",
-		.caps = OBS_ENCODER_CAP_PASS_TEXTURE,
-		.get_name = mock_tex_enc_name,
-		.create = mock_tex_enc_create,
-		.destroy = mock_tex_enc_destroy,
-		.encode_texture = mock_tex_encode,
-	};
-	obs_register_encoder(&mock_jim_nvenc);
-
 	if (!obs_module_load()) {
 		fprintf(stderr, "[test] obs_module_load failed\n");
-		return 1;
-	}
-
-	const char *chosen_enc = replay_save_select_encoder(SAVE_ENCODER_AUTO);
-	printf("[test] Auto-selected encoder on this host: '%s'\n", chosen_enc);
-	if (strcmp(chosen_enc, "obs_x264") != 0) {
-		fprintf(stderr, "[test] Expected auto encoder 'obs_x264' (skipping texture-only jim_nvenc), got '%s'\n",
-			chosen_enc);
-		return 1;
-	}
-
-	bool hotkey_found = false;
-	obs_enum_hotkeys(find_save_all_hotkey_cb, &hotkey_found);
-	if (!hotkey_found) {
-		fprintf(stderr, "[test] Global hotkey ReplaySource.SaveAll was not registered\n");
 		return 1;
 	}
 

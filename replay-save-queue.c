@@ -151,72 +151,66 @@ static bool encoder_type_registered(const char *id)
 	return false;
 }
 
-static bool encoder_accepts_raw_frames(const char *id)
+/* Save backends.
+ *
+ * Clips are fed through a private video_output_open() video_t. OBS NVENC encoders cannot consume it: obs-nvenc
+ * (OBS >= 31) calls obs_encoder_video_tex_active() while allocating its CUDA surfaces, which dereferences the core
+ * video mix of the encoder's video_t without a NULL check; a private video_t has no mix (access violation in
+ * obs.dll, seen on OBS 32.2.2). NVENC is therefore driven through ffmpeg_output with libavcodec's nvenc encoders,
+ * which consume raw frames. OBS NVENC encoder types are only used to detect an NVIDIA encoder. x264 keeps the
+ * obs_encoder + ffmpeg_muxer path. */
+enum save_backend {
+	SAVE_BACKEND_OBS_ENCODER,
+	SAVE_BACKEND_FFMPEG_OUTPUT,
+};
+
+struct save_plan {
+	enum save_backend backend;
+	const char *codec; /* obs encoder type id or libavcodec encoder name */
+};
+
+#define MAX_SAVE_PLANS 3
+
+static bool nvenc_present(void)
 {
-	if (!encoder_type_registered(id))
-		return false;
-	if (obs_get_encoder_type(id) != OBS_ENCODER_VIDEO)
-		return false;
-	const uint32_t caps = obs_get_encoder_caps(id);
-	if ((caps & OBS_ENCODER_CAP_PASS_TEXTURE) != 0)
-		return false;
-	return true;
+	static const char *const ids[] = {
+		"obs_nvenc_hevc_tex", "obs_nvenc_h264_tex", "obs_nvenc_hevc_soft", "obs_nvenc_h264_soft",
+		"jim_hevc_nvenc",     "jim_nvenc",          "ffmpeg_hevc_nvenc",   "ffmpeg_nvenc",
+		NULL,
+	};
+	for (size_t i = 0; ids[i]; i++) {
+		if (encoder_type_registered(ids[i]))
+			return true;
+	}
+	return false;
 }
 
-const char *replay_save_select_encoder(const char *save_encoder)
+static void add_plan(struct save_plan *plans, size_t *count, enum save_backend backend, const char *codec)
 {
-	static const char *const auto_candidates[] = {
-		"obs_nvenc_hevc_soft",
-		"obs_nvenc_h264_soft",
-		"obs_nvenc_hevc_cuda",
-		"obs_nvenc_h264_cuda",
-		"jim_hevc_nvenc",
-		"jim_nvenc",
-		"ffmpeg_hevc_nvenc",
-		"ffmpeg_nvenc",
-		"obs_x264",
-		NULL,
-	};
-	static const char *const hevc_candidates[] = {
-		"obs_nvenc_hevc_soft",
-		"obs_nvenc_hevc_cuda",
-		"jim_hevc_nvenc",
-		"ffmpeg_hevc_nvenc",
-		NULL,
-	};
-	static const char *const h264_candidates[] = {
-		"obs_nvenc_h264_soft",
-		"obs_nvenc_h264_cuda",
-		"jim_nvenc",
-		"ffmpeg_nvenc",
-		NULL,
-	};
+	plans[*count].backend = backend;
+	plans[*count].codec = codec;
+	(*count)++;
+}
 
-	if (save_encoder && astrcmpi(save_encoder, SAVE_ENCODER_X264) == 0) {
-		if (encoder_accepts_raw_frames("obs_x264"))
-			return "obs_x264";
-	} else if (save_encoder && astrcmpi(save_encoder, SAVE_ENCODER_HEVC_NVENC) == 0) {
-		for (size_t i = 0; hevc_candidates[i]; i++) {
-			if (encoder_accepts_raw_frames(hevc_candidates[i]))
-				return hevc_candidates[i];
+static size_t build_save_plans(const char *save_encoder, struct save_plan *plans)
+{
+	size_t count = 0;
+	const bool want_x264 = save_encoder && astrcmpi(save_encoder, SAVE_ENCODER_X264) == 0;
+	const bool want_h264_nvenc = save_encoder && astrcmpi(save_encoder, SAVE_ENCODER_H264_NVENC) == 0;
+	const bool want_hevc_nvenc = save_encoder && astrcmpi(save_encoder, SAVE_ENCODER_HEVC_NVENC) == 0;
+
+	if (!want_x264) {
+		if (nvenc_present()) {
+			if (!want_h264_nvenc)
+				add_plan(plans, &count, SAVE_BACKEND_FFMPEG_OUTPUT, "hevc_nvenc");
+			add_plan(plans, &count, SAVE_BACKEND_FFMPEG_OUTPUT, "h264_nvenc");
+		} else if (want_h264_nvenc || want_hevc_nvenc) {
+			blog(LOG_WARNING, "[replay_save_queue] Requested encoder '%s' unavailable, using x264",
+			     save_encoder);
 		}
-		blog(LOG_WARNING, "[replay_save_queue] Requested encoder '%s' unavailable, falling back to auto",
-		     save_encoder);
-	} else if (save_encoder && astrcmpi(save_encoder, SAVE_ENCODER_H264_NVENC) == 0) {
-		for (size_t i = 0; h264_candidates[i]; i++) {
-			if (encoder_accepts_raw_frames(h264_candidates[i]))
-				return h264_candidates[i];
-		}
-		blog(LOG_WARNING, "[replay_save_queue] Requested encoder '%s' unavailable, falling back to auto",
-		     save_encoder);
 	}
-
-	for (size_t i = 0; auto_candidates[i]; i++) {
-		if (encoder_accepts_raw_frames(auto_candidates[i]))
-			return auto_candidates[i];
-	}
-
-	return "obs_x264";
+	add_plan(plans, &count, SAVE_BACKEND_OBS_ENCODER, "obs_x264");
+	return count;
 }
 
 static void sanitize_filename_component(const char *in, struct dstr *out)
@@ -499,33 +493,107 @@ static bool write_frame_to_output(video_t *video_output, const struct video_outp
 	return true;
 }
 
-static void configure_video_encoder(obs_encoder_t *venc, const char *enc_id, int save_quality)
+static int clamp_save_quality(int save_quality)
 {
-	const int q = (save_quality >= SETTING_SAVE_QUALITY_MIN && save_quality <= SETTING_SAVE_QUALITY_MAX)
-			      ? save_quality
-			      : SETTING_SAVE_QUALITY_DEFAULT;
+	return (save_quality >= SETTING_SAVE_QUALITY_MIN && save_quality <= SETTING_SAVE_QUALITY_MAX)
+		       ? save_quality
+		       : SETTING_SAVE_QUALITY_DEFAULT;
+}
+
+static void configure_x264_encoder(obs_encoder_t *venc, int save_quality)
+{
 	obs_data_t *settings = obs_data_create();
-	if (strcmp(enc_id, "obs_x264") == 0) {
-		obs_data_set_int(settings, "crf", q);
-		obs_data_set_bool(settings, "use_bufsize", true);
-		obs_data_set_string(settings, "rate_control", "CRF");
-		obs_data_set_string(settings, "profile", "high");
-		obs_data_set_string(settings, "preset", "veryfast");
-	} else {
-		const bool is_hevc = strstr(enc_id, "hevc") != NULL;
-		obs_data_set_string(settings, "rate_control", "CQP");
-		obs_data_set_int(settings, "cqp", q);
-		obs_data_set_string(settings, "preset", "p5");
-		obs_data_set_string(settings, "preset2", "p5");
-		obs_data_set_string(settings, "tune", "hq");
-		obs_data_set_string(settings, "multipass", "qres");
-		obs_data_set_string(settings, "profile", is_hevc ? "main" : "high");
-		obs_data_set_bool(settings, "psycho_aq", true);
-		obs_data_set_bool(settings, "adaptive_quantization", true);
-		obs_data_set_int(settings, "bf", 2);
-	}
+	obs_data_set_int(settings, "crf", clamp_save_quality(save_quality));
+	obs_data_set_bool(settings, "use_bufsize", true);
+	obs_data_set_string(settings, "rate_control", "CRF");
+	obs_data_set_string(settings, "profile", "high");
+	obs_data_set_string(settings, "preset", "veryfast");
 	obs_encoder_update(venc, settings);
 	obs_data_release(settings);
+}
+
+/* Creates the file output for one save plan. Encoders created for the plan are returned for release by the caller. */
+static obs_output_t *create_save_output(const struct replay_save_job *job, const struct save_plan *plan,
+					const struct video_output_info *vi, video_t *video_output,
+					audio_t *audio_output, obs_encoder_t **video_encoder,
+					obs_encoder_t **audio_encoder)
+{
+	obs_output_t *file_output = NULL;
+	obs_data_t *fo_settings = obs_data_create();
+	obs_data_set_string(fo_settings, "path", job->output_path);
+	obs_data_set_string(fo_settings, "url", job->output_path);
+
+	if (plan->backend == SAVE_BACKEND_FFMPEG_OUTPUT) {
+		file_output = obs_output_create("ffmpeg_output", "replay_save_ffmpeg_output", NULL, NULL);
+		if (!file_output) {
+			blog(LOG_ERROR, "[replay_save_queue] Failed to create ffmpeg_output");
+			goto done;
+		}
+		if (job->lossless) {
+			obs_data_set_string(fo_settings, "format_name", "avi");
+			obs_data_set_string(fo_settings, "audio_encoder", "pcm_s16le");
+		} else {
+			const bool mkv = job->save_container && astrcmpi(job->save_container, SAVE_CONTAINER_MKV) == 0;
+			struct dstr vs = {0};
+			dstr_printf(&vs, "preset=p5 tune=hq rc=constqp qp=%d bf=2", clamp_save_quality(job->save_quality));
+			obs_data_set_string(fo_settings, "format_name", mkv ? "matroska" : "mp4");
+			obs_data_set_string(fo_settings, "video_settings", vs.array);
+			obs_data_set_int(fo_settings, "gop_size", (int)(2 * vi->fps_num / (vi->fps_den ? vi->fps_den : 1)));
+			obs_data_set_string(fo_settings, "audio_encoder", "aac");
+			obs_data_set_int(fo_settings, "audio_bitrate", 192);
+			dstr_free(&vs);
+		}
+		obs_data_set_string(fo_settings, "video_encoder", plan->codec);
+		obs_output_update(file_output, fo_settings);
+		obs_output_set_media(file_output, video_output, audio_output);
+		obs_output_set_mixer(file_output, 0);
+		goto done;
+	}
+
+	file_output = obs_output_create("ffmpeg_muxer", "replay_save_ffmpeg_muxer", NULL, NULL);
+	if (!file_output) {
+		blog(LOG_ERROR, "[replay_save_queue] Failed to create ffmpeg_muxer");
+		goto done;
+	}
+	*video_encoder = obs_video_encoder_create(plan->codec, "replay_save_video_encoder", NULL, NULL);
+	if (!*video_encoder) {
+		blog(LOG_ERROR, "[replay_save_queue] Failed to create video encoder '%s'", plan->codec);
+		goto fail;
+	}
+	configure_x264_encoder(*video_encoder, job->save_quality);
+	obs_encoder_set_video(*video_encoder, video_output);
+	obs_output_set_video_encoder(file_output, *video_encoder);
+
+	*audio_encoder = obs_audio_encoder_create("ffmpeg_aac", "replay_save_aac_encoder", NULL, 0, NULL);
+	if (!*audio_encoder) {
+		blog(LOG_ERROR, "[replay_save_queue] Failed to create ffmpeg_aac audio encoder");
+		goto fail;
+	}
+	obs_encoder_set_audio(*audio_encoder, audio_output);
+	obs_output_set_audio_encoder(file_output, *audio_encoder, 0);
+	obs_output_update(file_output, fo_settings);
+	goto done;
+
+fail:
+	obs_output_release(file_output);
+	file_output = NULL;
+done:
+	obs_data_release(fo_settings);
+	return file_output;
+}
+
+static void release_save_output(obs_output_t **file_output, obs_encoder_t **video_encoder,
+				obs_encoder_t **audio_encoder)
+{
+	if (*file_output)
+		obs_output_release(*file_output);
+	if (*video_encoder)
+		obs_encoder_release(*video_encoder);
+	if (*audio_encoder)
+		obs_encoder_release(*audio_encoder);
+	*file_output = NULL;
+	*video_encoder = NULL;
+	*audio_encoder = NULL;
 }
 
 static void ensure_parent_dir(const char *file_path)
@@ -622,90 +690,62 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 		os_atomic_compare_exchange_long(&g_queue.max_concurrent_encoders, &prev_max, cur_enc);
 	}
 
+	struct save_plan plans[MAX_SAVE_PLANS];
+	size_t plan_count;
 	if (job->lossless) {
-		blog(LOG_INFO, "[replay_save_queue] Using lossless utvideo/pcm_s16le AVI output for '%s'",
-		     job->output_path);
-		file_output = obs_output_create("ffmpeg_output", "replay_save_ffmpeg_output", NULL, NULL);
-		if (!file_output) {
-			blog(LOG_ERROR, "[replay_save_queue] Failed to create ffmpeg_output");
-			goto cleanup;
-		}
-		obs_data_t *fo_settings = obs_data_create();
-		obs_data_set_string(fo_settings, "format_name", "avi");
-		obs_data_set_string(fo_settings, "video_encoder", "utvideo");
-		obs_data_set_string(fo_settings, "audio_encoder", "pcm_s16le");
-		obs_data_set_string(fo_settings, "path", job->output_path);
-		obs_data_set_string(fo_settings, "url", job->output_path);
-		obs_output_update(file_output, fo_settings);
-		obs_data_release(fo_settings);
-		obs_output_set_media(file_output, video_output, audio_output);
-		obs_output_set_mixer(file_output, 0);
+		plans[0].backend = SAVE_BACKEND_FFMPEG_OUTPUT;
+		plans[0].codec = "utvideo";
+		plan_count = 1;
 	} else {
-		const char *enc_id = replay_save_select_encoder(job->save_encoder);
-		blog(LOG_INFO, "[replay_save_queue] Selected video encoder '%s' (setting '%s') for '%s'", enc_id,
-		     job->save_encoder ? job->save_encoder : SAVE_ENCODER_AUTO, job->output_path);
+		plan_count = build_save_plans(job->save_encoder, plans);
+	}
 
-		file_output = obs_output_create("ffmpeg_muxer", "replay_save_ffmpeg_muxer", NULL, NULL);
+	bool started = false;
+	for (size_t p = 0; p < plan_count && !started; p++) {
+		const struct save_plan *plan = &plans[p];
+		const char *backend_name = plan->backend == SAVE_BACKEND_FFMPEG_OUTPUT ? "ffmpeg_output" : "obs encoder";
+		blog(LOG_INFO, "[replay_save_queue] Encoding '%s' with '%s' via %s (setting '%s')", job->output_path,
+		     plan->codec, backend_name, job->save_encoder ? job->save_encoder : SAVE_ENCODER_AUTO);
+
+		file_output = create_save_output(job, plan, &vi, video_output, audio_output, &video_encoder,
+						 &audio_encoder);
 		if (!file_output) {
-			blog(LOG_ERROR, "[replay_save_queue] Failed to create ffmpeg_muxer");
+			release_save_output(&file_output, &video_encoder, &audio_encoder);
+			continue;
+		}
+		if (!obs_output_start(file_output)) {
+			const char *err = obs_output_get_last_error(file_output);
+			blog(LOG_WARNING, "[replay_save_queue] '%s' failed to start for '%s': %s", plan->codec,
+			     job->output_path, err ? err : "unknown error");
+			release_save_output(&file_output, &video_encoder, &audio_encoder);
+			continue;
+		}
+
+		/* Wait for output to become active and audio_thread to connect its first callback */
+		const uint64_t wait_start_ns = os_gettime_ns();
+		while (!is_shutting_down()) {
+			if (obs_output_active(file_output) && os_atomic_load_bool(&audio_ctx.audio_connected))
+				break;
+			if (os_gettime_ns() - wait_start_ns > 2000000000ULL)
+				break;
+			os_sleep_ms(5);
+		}
+		if (is_shutting_down()) {
+			*aborted_out = true;
+			obs_output_force_stop(file_output);
 			goto cleanup;
 		}
-
-		video_encoder = obs_video_encoder_create(enc_id, "replay_save_video_encoder", NULL, NULL);
-		if (!video_encoder && strcmp(enc_id, "obs_x264") != 0) {
-			blog(LOG_WARNING,
-			     "[replay_save_queue] Failed to create encoder '%s', falling back to 'obs_x264'", enc_id);
-			enc_id = "obs_x264";
-			video_encoder = obs_video_encoder_create(enc_id, "replay_save_video_encoder", NULL, NULL);
+		if (!obs_output_active(file_output)) {
+			const char *err = obs_output_get_last_error(file_output);
+			blog(LOG_WARNING, "[replay_save_queue] '%s' did not become active for '%s': %s", plan->codec,
+			     job->output_path, err ? err : "unknown error");
+			release_save_output(&file_output, &video_encoder, &audio_encoder);
+			continue;
 		}
-		if (!video_encoder) {
-			blog(LOG_ERROR, "[replay_save_queue] Failed to create video encoder '%s'", enc_id);
-			goto cleanup;
-		}
-		configure_video_encoder(video_encoder, enc_id, job->save_quality);
-		obs_encoder_set_video(video_encoder, video_output);
-		obs_output_set_video_encoder(file_output, video_encoder);
-
-		audio_encoder = obs_audio_encoder_create("ffmpeg_aac", "replay_save_aac_encoder", NULL, 0, NULL);
-		if (!audio_encoder) {
-			blog(LOG_ERROR, "[replay_save_queue] Failed to create ffmpeg_aac audio encoder");
-			goto cleanup;
-		}
-		obs_encoder_set_audio(audio_encoder, audio_output);
-		obs_output_set_audio_encoder(file_output, audio_encoder, 0);
-
-		obs_data_t *fo_settings = obs_data_create();
-		obs_data_set_string(fo_settings, "path", job->output_path);
-		obs_data_set_string(fo_settings, "url", job->output_path);
-		obs_output_update(file_output, fo_settings);
-		obs_data_release(fo_settings);
+		started = true;
 	}
-
-	if (!obs_output_start(file_output)) {
-		const char *err = obs_output_get_last_error(file_output);
-		blog(LOG_ERROR, "[replay_save_queue] obs_output_start failed for '%s': %s", job->output_path,
-		     err ? err : "unknown error");
-		goto cleanup;
-	}
-
-	/* Wait for output to become active and audio_thread to connect its first callback */
-	const uint64_t wait_start_ns = os_gettime_ns();
-	while (!is_shutting_down()) {
-		if (obs_output_active(file_output) && os_atomic_load_bool(&audio_ctx.audio_connected))
-			break;
-		if (os_gettime_ns() - wait_start_ns > 2000000000ULL)
-			break;
-		os_sleep_ms(5);
-	}
-	if (is_shutting_down()) {
-		*aborted_out = true;
-		obs_output_force_stop(file_output);
-		goto cleanup;
-	}
-	if (!obs_output_active(file_output)) {
-		const char *err = obs_output_get_last_error(file_output);
-		blog(LOG_ERROR, "[replay_save_queue] Output did not become active for '%s': %s", job->output_path,
-		     err ? err : "unknown error");
+	if (!started) {
+		blog(LOG_ERROR, "[replay_save_queue] No encoder could be started for '%s'", job->output_path);
 		goto cleanup;
 	}
 
@@ -823,12 +863,7 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 	success = os_file_exists(job->output_path) && os_get_file_size(job->output_path) > 0;
 
 cleanup:
-	if (file_output)
-		obs_output_release(file_output);
-	if (video_encoder)
-		obs_encoder_release(video_encoder);
-	if (audio_encoder)
-		obs_encoder_release(audio_encoder);
+	release_save_output(&file_output, &video_encoder, &audio_encoder);
 	if (video_output)
 		video_output_close(video_output);
 	if (audio_output)
