@@ -24,6 +24,8 @@ struct replay_source_status {
 	uint64_t effective_start_ns;
 	uint64_t effective_end_ns;
 	uint64_t effective_duration_ns;
+	int64_t mark_in_ms;
+	int64_t mark_out_ms;
 };
 
 /* Lifecycle called from replay-module.c */
@@ -36,10 +38,13 @@ size_t replay_control_load_all(const char *const *filter_names, size_t filter_co
 void replay_control_set_all_speed(float speed_percent);
 void replay_control_restart_all(void);
 void replay_control_pause_all(void);
+void replay_control_all_mark_in(void);
+void replay_control_all_mark_out(void);
+void replay_control_all_mark_reset(void);
 
 /* Event emitters (thread-safe; never call while holding source/queue locks) */
 void replay_control_emit_replay_loaded(const char *source_name, int64_t duration_ms);
-void replay_control_emit_save_started(const char *source_name, const char *path);
+void replay_control_emit_save_started(const char *source_name, const char *path, const char *trigger);
 void replay_control_emit_save_finished(const char *source_name, const char *path, bool ok);
 
 /* Per-source hooks implemented in replay-source.c */
@@ -54,6 +59,14 @@ void replay_source_align_loaded_replay(struct replay_source *context, uint64_t c
 				       int64_t *trim_end_ns_out);
 bool replay_source_get_active_window_frames(struct replay_source *context, uint64_t *first_frame_ts_out,
 					    uint64_t *last_frame_ts_out);
+bool replay_source_get_current_playback_time(struct replay_source *context, uint64_t *abs_ts_out);
+bool replay_source_set_mark_in(struct replay_source *context, uint64_t abs_ts);
+bool replay_source_set_mark_out(struct replay_source *context, uint64_t abs_ts);
+void replay_source_mark_reset(struct replay_source *context);
+void replay_source_get_marks_ms(struct replay_source *context, int64_t *in_ms_out, int64_t *out_ms_out,
+				int64_t *dur_ms_out);
+void replay_source_auto_save_loaded(struct replay_source *context, const char *trigger);
+void replay_source_test_set_playback_pos(struct replay_source *context, uint64_t pause_ts, uint64_t start_ts);
 
 #ifdef __cplusplus
 }

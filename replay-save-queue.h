@@ -20,6 +20,7 @@ extern "C" {
 
 struct replay_source;
 void replay_save(struct replay_source *context);
+void replay_save_with_trigger(struct replay_source *context, const char *trigger);
 
 struct replay_save_job_params {
 	const char *source_name;
@@ -29,6 +30,7 @@ struct replay_save_job_params {
 	const char *save_container;
 	int save_quality;
 	bool lossless;
+	const char *trigger;
 	struct obs_source_frame **video_frames;
 	uint64_t video_frame_count;
 

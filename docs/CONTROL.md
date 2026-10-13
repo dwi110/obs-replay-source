@@ -61,6 +61,9 @@ Registered once at module load (`obs_hotkey_register_frontend`):
 | `ReplaySource.AllQuarterSpeed` | `Replay: all angles quarter speed (25%)` / `Replay: Alle Winkel Viertelgeschwindigkeit (25%)` | Sets playback speed to `25%` on all replay sources. |
 | `ReplaySource.AllRestart` | `Replay: restart all angles` / `Replay: Alle Winkel neu starten` | Restarts playback on all replay sources. |
 | `ReplaySource.AllPause` | `Replay: pause/play all angles` / `Replay: Alle Winkel pausieren/fortsetzen` | Toggles pause/play on all replay sources. |
+| `ReplaySource.AllMarkIn` | `Replay: mark in (all angles)` / `Replay: Mark In (alle Winkel)` | Sets Mark In across all loaded angles using the absolute playhead timestamp of the reference camera (the replay source currently active in program if exactly one is active, otherwise the first playing/paused replay source with a loaded replay). Trims are clamped to each angle's aligned base window. |
+| `ReplaySource.AllMarkOut` | `Replay: mark out (all angles)` / `Replay: Mark Out (alle Winkel)` | Sets Mark Out across all loaded angles using the absolute playhead timestamp of the reference camera. Trims are clamped to each angle's aligned base window. |
+| `ReplaySource.AllMarkReset` | `Replay: reset marks (all angles)` / `Replay: Marken zurücksetzen (alle Winkel)` | Restores the aligned base window across all loaded angles (or start-delay behavior if unaligned), preventing angles from becoming misaligned after custom trims. |
 
 ---
 
@@ -88,7 +91,9 @@ Returns status for all replay sources and the sequential save queue.
       "speedPercent": 50.0,
       "backward": false,
       "durationMs": 4850,
-      "bufferedMs": 5000
+      "bufferedMs": 5000,
+      "markInMs": 0,
+      "markOutMs": 4850,
     }
   ],
   "saveQueue": {
@@ -99,7 +104,7 @@ Returns status for all replay sources and the sequential save queue.
 ```
 
 #### `Action`
-Runs any existing `execute_action` command (`Load`, `Next`, `Previous`, `First`, `Last`, `Remove`, `Clear`, `Save`, `Restart`, `Pause`, `Faster`, `Slower`, `Faster5Percent`, `Slower5Percent`, `NormalOrFaster`, `NormalOrSlower`, `NormalSpeed`, `HalfSpeed`, `DoubleSpeed`, `TrimFront`, `TrimEnd`, `TrimReset`, `Reverse`, `Backward`, `Forward`, `ForwardOrFaster`, `BackwardOrFaster`, `DisableNextScene`, `EnableNextScene`, `Disable`, `Enable`, `SetNextSceneToCurrent`, `SwitchToNextScene`, `NextFrame`, `PrevFrame`, `NextNFrames`, `PrevNFrames`).
+Runs any existing `execute_action` command (`Load`, `Next`, `Previous`, `First`, `Last`, `Remove`, `Clear`, `Save`, `Restart`, `Pause`, `Faster`, `Slower`, `Faster5Percent`, `Slower5Percent`, `NormalOrFaster`, `NormalOrSlower`, `NormalSpeed`, `HalfSpeed`, `DoubleSpeed`, `TrimFront`, `TrimEnd`, `TrimReset`, `MarkIn`, `MarkOut`, `MarkReset`, `Reverse`, `Backward`, `Forward`, `ForwardOrFaster`, `BackwardOrFaster`, `DisableNextScene`, `EnableNextScene`, `Disable`, `Enable`, `SetNextSceneToCurrent`, `SwitchToNextScene`, `NextFrame`, `PrevFrame`, `NextNFrames`, `PrevNFrames`).
 Omit both `source` and `sources` to target **all** replay sources. `sources` accepts `[ { "name": "Replay Cam 1" } ]` or a comma-separated string `"Replay Cam 1,Replay Cam 2"`. A plain string array (`["Replay Cam 1"]`) is dropped by obs-websocket while converting JSON to `obs_data` (only object items survive), so such a request is rejected with `ok: false` instead of silently targeting nothing.
 
 - **Request Data**:
@@ -186,17 +191,64 @@ Enqueues all loaded replays into the sequential save queue.
 }
 ```
 
+#### `MarkIn`
+Sets Mark In on one, several, or all loaded replay sources using the absolute playhead timestamp of the reference angle (the replay source currently active in program if exactly one is active, otherwise the explicitly targeted angle or the first playing/paused replay source). Mark In is clamped to each replay's aligned base window.
+
+- **Request Data**: `{}` (or `{ "source": "Replay Cam 1" }` or `{ "sources": "Replay Cam 1,Replay Cam 2" }`)
+- **Response Data**:
+```json
+{
+  "ok": true,
+  "sources": [
+    {
+      "name": "Replay Cam 1",
+      "inMs": 1500,
+      "outMs": 4850,
+      "durationMs": 3350
+    }
+  ],
+  "applied": [{ "name": "Replay Cam 1" }],
+  "unknown": [],
+  "appliedCount": 1,
+  "unknownCount": 0
+}
+```
+`inMs`, `outMs`, and `durationMs` are reported in milliseconds relative to each source's aligned window start.
+
+#### `MarkOut`
+Sets Mark Out on one, several, or all loaded replay sources using the absolute playhead timestamp of the reference angle, clamped to each replay's aligned base window.
+
+- **Request Data**: `{}` (or `{ "source": "Replay Cam 1" }` or `{ "sources": "Replay Cam 1,Replay Cam 2" }`)
+- **Response Data**: same format as `MarkIn`.
+
+#### `MarkReset`
+Restores the aligned base window on one, several, or all loaded replay sources (or start-delay behavior if not aligned).
+
+- **Request Data**: `{}` (or `{ "source": "Replay Cam 1" }` or `{ "sources": "Replay Cam 1,Replay Cam 2" }`)
+- **Response Data**: same format as `MarkIn`, with `inMs: 0` and `outMs: alignedDurationMs`.
+
 ### Vendor Events
 
 Emitted under `vendorName`: **`ReplaySource`**:
 
 - **`ReplayLoaded`**: `{ "source": "Replay Cam 1", "durationMs": 4850 }`
-- **`SaveStarted`**: `{ "source": "Replay Cam 1", "path": "C:/Replays/2026-10-13 18.42.10 - Replay Cam 1.mp4" }`
+- **`SaveStarted`**: `{ "source": "Replay Cam 1", "path": "C:/Replays/2026-10-13 18.42.10 - Replay Cam 1.mp4", "trigger": "manual" }` (`trigger` is `"manual"`, `"auto-load"`, `"auto-release"`, or `"save-all"`)
 - **`SaveFinished`**: `{ "source": "Replay Cam 1", "path": "C:/Replays/2026-10-13 18.42.10 - Replay Cam 1.mp4", "ok": true, "status": "ok" }` (`status` is `"ok"` or `"failed"`)
+
 
 ---
 
-## 4. Bitfocus Companion Setup
+## 4. Auto-Save Configuration (`auto_save`)
+
+Configured per replay source under settings:
+- **`Off` (`0`, default)**: Auto-save disabled.
+- **`On Load` (`1`)**: Enqueue immediately when a replay is loaded (with full or aligned window). When using `LoadAll`, all angles are enqueued in source order after time-alignment so files share the exact same clip window.
+- **`On Release (with Mark In/Out)` (`2`)**: Enqueue when the loaded replay is released (`Clear`, `Remove`, purge when exceeding `Maximum Replays`, auto-release on deactivate/hide, or replacement by a newer load). This honors any `Mark In` or `Mark Out` set during playback. Not triggered during source destroy or OBS shutdown.
+
+Each replay is auto-saved at most once (tracked via an internal replay flag). Manual saves (`Save`, `SaveAll`) always remain available.
+---
+
+## 5. Bitfocus Companion Setup
 
 ### Hotkeys ("Hotkey - Trigger by ID")
 Companion lists the names from `GetHotkeyList`, so each angle now appears with its own entry, e.g.

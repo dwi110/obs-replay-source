@@ -47,6 +47,10 @@ struct replay {
 	uint64_t duration;
 	int64_t trim_front;
 	int64_t trim_end;
+	int64_t align_front;
+	int64_t align_end;
+	bool has_align;
+	bool auto_saved;
 };
 
 struct replay_source {
@@ -153,6 +157,8 @@ struct replay_source {
 	bool free_after_save;
 	bool keep_buffer;
 	int auto_release;
+	int auto_save;
+	bool destroying;
 };
 
 static void replace_text(struct dstr *str, size_t pos, size_t len, const char *new_text)
@@ -547,9 +553,14 @@ static void replay_update_position(struct replay_source *context, bool lock)
 
 	replay_update_text(context);
 }
+static bool replay_save_replay(struct replay_source *context, struct replay *r, const char *trigger);
 
 static void replay_free_replay(struct replay *replay, struct replay_source *context)
 {
+	if (context && !context->destroying && context->auto_save == AUTO_SAVE_ON_RELEASE && !replay->auto_saved) {
+		replay->auto_saved = true;
+		replay_save_replay(context, replay, "auto-release");
+	}
 	if (replay == &context->saving_replay) {
 		context->free_after_save = false;
 	} else if (replay->video_frames == context->saving_replay.video_frames && context->saving_status != SAVING_STATUS_NONE) {
@@ -581,11 +592,13 @@ static void replay_free_replay(struct replay *replay, struct replay_source *cont
 static void replay_purge_replays(struct replay_source *context)
 {
 	if ((int)(context->replays.size / sizeof context->current_replay) > context->replay_max) {
+		/* Lock order video_mutex -> replay_mutex, same as the tick (auto release) and the mark setters. */
+		pthread_mutex_lock(&context->video_mutex);
 		pthread_mutex_lock(&context->replay_mutex);
 		const int replays_to_delete = (int)(context->replays.size / sizeof context->current_replay - context->replay_max);
 		if (replays_to_delete > context->replay_position) {
 			context->replay_position = replays_to_delete;
-			replay_update_position(context, true);
+			replay_update_position(context, false);
 		}
 		while ((int)(context->replays.size / sizeof context->current_replay) > context->replay_max) {
 			struct replay old_replay;
@@ -597,6 +610,7 @@ static void replay_purge_replays(struct replay_source *context)
 			blog(LOG_INFO, "[replay_source: '%s'] switched to replay %i/%i", obs_source_get_name(context->source),
 			     context->replay_position + 1, (int)(context->replays.size / sizeof context->current_replay));
 		pthread_mutex_unlock(&context->replay_mutex);
+		pthread_mutex_unlock(&context->video_mutex);
 	}
 }
 static void replay_auto_release(struct replay_source *context, bool lock)
@@ -673,6 +687,7 @@ static void replay_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, SETTING_SAVE_ENCODER, SAVE_ENCODER_AUTO);
 	obs_data_set_default_string(settings, SETTING_SAVE_CONTAINER, SAVE_CONTAINER_MP4);
 	obs_data_set_default_int(settings, SETTING_SAVE_QUALITY, SETTING_SAVE_QUALITY_DEFAULT);
+	obs_data_set_default_int(settings, SETTING_AUTO_SAVE, AUTO_SAVE_OFF);
 }
 
 static void replay_source_show(void *data)
@@ -830,21 +845,13 @@ static void replay_pause_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotk
 		replay_play_pause(data, true);
 }
 
-void replay_save(struct replay_source *context)
+static bool replay_save_replay(struct replay_source *context, struct replay *r, const char *trigger)
 {
-	if (!context)
-		return;
+	if (!context || !r)
+		return false;
 
-	pthread_mutex_lock(&context->video_mutex);
-	pthread_mutex_lock(&context->audio_mutex);
-
-	context->saving_status = SAVING_STATUS_NONE;
-
-	if (context->current_replay.video_frame_count == 0 || !context->current_replay.video_frames) {
-		pthread_mutex_unlock(&context->audio_mutex);
-		pthread_mutex_unlock(&context->video_mutex);
-		return;
-	}
+	if (r->video_frame_count == 0 || !r->video_frames)
+		return false;
 
 	const char *src_name = context->source ? obs_source_get_name(context->source) : NULL;
 	if (!src_name || !*src_name)
@@ -858,22 +865,40 @@ void replay_save(struct replay_source *context)
 		.save_container = context->save_container,
 		.save_quality = context->save_quality,
 		.lossless = context->lossless,
-		.video_frames = context->current_replay.video_frames,
-		.video_frame_count = context->current_replay.video_frame_count,
-		.audio_frames = context->current_replay.audio_frames,
-		.audio_frame_count = context->current_replay.audio_frame_count,
-		.oai = context->current_replay.oai,
-		.first_frame_timestamp = context->current_replay.first_frame_timestamp,
-		.last_frame_timestamp = context->current_replay.last_frame_timestamp,
-		.duration = context->current_replay.duration,
-		.trim_front = context->current_replay.trim_front,
-		.trim_end = context->current_replay.trim_end,
+		.trigger = trigger ? trigger : "manual",
+		.video_frames = r->video_frames,
+		.video_frame_count = r->video_frame_count,
+		.audio_frames = r->audio_frames,
+		.audio_frame_count = r->audio_frame_count,
+		.oai = r->oai,
+		.first_frame_timestamp = r->first_frame_timestamp,
+		.last_frame_timestamp = r->last_frame_timestamp,
+		.duration = r->duration,
+		.trim_front = r->trim_front,
+		.trim_end = r->trim_end,
 	};
 
-	replay_save_queue_enqueue(&params);
+	return replay_save_queue_enqueue(&params);
+}
+
+void replay_save_with_trigger(struct replay_source *context, const char *trigger)
+{
+	if (!context)
+		return;
+
+	pthread_mutex_lock(&context->video_mutex);
+	pthread_mutex_lock(&context->audio_mutex);
+
+	context->saving_status = SAVING_STATUS_NONE;
+	replay_save_replay(context, &context->current_replay, trigger ? trigger : "manual");
 
 	pthread_mutex_unlock(&context->audio_mutex);
 	pthread_mutex_unlock(&context->video_mutex);
+}
+
+void replay_save(struct replay_source *context)
+{
+	replay_save_with_trigger(context, "manual");
 }
 
 static void *update_scene_thread(void *data)
@@ -920,6 +945,10 @@ static bool replay_retrieve_internal(struct replay_source *context, bool emit_ev
 	new_replay.first_frame_timestamp = 0;
 	new_replay.trim_end = 0;
 	new_replay.trim_front = 0;
+	new_replay.align_front = 0;
+	new_replay.align_end = 0;
+	new_replay.has_align = false;
+	new_replay.auto_saved = false;
 	if (vf) {
 		struct obs_source_frame *frame;
 		pthread_mutex_lock(&vf->mutex);
@@ -1043,6 +1072,9 @@ static bool replay_retrieve_internal(struct replay_source *context, bool emit_ev
 		}
 	}
 	replay_update_text(context);
+	if (emit_event && context->auto_save == AUTO_SAVE_ON_LOAD) {
+		replay_source_auto_save_loaded(context, "auto-load");
+	}
 	if (emit_event) {
 		uint64_t eff_start = new_replay.first_frame_timestamp;
 		if (new_replay.trim_front > 0 && (uint64_t)new_replay.trim_front < new_replay.duration)
@@ -1697,6 +1729,15 @@ static void replay_trim_front_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t 
 	if (c->backward) {
 		duration = (c->current_replay.last_frame_timestamp - c->current_replay.first_frame_timestamp) - duration;
 	}
+	const int64_t min_front = c->current_replay.has_align ? c->current_replay.align_front : 0;
+	if (duration < min_front)
+		duration = min_front;
+
+	const int64_t align_end = c->current_replay.has_align ? c->current_replay.align_end : 0;
+	const int64_t max_front = (int64_t)(c->current_replay.duration - align_end);
+	if (duration > max_front)
+		duration = max_front;
+
 	if (duration + c->current_replay.first_frame_timestamp <
 	    c->current_replay.last_frame_timestamp - c->current_replay.trim_end) {
 		c->current_replay.trim_front = duration;
@@ -1725,6 +1766,15 @@ static void replay_trim_end_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *h
 		if (!c->backward) {
 			duration = (c->current_replay.last_frame_timestamp - c->current_replay.first_frame_timestamp) - duration;
 		}
+		const int64_t min_end = c->current_replay.has_align ? c->current_replay.align_end : 0;
+		if (duration < min_end)
+			duration = min_end;
+
+		const int64_t align_front = c->current_replay.has_align ? c->current_replay.align_front : 0;
+		const int64_t max_end = (int64_t)(c->current_replay.duration - align_front);
+		if (duration > max_end)
+			duration = max_end;
+
 		if (c->current_replay.first_frame_timestamp + c->current_replay.trim_front <
 		    c->current_replay.last_frame_timestamp - duration) {
 			c->current_replay.trim_end = duration;
@@ -1745,22 +1795,7 @@ static void replay_trim_reset_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t 
 	if (!pressed)
 		return;
 
-	c->current_replay.trim_end = 0;
-
-	if (c->start_delay > 0) {
-		if (c->speed_percent == 100.0f) {
-			c->current_replay.trim_front = c->start_delay * -1;
-		} else {
-			c->current_replay.trim_front = (int64_t)(c->start_delay * c->speed_percent / -100.0);
-		}
-	} else {
-		c->current_replay.trim_front = 0;
-	}
-	struct replay *r = circlebuf_data(&c->replays, c->replay_position * sizeof c->current_replay);
-	if (r) {
-		r->trim_end = c->current_replay.trim_end;
-		r->trim_front = c->current_replay.trim_front;
-	}
+	replay_source_mark_reset(c);
 }
 
 void update_filter_settings(obs_source_t *filter, obs_data_t *settings)
@@ -1879,6 +1914,21 @@ bool replay_source_execute_action(struct replay_source *context, const char *act
 	} else if (strcmp(action, "TrimReset") == 0) {
 		if (context)
 			replay_trim_reset_hotkey(context, 0, NULL, true);
+	} else if (strcmp(action, "MarkIn") == 0) {
+		if (context) {
+			uint64_t abs_ts = 0;
+			if (replay_source_get_current_playback_time(context, &abs_ts))
+				replay_source_set_mark_in(context, abs_ts);
+		}
+	} else if (strcmp(action, "MarkOut") == 0) {
+		if (context) {
+			uint64_t abs_ts = 0;
+			if (replay_source_get_current_playback_time(context, &abs_ts))
+				replay_source_set_mark_out(context, abs_ts);
+		}
+	} else if (strcmp(action, "MarkReset") == 0) {
+		if (context)
+			replay_source_mark_reset(context);
 	} else if (strcmp(action, "Reverse") == 0) {
 		if (context)
 			replay_reverse_hotkey(context, 0, NULL, true);
@@ -2180,6 +2230,7 @@ static void replay_source_update(void *data, obs_data_t *settings)
 	if (save_quality < SETTING_SAVE_QUALITY_MIN || save_quality > SETTING_SAVE_QUALITY_MAX)
 		save_quality = SETTING_SAVE_QUALITY_DEFAULT;
 	context->save_quality = save_quality;
+	context->auto_save = (int)obs_data_get_int(settings, SETTING_AUTO_SAVE);
 	replay_update_text(context);
 }
 
@@ -2318,6 +2369,8 @@ static void *replay_source_create(obs_data_t *settings, obs_source_t *source)
 	context->source = source;
 	context->keep_buffer = true;
 	context->auto_release = AUTO_RELEASE_NEVER;
+	context->auto_save = AUTO_SAVE_OFF;
+	context->destroying = false;
 	context->save_quality = SETTING_SAVE_QUALITY_DEFAULT;
 	obs_source_set_async_unbuffered(source, true);
 	pthread_mutex_init(&context->video_mutex, NULL);
@@ -2366,6 +2419,7 @@ static void *replay_source_create(obs_data_t *settings, obs_source_t *source)
 static void replay_source_destroy(void *data)
 {
 	struct replay_source *context = data;
+	context->destroying = true;
 
 	if (context->source) {
 		signal_handler_t *sh = obs_source_get_signal_handler(context->source);
@@ -2991,6 +3045,11 @@ static obs_properties_t *replay_source_properties(void *data)
 
 	obs_properties_add_int(props, SETTING_SAVE_QUALITY, obs_module_text("SaveQuality"), SETTING_SAVE_QUALITY_MIN,
 			       SETTING_SAVE_QUALITY_MAX, 1);
+	prop = obs_properties_add_list(props, SETTING_AUTO_SAVE, obs_module_text("AutoSave"), OBS_COMBO_TYPE_LIST,
+				       OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(prop, obs_module_text("AutoSave.Off"), AUTO_SAVE_OFF);
+	obs_property_list_add_int(prop, obs_module_text("AutoSave.OnLoad"), AUTO_SAVE_ON_LOAD);
+	obs_property_list_add_int(prop, obs_module_text("AutoSave.OnRelease"), AUTO_SAVE_ON_RELEASE);
 
 	obs_properties_add_bool(props, SETTING_LOSSLESS, obs_module_text("Lossless"));
 	prop = obs_properties_add_list(props, SETTING_PROGRESS_SOURCE, obs_module_text("ProgressCropSource"),
@@ -3254,6 +3313,12 @@ bool replay_source_get_status(struct replay_source *context, struct replay_sourc
 		compute_replay_window_ns(&context->current_replay, &out->effective_start_ns, &out->effective_end_ns,
 					 &out->effective_duration_ns);
 		out->duration_ms = (int64_t)(out->effective_duration_ns / 1000000ULL);
+		const int64_t base_front = context->current_replay.has_align ? context->current_replay.align_front : 0;
+		const int64_t in_ns = context->current_replay.trim_front - base_front;
+		const int64_t out_ns =
+			(int64_t)context->current_replay.duration - context->current_replay.trim_end - base_front;
+		out->mark_in_ms = (int64_t)(in_ns / 1000000LL);
+		out->mark_out_ms = (int64_t)(out_ns / 1000000LL);
 	}
 
 	char *v_src = context->source_name ? bstrdup(context->source_name) : NULL;
@@ -3320,6 +3385,9 @@ void replay_source_align_loaded_replay(struct replay_source *context, uint64_t c
 			    common_end_ns <= r->last_frame_timestamp) {
 				r->trim_front = (int64_t)(common_start_ns - r->first_frame_timestamp);
 				r->trim_end = (int64_t)(r->last_frame_timestamp - common_end_ns);
+				r->align_front = r->trim_front;
+				r->align_end = r->trim_end;
+				r->has_align = true;
 			}
 			tf = r->trim_front;
 			te = r->trim_end;
@@ -3367,4 +3435,222 @@ bool replay_source_get_active_window_frames(struct replay_source *context, uint6
 	if (last_frame_ts_out)
 		*last_frame_ts_out = last_ts;
 	return true;
+}
+
+bool replay_source_get_current_playback_time(struct replay_source *c, uint64_t *abs_ts_out)
+{
+	if (!c)
+		return false;
+
+	pthread_mutex_lock(&c->video_mutex);
+	if (c->current_replay.video_frame_count == 0 && c->current_replay.audio_frame_count == 0) {
+		pthread_mutex_unlock(&c->video_mutex);
+		return false;
+	}
+
+	const uint64_t timestamp = c->pause_timestamp == 0 ? obs_get_video_frame_time() : c->pause_timestamp;
+	int64_t duration = (int64_t)(timestamp - c->start_timestamp);
+	if (c->speed_percent != 100.0f) {
+		duration = (int64_t)(duration * c->speed_percent / 100.0);
+	}
+	if (c->backward) {
+		duration = (int64_t)(c->current_replay.last_frame_timestamp - c->current_replay.first_frame_timestamp) -
+			   duration;
+	}
+
+	uint64_t abs_ts = c->current_replay.first_frame_timestamp;
+	if (duration > 0) {
+		if ((uint64_t)duration < c->current_replay.duration)
+			abs_ts += (uint64_t)duration;
+		else
+			abs_ts = c->current_replay.last_frame_timestamp;
+	}
+
+	pthread_mutex_unlock(&c->video_mutex);
+
+	if (abs_ts_out)
+		*abs_ts_out = abs_ts;
+	return true;
+}
+
+bool replay_source_set_mark_in(struct replay_source *c, uint64_t abs_ts)
+{
+	if (!c)
+		return false;
+
+	pthread_mutex_lock(&c->video_mutex);
+	pthread_mutex_lock(&c->replay_mutex);
+
+	if (c->current_replay.video_frame_count == 0 && c->current_replay.audio_frame_count == 0) {
+		pthread_mutex_unlock(&c->replay_mutex);
+		pthread_mutex_unlock(&c->video_mutex);
+		return false;
+	}
+
+	int64_t new_trim = 0;
+	if (abs_ts > c->current_replay.first_frame_timestamp)
+		new_trim = (int64_t)(abs_ts - c->current_replay.first_frame_timestamp);
+
+	/* Clamping to aligned base window */
+	const int64_t min_front = c->current_replay.has_align ? c->current_replay.align_front : 0;
+	if (new_trim < min_front)
+		new_trim = min_front;
+
+	const int64_t align_end = c->current_replay.has_align ? c->current_replay.align_end : 0;
+	const int64_t max_front = (int64_t)(c->current_replay.duration - align_end);
+	if (new_trim > max_front)
+		new_trim = max_front;
+
+	if (new_trim + c->current_replay.trim_end < (int64_t)c->current_replay.duration) {
+		c->current_replay.trim_front = new_trim;
+		struct replay *r = circlebuf_data(&c->replays, c->replay_position * sizeof(c->current_replay));
+		if (r)
+			r->trim_front = new_trim;
+	}
+
+	pthread_mutex_unlock(&c->replay_mutex);
+	pthread_mutex_unlock(&c->video_mutex);
+	return true;
+}
+
+bool replay_source_set_mark_out(struct replay_source *c, uint64_t abs_ts)
+{
+	if (!c)
+		return false;
+
+	pthread_mutex_lock(&c->video_mutex);
+	pthread_mutex_lock(&c->replay_mutex);
+
+	if (c->current_replay.video_frame_count == 0 && c->current_replay.audio_frame_count == 0) {
+		pthread_mutex_unlock(&c->replay_mutex);
+		pthread_mutex_unlock(&c->video_mutex);
+		return false;
+	}
+
+	int64_t new_trim = 0;
+	if (abs_ts < c->current_replay.last_frame_timestamp)
+		new_trim = (int64_t)(c->current_replay.last_frame_timestamp - abs_ts);
+
+	/* Clamping to aligned base window */
+	const int64_t min_end = c->current_replay.has_align ? c->current_replay.align_end : 0;
+	if (new_trim < min_end)
+		new_trim = min_end;
+
+	const int64_t align_front = c->current_replay.has_align ? c->current_replay.align_front : 0;
+	const int64_t max_end = (int64_t)(c->current_replay.duration - align_front);
+	if (new_trim > max_end)
+		new_trim = max_end;
+
+	if (c->current_replay.trim_front + new_trim < (int64_t)c->current_replay.duration) {
+		c->current_replay.trim_end = new_trim;
+		struct replay *r = circlebuf_data(&c->replays, c->replay_position * sizeof(c->current_replay));
+		if (r)
+			r->trim_end = new_trim;
+	}
+
+	pthread_mutex_unlock(&c->replay_mutex);
+	pthread_mutex_unlock(&c->video_mutex);
+	return true;
+}
+
+void replay_source_mark_reset(struct replay_source *c)
+{
+	if (!c)
+		return;
+
+	pthread_mutex_lock(&c->video_mutex);
+	pthread_mutex_lock(&c->replay_mutex);
+
+	if (c->replays.size == 0) {
+		pthread_mutex_unlock(&c->replay_mutex);
+		pthread_mutex_unlock(&c->video_mutex);
+		return;
+	}
+
+	if (c->current_replay.has_align) {
+		c->current_replay.trim_front = c->current_replay.align_front;
+		c->current_replay.trim_end = c->current_replay.align_end;
+	} else {
+		c->current_replay.trim_end = 0;
+		if (c->start_delay > 0) {
+			if (c->speed_percent == 100.0f) {
+				c->current_replay.trim_front = c->start_delay * -1;
+			} else {
+				c->current_replay.trim_front = (int64_t)(c->start_delay * c->speed_percent / -100.0);
+			}
+		} else {
+			c->current_replay.trim_front = 0;
+		}
+	}
+
+	struct replay *r = circlebuf_data(&c->replays, c->replay_position * sizeof(c->current_replay));
+	if (r) {
+		r->trim_front = c->current_replay.trim_front;
+		r->trim_end = c->current_replay.trim_end;
+	}
+
+	pthread_mutex_unlock(&c->replay_mutex);
+	pthread_mutex_unlock(&c->video_mutex);
+}
+
+void replay_source_get_marks_ms(struct replay_source *context, int64_t *in_ms_out, int64_t *out_ms_out,
+				int64_t *dur_ms_out)
+{
+	if (!context) {
+		if (in_ms_out)
+			*in_ms_out = 0;
+		if (out_ms_out)
+			*out_ms_out = 0;
+		if (dur_ms_out)
+			*dur_ms_out = 0;
+		return;
+	}
+
+	pthread_mutex_lock(&context->video_mutex);
+	pthread_mutex_lock(&context->replay_mutex);
+
+	const int64_t base_front = context->current_replay.has_align ? context->current_replay.align_front : 0;
+	const int64_t in_ns = context->current_replay.trim_front - base_front;
+	const int64_t out_ns =
+		(int64_t)context->current_replay.duration - context->current_replay.trim_end - base_front;
+	const int64_t dur_ns = (out_ns > in_ns) ? (out_ns - in_ns) : 0;
+
+	pthread_mutex_unlock(&context->replay_mutex);
+	pthread_mutex_unlock(&context->video_mutex);
+
+	if (in_ms_out)
+		*in_ms_out = (int64_t)(in_ns / 1000000LL);
+	if (out_ms_out)
+		*out_ms_out = (int64_t)(out_ns / 1000000LL);
+	if (dur_ms_out)
+		*dur_ms_out = (int64_t)(dur_ns / 1000000LL);
+}
+
+void replay_source_auto_save_loaded(struct replay_source *context, const char *trigger)
+{
+	if (!context || context->auto_save != AUTO_SAVE_ON_LOAD)
+		return;
+
+	pthread_mutex_lock(&context->replay_mutex);
+	const size_t count = context->replays.size / sizeof(struct replay);
+	if (count > 0) {
+		struct replay *r = circlebuf_data(&context->replays, (count - 1) * sizeof(struct replay));
+		if (r && !r->auto_saved) {
+			r->auto_saved = true;
+			context->current_replay.auto_saved = true;
+			replay_save_replay(context, r, trigger ? trigger : "auto-load");
+		}
+	}
+	pthread_mutex_unlock(&context->replay_mutex);
+}
+
+void replay_source_test_set_playback_pos(struct replay_source *context, uint64_t pause_ts, uint64_t start_ts)
+{
+	if (!context)
+		return;
+
+	pthread_mutex_lock(&context->video_mutex);
+	context->pause_timestamp = pause_ts;
+	context->start_timestamp = start_ts;
+	pthread_mutex_unlock(&context->video_mutex);
 }

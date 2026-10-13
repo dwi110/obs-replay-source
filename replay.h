@@ -161,6 +161,10 @@ void replay_filter_check(void *data);
 #define SETTING_SAVE_QUALITY_MIN 10
 #define SETTING_SAVE_QUALITY_MAX 40
 #define SETTING_SAVE_QUALITY_DEFAULT 18
+#define SETTING_AUTO_SAVE "auto_save"
+#define AUTO_SAVE_OFF 0
+#define AUTO_SAVE_ON_LOAD 1
+#define AUTO_SAVE_ON_RELEASE 2
 #ifndef SEC_TO_NSEC
 #define SEC_TO_NSEC 1000000000ULL
 #endif
