@@ -38,6 +38,10 @@ Existing scene collections saved with upstream Replay Source store key bindings 
 2. If the new hotkey has no saved bindings, it temporarily registers `<legacy_name>` on the same source so `libobs` loads any legacy bindings from the source's saved hotkey data.
 3. Any loaded bindings are copied via `obs_hotkey_save` → `obs_hotkey_load` onto the new hotkey, and the temporary hotkey is immediately unregistered.
 
+Rollback to the original Replay Source DLL: once the scene collection has been saved with this fork, bindings are stored
+under the new names only, so the original plugin starts without key bindings for replay sources (re-assign them, or keep
+a backup of the scene collection JSON from before the switch).
+
 ### Source Rename Behavior
 
 Each replay source connects to its `rename` signal (`new_name`) and updates all 37 hotkey names in-place using `obs_hotkey_set_name`. Renaming `Replay Cam 1` to `Replay Angle A` immediately updates its hotkey names to `ReplaySource.<Action>.Replay Angle A`.
@@ -188,11 +192,18 @@ Emitted under `vendorName`: **`ReplaySource`**:
 
 - **`ReplayLoaded`**: `{ "source": "Replay Cam 1", "durationMs": 4850 }`
 - **`SaveStarted`**: `{ "source": "Replay Cam 1", "path": "C:/Replays/2026-10-13 18.42.10 - Replay Cam 1.mp4" }`
-- **`SaveFinished`**: `{ "source": "Replay Cam 1", "path": "C:/Replays/2026-10-13 18.42.10 - Replay Cam 1.mp4", "ok": true }`
+- **`SaveFinished`**: `{ "source": "Replay Cam 1", "path": "C:/Replays/2026-10-13 18.42.10 - Replay Cam 1.mp4", "ok": true, "status": "ok" }` (`status` is `"ok"` or `"failed"`)
 
 ---
 
 ## 4. Bitfocus Companion Setup
+
+### Hotkeys ("Hotkey - Trigger by ID")
+Companion lists the names from `GetHotkeyList`, so each angle now appears with its own entry, e.g.
+`ReplaySource.Save.Replay Cam 1`, `ReplaySource.Save.Replay Cam 2`. Companion reads this list when it connects and when
+the OBS profile or scene collection changes; after renaming a replay source (or adding a new one) reconnect the OBS
+connection in Companion so the new names appear. Buttons store the hotkey name, so renaming a source requires picking the
+new name on its buttons.
 
 ### Triggering Actions ("Custom - Send Vendor Request")
 Add an OBS action **"Custom - Send Vendor Request"**:
@@ -207,4 +218,8 @@ Add an OBS action **"Custom - Send Vendor Request"**:
 Add an OBS feedback **"Custom - Vendor Event"**:
 - **Vendor Name**: `ReplaySource`
 - **Event Type**: `ReplayLoaded`, `SaveStarted`, or `SaveFinished`
-- **Data Key / Value**: e.g. `source` = `Replay Cam 1` (or `ok` = `true` on `SaveFinished`)
+- **Data Key / Value**: e.g. `source` = `Replay Cam 1`, or `status` = `ok` / `failed` on `SaveFinished`.
+
+Companion compares the value **as a string** (`===`) and only looks at the **most recent** vendor event of any plugin.
+Numeric/boolean fields (`durationMs`, `ok`) therefore never match; use the string fields `source` and `status`.
+Example: button "Saving Cam 1" active while the latest event is `SaveStarted` with `source` = `Replay Cam 1`.

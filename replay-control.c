@@ -655,6 +655,8 @@ void replay_control_emit_save_finished(const char *source_name, const char *path
 	obs_data_set_string(ev, "source", source_name ? source_name : "");
 	obs_data_set_string(ev, "path", path ? path : "");
 	obs_data_set_bool(ev, "ok", ok);
+	/* Companion's "Custom - Vendor Event" feedback compares values as strings only */
+	obs_data_set_string(ev, "status", ok ? "ok" : "failed");
 	obs_websocket_vendor_emit_event(g_ctrl.vendor, "SaveFinished", ev);
 	obs_data_release(ev);
 }
