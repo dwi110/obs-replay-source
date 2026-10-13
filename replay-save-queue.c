@@ -535,7 +535,10 @@ static obs_output_t *create_save_output(const struct replay_save_job *job, const
 		} else {
 			const bool mkv = job->save_container && astrcmpi(job->save_container, SAVE_CONTAINER_MKV) == 0;
 			struct dstr vs = {0};
-			dstr_printf(&vs, "preset=p5 tune=hq rc=constqp qp=%d bf=2", clamp_save_quality(job->save_quality));
+			/* ffmpeg_output does not drain delayed video packets on stop. Every submitted frame must produce
+			 * its packet immediately, so NVENC uses zero-delay P-frames (no B-frames/lookahead). */
+			dstr_printf(&vs, "preset=p5 tune=hq rc=constqp qp=%d bf=0 delay=0 rc-lookahead=0 zerolatency=1",
+				    clamp_save_quality(job->save_quality));
 			obs_data_set_string(fo_settings, "format_name", mkv ? "matroska" : "mp4");
 			obs_data_set_string(fo_settings, "video_settings", vs.array);
 			obs_data_set_int(fo_settings, "gop_size", (int)(2 * vi->fps_num / (vi->fps_den ? vi->fps_den : 1)));
