@@ -77,3 +77,24 @@ if(UNIX AND NOT APPLE)
 	target_link_libraries(test-control PRIVATE m)
 endif()
 add_test(NAME replay_control COMMAND test-control)
+
+add_executable(test-tap-hidden
+	test-tap-hidden.c
+	../replay.c
+	../replay-module.c
+	../replay-source.c
+	../replay-filter.c
+	../replay-filter-audio.c
+	../replay-filter-async.c
+	../replay-pool.c
+	../replay-convert.c
+	../replay-save-queue.c
+	../replay-control.c)
+target_include_directories(test-tap-hidden PRIVATE ${REPLAY_TEST_COMMON_INCLUDES})
+target_link_libraries(test-tap-hidden PRIVATE
+	OBS::${OBS_FRONTEND_API_NAME}
+	OBS::libobs)
+if(UNIX AND NOT APPLE)
+	target_link_libraries(test-tap-hidden PRIVATE m)
+endif()
+add_test(NAME replay_tap_hidden COMMAND test-tap-hidden)
