@@ -2057,12 +2057,10 @@ static void replay_source_update(void *data, obs_data_t *settings)
 	}
 	int old_blend = context->slowmo_blend;
 	context->slowmo_blend = (int)obs_data_get_int(settings, SETTING_SLOWMO_BLEND);
-	if (old_blend != context->slowmo_blend && context->slowmo_blend == SLOWMO_BLEND_OFF) {
-		if (context->blend_worker) {
-			replay_blend_worker_destroy(context->blend_worker);
-			context->blend_worker = NULL;
-		}
-	}
+	/* The worker lives until source destroy: other threads (hotkeys, vendor requests) may flush it unlocked.
+	 * Switching off only drops pending blended frames so the normal output path continues in order. */
+	if (old_blend != context->slowmo_blend && context->slowmo_blend == SLOWMO_BLEND_OFF)
+		replay_blend_worker_flush(context->blend_worker);
 	context->sound_trigger = obs_data_get_bool(settings, SETTING_SOUND_TRIGGER);
 	if (!context->disabled) {
 
