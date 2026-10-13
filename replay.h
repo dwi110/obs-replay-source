@@ -118,6 +118,9 @@ void replay_filter_check(void *data);
 #define SETTING_SPEED_MIN 0.01f
 #define SETTING_SPEED_MAX 400.0f
 #define SETTING_BACKWARD "backward"
+#define SETTING_SLOWMO_BLEND "slowmo_blend"
+#define SLOWMO_BLEND_OFF 0
+#define SLOWMO_BLEND_CROSSFADE 1
 #define SETTING_VISIBILITY_ACTION "visibility_action"
 #define SETTING_START_DELAY "start_delay"
 #define SETTING_FRAME_STEP_COUNT "frame_step_count"

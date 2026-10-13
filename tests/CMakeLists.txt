@@ -47,7 +47,8 @@ add_executable(test-save-queue
 	../replay-pool.c
 	../replay-convert.c
 	../replay-save-queue.c
-	../replay-control.c)
+	../replay-control.c
+	../replay-blend.c)
 target_include_directories(test-save-queue PRIVATE ${REPLAY_TEST_COMMON_INCLUDES})
 target_link_libraries(test-save-queue PRIVATE
 	OBS::${OBS_FRONTEND_API_NAME}
@@ -68,7 +69,8 @@ add_executable(test-control
 	../replay-pool.c
 	../replay-convert.c
 	../replay-save-queue.c
-	../replay-control.c)
+	../replay-control.c
+	../replay-blend.c)
 target_include_directories(test-control PRIVATE ${REPLAY_TEST_COMMON_INCLUDES})
 target_link_libraries(test-control PRIVATE
 	OBS::${OBS_FRONTEND_API_NAME}
@@ -77,3 +79,25 @@ if(UNIX AND NOT APPLE)
 	target_link_libraries(test-control PRIVATE m)
 endif()
 add_test(NAME replay_control COMMAND test-control)
+
+add_executable(test-blend
+	test-blend.c
+	../replay.c
+	../replay-module.c
+	../replay-source.c
+	../replay-filter.c
+	../replay-filter-audio.c
+	../replay-filter-async.c
+	../replay-pool.c
+	../replay-convert.c
+	../replay-save-queue.c
+	../replay-control.c
+	../replay-blend.c)
+target_include_directories(test-blend PRIVATE ${REPLAY_TEST_COMMON_INCLUDES})
+target_link_libraries(test-blend PRIVATE
+	OBS::${OBS_FRONTEND_API_NAME}
+	OBS::libobs)
+if(UNIX AND NOT APPLE)
+	target_link_libraries(test-blend PRIVATE m)
+endif()
+add_test(NAME replay_blend COMMAND test-blend)

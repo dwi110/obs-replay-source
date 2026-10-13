@@ -34,6 +34,8 @@ target_sources(${PROJECT_NAME} PRIVATE
 	replay-pool.h
 	replay-convert.c
 	replay-convert.h
+	replay-blend.c
+	replay-blend.h
 	version.h)
 
 if(BUILD_OUT_OF_TREE)
