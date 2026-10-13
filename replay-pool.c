@@ -299,6 +299,8 @@ static void start_warmup_locked(struct replay_pool *pool, uint32_t target_frames
 {
 	if (pool->closed)
 		return;
+	/* The target only ever grows: a lower reserve_mode (or shorter duration) must not shrink the
+	 * pool, so already allocated frames and in-flight frame references stay valid. */
 	if (target_frames > pool->target_frames)
 		pool->target_frames = target_frames;
 	if (pool->allocated_frames >= pool->target_frames || pool->warmup_active)

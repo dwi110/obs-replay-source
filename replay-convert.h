@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 void replay_convert_target_format(enum video_format src_format, uint32_t src_width, uint32_t src_height,
-				  bool prefer_nv12, bool downscale_max_1080p, enum video_format *dst_format,
+				  int storage_format, bool downscale_max_1080p, enum video_format *dst_format,
 				  uint32_t *dst_width, uint32_t *dst_height);
 
 void replay_copy_frame_metadata(struct obs_source_frame *dst, const struct obs_source_frame *src);

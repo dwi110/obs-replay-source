@@ -142,6 +142,7 @@ struct replay_source {
 	char *directory;
 	char *save_encoder;
 	char *save_container;
+	int save_quality;
 	char *progress_source_name;
 	char *text_source_name;
 	char *text_format;
@@ -652,8 +653,10 @@ static void replay_source_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, SETTING_DOWNSCALE, DOWNSCALE_NONE);
 	obs_data_set_default_bool(settings, SETTING_KEEP_BUFFER, true);
 	obs_data_set_default_int(settings, SETTING_AUTO_RELEASE, AUTO_RELEASE_NEVER);
+	obs_data_set_default_int(settings, SETTING_RESERVE_MODE, RESERVE_BUFFER_PLUS_ONE);
 	obs_data_set_default_string(settings, SETTING_SAVE_ENCODER, SAVE_ENCODER_AUTO);
 	obs_data_set_default_string(settings, SETTING_SAVE_CONTAINER, SAVE_CONTAINER_MP4);
+	obs_data_set_default_int(settings, SETTING_SAVE_QUALITY, SETTING_SAVE_QUALITY_DEFAULT);
 }
 
 static void replay_source_show(void *data)
@@ -837,6 +840,7 @@ void replay_save(struct replay_source *context)
 		.file_format = context->file_format,
 		.save_encoder = context->save_encoder,
 		.save_container = context->save_container,
+		.save_quality = context->save_quality,
 		.lossless = context->lossless,
 		.video_frames = context->current_replay.video_frames,
 		.video_frame_count = context->current_replay.video_frame_count,
@@ -1757,6 +1761,16 @@ void update_filter_settings(obs_source_t *filter, obs_data_t *settings)
 		obs_data_set_int(filter_settings, SETTING_DOWNSCALE, obs_data_get_int(settings, SETTING_DOWNSCALE));
 		changed = true;
 	}
+	if (obs_data_get_int(filter_settings, SETTING_RESERVE_MODE) !=
+	    obs_data_get_int(settings, SETTING_RESERVE_MODE)) {
+		obs_data_set_int(filter_settings, SETTING_RESERVE_MODE,
+				 obs_data_get_int(settings, SETTING_RESERVE_MODE));
+		changed = true;
+	}
+	if (obs_data_get_int(filter_settings, SETTING_REPLAYS) != obs_data_get_int(settings, SETTING_REPLAYS)) {
+		obs_data_set_int(filter_settings, SETTING_REPLAYS, obs_data_get_int(settings, SETTING_REPLAYS));
+		changed = true;
+	}
 	obs_data_release(filter_settings);
 	if (changed)
 		obs_source_update(filter, NULL);
@@ -2074,6 +2088,10 @@ static void replay_source_update(void *data, obs_data_t *settings)
 	} else {
 		context->save_container = bstrdup(save_container);
 	}
+	int save_quality = (int)obs_data_get_int(settings, SETTING_SAVE_QUALITY);
+	if (save_quality < SETTING_SAVE_QUALITY_MIN || save_quality > SETTING_SAVE_QUALITY_MAX)
+		save_quality = SETTING_SAVE_QUALITY_DEFAULT;
+	context->save_quality = save_quality;
 	replay_update_text(context);
 }
 
@@ -2084,6 +2102,7 @@ static void *replay_source_create(obs_data_t *settings, obs_source_t *source)
 	context->source = source;
 	context->keep_buffer = true;
 	context->auto_release = AUTO_RELEASE_NEVER;
+	context->save_quality = SETTING_SAVE_QUALITY_DEFAULT;
 	obs_source_set_async_unbuffered(source, true);
 	pthread_mutex_init(&context->video_mutex, NULL);
 	pthread_mutex_init(&context->audio_mutex, NULL);
@@ -2831,8 +2850,10 @@ static obs_properties_t *replay_source_properties(void *data)
 	obs_property_list_add_string(prop, obs_module_text("SaveContainerMp4"), SAVE_CONTAINER_MP4);
 	obs_property_list_add_string(prop, obs_module_text("SaveContainerMkv"), SAVE_CONTAINER_MKV);
 
-	obs_properties_add_bool(props, SETTING_LOSSLESS, obs_module_text("Lossless"));
+	obs_properties_add_int(props, SETTING_SAVE_QUALITY, obs_module_text("SaveQuality"), SETTING_SAVE_QUALITY_MIN,
+			       SETTING_SAVE_QUALITY_MAX, 1);
 
+	obs_properties_add_bool(props, SETTING_LOSSLESS, obs_module_text("Lossless"));
 	prop = obs_properties_add_list(props, SETTING_PROGRESS_SOURCE, obs_module_text("ProgressCropSource"),
 				       OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(prop, "", "");
@@ -2861,6 +2882,7 @@ static obs_properties_t *replay_source_properties(void *data)
 	prop = obs_properties_add_list(multicam_group, SETTING_STORAGE_FORMAT, obs_module_text("StorageFormat"),
 				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(prop, obs_module_text("StorageFormat.NV12"), STORAGE_FORMAT_NV12);
+	obs_property_list_add_int(prop, obs_module_text("StorageFormat.UYVY"), STORAGE_FORMAT_UYVY);
 	obs_property_list_add_int(prop, obs_module_text("StorageFormat.Original"), STORAGE_FORMAT_ORIGINAL);
 
 	prop = obs_properties_add_list(multicam_group, SETTING_DOWNSCALE, obs_module_text("ReplayDownscale"),
@@ -2875,6 +2897,12 @@ static obs_properties_t *replay_source_properties(void *data)
 	obs_property_list_add_int(prop, obs_module_text("AutoReleaseReplay.Never"), AUTO_RELEASE_NEVER);
 	obs_property_list_add_int(prop, obs_module_text("AutoReleaseReplay.OnDeactivateOrHide"),
 				  AUTO_RELEASE_DEACTIVATE_HIDE);
+
+	prop = obs_properties_add_list(multicam_group, SETTING_RESERVE_MODE, obs_module_text("ReserveMemory"),
+				       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(prop, obs_module_text("ReserveMemory.Buffer"), RESERVE_BUFFER);
+	obs_property_list_add_int(prop, obs_module_text("ReserveMemory.BufferPlusOne"), RESERVE_BUFFER_PLUS_ONE);
+	obs_property_list_add_int(prop, obs_module_text("ReserveMemory.BufferPlusMax"), RESERVE_BUFFER_PLUS_MAX);
 
 	obs_properties_add_group(props, "multicam_buffer_group", obs_module_text("BufferAndMemoryGroup"),
 				 OBS_GROUP_NORMAL, multicam_group);
