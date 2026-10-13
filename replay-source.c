@@ -592,11 +592,13 @@ static void replay_free_replay(struct replay *replay, struct replay_source *cont
 static void replay_purge_replays(struct replay_source *context)
 {
 	if ((int)(context->replays.size / sizeof context->current_replay) > context->replay_max) {
+		/* Lock order video_mutex -> replay_mutex, same as the tick (auto release) and the mark setters. */
+		pthread_mutex_lock(&context->video_mutex);
 		pthread_mutex_lock(&context->replay_mutex);
 		const int replays_to_delete = (int)(context->replays.size / sizeof context->current_replay - context->replay_max);
 		if (replays_to_delete > context->replay_position) {
 			context->replay_position = replays_to_delete;
-			replay_update_position(context, true);
+			replay_update_position(context, false);
 		}
 		while ((int)(context->replays.size / sizeof context->current_replay) > context->replay_max) {
 			struct replay old_replay;
@@ -608,6 +610,7 @@ static void replay_purge_replays(struct replay_source *context)
 			blog(LOG_INFO, "[replay_source: '%s'] switched to replay %i/%i", obs_source_get_name(context->source),
 			     context->replay_position + 1, (int)(context->replays.size / sizeof context->current_replay));
 		pthread_mutex_unlock(&context->replay_mutex);
+		pthread_mutex_unlock(&context->video_mutex);
 	}
 }
 static void replay_auto_release(struct replay_source *context, bool lock)
