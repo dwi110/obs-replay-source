@@ -100,7 +100,7 @@ Returns status for all replay sources and the sequential save queue.
 
 #### `Action`
 Runs any existing `execute_action` command (`Load`, `Next`, `Previous`, `First`, `Last`, `Remove`, `Clear`, `Save`, `Restart`, `Pause`, `Faster`, `Slower`, `Faster5Percent`, `Slower5Percent`, `NormalOrFaster`, `NormalOrSlower`, `NormalSpeed`, `HalfSpeed`, `DoubleSpeed`, `TrimFront`, `TrimEnd`, `TrimReset`, `Reverse`, `Backward`, `Forward`, `ForwardOrFaster`, `BackwardOrFaster`, `DisableNextScene`, `EnableNextScene`, `Disable`, `Enable`, `SetNextSceneToCurrent`, `SwitchToNextScene`, `NextFrame`, `PrevFrame`, `NextNFrames`, `PrevNFrames`).
-Omit both `source` and `sources` to target **all** replay sources. Note: because `libobs`'s `obs_data_t` represents JSON arrays as arrays of objects, `sources` accepts either `[ { "name": "Replay Cam 1" } ]` or a comma-separated string `"Replay Cam 1,Replay Cam 2"`.
+Omit both `source` and `sources` to target **all** replay sources. `sources` accepts `[ { "name": "Replay Cam 1" } ]` or a comma-separated string `"Replay Cam 1,Replay Cam 2"`. A plain string array (`["Replay Cam 1"]`) is dropped by obs-websocket while converting JSON to `obs_data` (only object items survive), so such a request is rejected with `ok: false` instead of silently targeting nothing.
 
 - **Request Data**:
 ```json
