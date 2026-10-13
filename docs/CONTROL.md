@@ -275,3 +275,29 @@ Add an OBS feedback **"Custom - Vendor Event"**:
 Companion compares the value **as a string** (`===`) and only looks at the **most recent** vendor event of any plugin.
 Numeric/boolean fields (`durationMs`, `ok`) therefore never match; use the string fields `source` and `status`.
 Example: button "Saving Cam 1" active while the latest event is `SaveStarted` with `source` = `Replay Cam 1`.
+
+---
+
+## 5. Slow-Motion Blending (Crossfade)
+
+### Setting: `slowmo_blend`
+- **Type**: `int` (property dropdown on the replay source)
+- **Values**:
+  - `0` (`SLOWMO_BLEND_OFF`): Off (default, original behavior). Each stored frame is output once with a stretched timestamp, resulting in step-stutter at low speeds (e.g., each frame held for 4 output frames at 25%).
+  - `1` (`SLOWMO_BLEND_CROSSFADE`): Smooth slow-motion via crossfade blending.
+- **UI Labels**:
+  - en-US: `Smooth Slow Motion` ("Off" / "Crossfade (motion blur instead of stutter)")
+  - de-DE: `Zeitlupe glätten` ("Aus" / "Überblenden (Bewegungsunschärfe statt Ruckeln)")
+
+### Behavior
+- When enabled and playback speed is < 100% (both forward and backward), intermediate frames are synthesized between consecutive source frames $A$ and $B$ at the OBS output frame interval.
+- Frame weights $w8 = \mathrm{round}(w \cdot 256) \in [0, 256]$ are computed from the exact output timestamp position between $A$ and $B$, supporting arbitrary speeds (e.g., 50%, 25%, 75%, 33%).
+- Blending formula: per-plane 8-bit weighted average $\mathrm{out} = (A \cdot (256 - w8) + B \cdot w8 + 128) \gg 8$, implemented in SIMD (SSE2) with a bit-identical scalar fallback for NV12, UYVY, and I420.
+- Offloaded to a dedicated per-source worker thread without blocking the OBS graphics thread.
+- At $\ge 100\%$ speed, paused playback, or single-frame stepping, blending is bypassed and original behavior is retained.
+- Clear, Remove, new replay load, restart, direction change, or speed change immediately flushes pending worker frames to guarantee strict monotonic timestamps and avoid stale frames.
+
+### Motion Quality & Limitations (Ghosting)
+- Crossfade blending replaces discrete stuttering/judder with smooth motion transitions.
+- Because crossfade blends pixel values directly rather than tracking motion vectors (optical flow), very fast motion across high-contrast edges will produce a double-image/ghosting effect rather than true intermediate movement.
+- True motion-compensated frame interpolation (e.g. NVIDIA Optical Flow SDK / FRUC) requires GPU motion estimation and remains a potential future enhancement.

@@ -11,6 +11,7 @@
 #include "replay-save-queue.h"
 #include <inttypes.h>
 #include "replay-control.h"
+#include "replay-blend.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -62,6 +63,8 @@ struct replay_source {
 	float speed_percent;
 	bool backward;
 	bool backward_start;
+	int slowmo_blend;
+	struct replay_blend_worker *blend_worker;
 	int visibility_action;
 	int end_action;
 	char *next_scene_name;
@@ -366,6 +369,8 @@ static inline void obs_source_signal(struct obs_source *source, const char *sign
 static void replay_reverse(struct replay_source *c, uint64_t os_timestamp)
 {
 	c->backward = !c->backward;
+	if (c->blend_worker)
+		replay_blend_worker_flush(c->blend_worker);
 	if (c->end) {
 		c->end = false;
 		if (c->backward && c->current_replay.video_frame_count) {
@@ -430,6 +435,8 @@ static void replay_forward_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *ho
 		c->backward = false;
 	} else if (c->backward) {
 		c->backward = false;
+		if (c->blend_worker)
+			replay_blend_worker_flush(c->blend_worker);
 
 		const int64_t duration = (int64_t)(((int64_t)c->current_replay.last_frame_timestamp -
 						    (int64_t)c->current_replay.first_frame_timestamp) *
@@ -468,6 +475,8 @@ static void replay_backward_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *h
 		c->backward = true;
 	} else if (!c->backward) {
 		c->backward = true;
+		if (c->blend_worker)
+			replay_blend_worker_flush(c->blend_worker);
 
 		const int64_t duration = (int64_t)(((int64_t)c->current_replay.last_frame_timestamp -
 						    (int64_t)c->current_replay.first_frame_timestamp) *
@@ -487,6 +496,9 @@ static void replay_update_position(struct replay_source *context, bool lock)
 	if (lock)
 		pthread_mutex_lock(&context->video_mutex);
 	pthread_mutex_lock(&context->audio_mutex);
+	if (context->blend_worker)
+		replay_blend_worker_flush(context->blend_worker);
+	context->previous_frame_timestamp = 0;
 	const int replay_count = (int)(context->replays.size / sizeof context->current_replay);
 	if (replay_count == 0) {
 		context->current_replay.video_frame_count = 0;
@@ -677,6 +689,7 @@ static void replay_source_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, SETTING_FRAME_STEP_COUNT, 5);
 	obs_data_set_default_int(settings, SETTING_END_ACTION, END_ACTION_LOOP);
 	obs_data_set_default_bool(settings, SETTING_BACKWARD, false);
+	obs_data_set_default_int(settings, SETTING_SLOWMO_BLEND, SLOWMO_BLEND_OFF);
 	obs_data_set_default_string(settings, SETTING_FILE_FORMAT, "%CCYY-%MM-%DD %hh.%mm.%ss");
 	obs_data_set_default_bool(settings, SETTING_LOSSLESS, false);
 	obs_data_set_default_int(settings, SETTING_STORAGE_FORMAT, STORAGE_FORMAT_NV12);
@@ -749,6 +762,8 @@ void replay_restart(void *data)
 	struct replay_source *c = data;
 	c->restart = true;
 	c->play = true;
+	if (c->blend_worker)
+		replay_blend_worker_flush(c->blend_worker);
 	obs_source_signal(c->source, "media_restart");
 }
 
@@ -757,6 +772,8 @@ void replay_stop(void *data)
 	struct replay_source *c = data;
 	c->play = false;
 	c->restart = true;
+	if (c->blend_worker)
+		replay_blend_worker_flush(c->blend_worker);
 	obs_source_media_ended(c->source);
 }
 
@@ -796,6 +813,8 @@ static void replay_play_pause(void *data, bool pause)
 	if (pause) {
 		if (c->play) {
 			c->play = false;
+			if (c->blend_worker)
+				replay_blend_worker_flush(c->blend_worker);
 			c->pause_timestamp = obs_get_video_frame_time();
 			obs_source_signal(c->source, "media_pause");
 		} else {
@@ -1478,6 +1497,8 @@ static void replay_remove_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hot
 
 	if (context->replay_position >= replay_count)
 		return;
+	if (context->blend_worker)
+		replay_blend_worker_flush(context->blend_worker);
 
 	pthread_mutex_lock(&context->replay_mutex);
 	struct replay removed_replay;
@@ -1508,6 +1529,8 @@ static void replay_clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotk
 
 	pthread_mutex_lock(&context->video_mutex);
 	pthread_mutex_lock(&context->audio_mutex);
+	if (context->blend_worker)
+		replay_blend_worker_flush(context->blend_worker);
 	context->current_replay.video_frame_count = 0;
 	context->current_replay.audio_frame_count = 0;
 	context->replay_position = 0;
@@ -1550,6 +1573,8 @@ void update_speed(struct replay_source *context, float new_speed)
 		const uint64_t new_duration = (uint64_t)(duration * 100.0 / new_speed);
 		context->start_timestamp += old_duration - new_duration;
 	}
+	if (context->blend_worker)
+		replay_blend_worker_flush(context->blend_worker);
 	context->speed_percent = new_speed;
 	replay_update_text(context);
 }
@@ -2080,6 +2105,12 @@ static void replay_source_update(void *data, obs_data_t *settings)
 	if (context->backward != context->backward_start) {
 		replay_reverse_hotkey(context, 0, NULL, true);
 	}
+	int old_blend = context->slowmo_blend;
+	context->slowmo_blend = (int)obs_data_get_int(settings, SETTING_SLOWMO_BLEND);
+	/* The worker lives until source destroy: other threads (hotkeys, vendor requests) may flush it unlocked.
+	 * Switching off only drops pending blended frames so the normal output path continues in order. */
+	if (old_blend != context->slowmo_blend && context->slowmo_blend == SLOWMO_BLEND_OFF)
+		replay_blend_worker_flush(context->blend_worker);
 	context->sound_trigger = obs_data_get_bool(settings, SETTING_SOUND_TRIGGER);
 	if (!context->disabled) {
 
@@ -2475,6 +2506,10 @@ static void replay_source_destroy(void *data)
 	}
 	circlebuf_free(&context->replays);
 	pthread_mutex_unlock(&context->replay_mutex);
+	if (context->blend_worker) {
+		replay_blend_worker_destroy(context->blend_worker);
+		context->blend_worker = NULL;
+	}
 
 	pthread_mutex_destroy(&context->video_mutex);
 	pthread_mutex_destroy(&context->audio_mutex);
@@ -2670,33 +2705,95 @@ static void replay_source_tick(void *data, float seconds)
 				}
 			}
 
-			const int64_t video_duration = (int64_t)os_timestamp - (int64_t)context->start_timestamp;
-			//TODO audio backwards
-			int64_t source_duration = (int64_t)((context->current_replay.last_frame_timestamp - frame->timestamp) *
-							    100.0 / context->speed_percent);
+			bool do_blend = (context->slowmo_blend == SLOWMO_BLEND_CROSSFADE) &&
+					(context->speed_percent < 100.0f);
+			if (do_blend) {
+				const uint64_t first_ts = context->current_replay.first_frame_timestamp;
+				const uint64_t last_ts = context->current_replay.last_frame_timestamp;
+				const int64_t trim_front = context->current_replay.trim_front;
 
-			struct obs_source_frame *output_frame = frame;
-			while (context->play && video_duration >= source_duration) {
-				output_frame = frame;
-				if (frame->timestamp <=
-				    context->current_replay.first_frame_timestamp + context->current_replay.trim_front) {
-					replay_source_end_action(context);
-					break;
+				while (context->play && context->video_frame_position > 0) {
+					struct obs_source_frame *next_f =
+						context->current_replay.video_frames[context->video_frame_position - 1];
+					uint64_t next_t_out = context->start_timestamp +
+						(uint64_t)((last_ts - next_f->timestamp) * 100.0 / context->speed_percent);
+					if (os_timestamp < next_t_out)
+						break;
+
+					struct obs_source_frame *cur_f =
+						context->current_replay.video_frames[context->video_frame_position];
+					if (cur_f->timestamp <= first_ts + trim_front) {
+						replay_source_end_action(context);
+						break;
+					}
+					context->video_frame_position--;
 				}
+
+				struct obs_source_frame *frame_a =
+					context->current_replay.video_frames[context->video_frame_position];
+				struct obs_source_frame *frame_b = frame_a;
+				uint32_t w8 = 0;
+
+				uint64_t t_a = context->start_timestamp +
+					(uint64_t)((last_ts - frame_a->timestamp) * 100.0 / context->speed_percent);
+
+				if (context->video_frame_position > 0) {
+					frame_b = context->current_replay.video_frames[context->video_frame_position - 1];
+					uint64_t t_b = context->start_timestamp +
+						(uint64_t)((last_ts - frame_b->timestamp) * 100.0 / context->speed_percent);
+					if (t_b > t_a && os_timestamp >= t_a) {
+						double w = (double)(os_timestamp - t_a) / (double)(t_b - t_a);
+						if (w < 0.0)
+							w = 0.0;
+						if (w > 1.0)
+							w = 1.0;
+						w8 = (uint32_t)llround(w * 256.0);
+						if (w8 > 256)
+							w8 = 256;
+					}
+				}
+
+				if (os_timestamp >= context->previous_frame_timestamp) {
+					context->previous_frame_timestamp = os_timestamp;
+					if (!context->blend_worker)
+						context->blend_worker = replay_blend_worker_create(context->source);
+					replay_blend_worker_push(context->blend_worker, frame_a, frame_b, w8, os_timestamp);
+					replay_update_progress_crop(context, frame_a->timestamp);
+				}
+
+				if (context->video_frame_position == 0 ||
+				    frame_a->timestamp <= first_ts + trim_front) {
+					replay_source_end_action(context);
+				}
+			} else {
+				const int64_t video_duration = (int64_t)os_timestamp - (int64_t)context->start_timestamp;
+				//TODO audio backwards
+				int64_t source_duration = (int64_t)((context->current_replay.last_frame_timestamp - frame->timestamp) *
+								    100.0 / context->speed_percent);
+
+				struct obs_source_frame *output_frame = frame;
+				while (context->play && video_duration >= source_duration) {
+					output_frame = frame;
+					if (frame->timestamp <=
+					    context->current_replay.first_frame_timestamp + context->current_replay.trim_front) {
+						replay_source_end_action(context);
+						break;
+					}
+					if (context->video_frame_position == 0) {
+						replay_source_end_action(context);
+						break;
+					}
+					context->video_frame_position--;
+
+					frame = context->current_replay.video_frames[context->video_frame_position];
+
+					source_duration = (int64_t)((context->current_replay.last_frame_timestamp - frame->timestamp) *
+								    100.0 / context->speed_percent);
+				}
+				replay_output_frame(context, output_frame);
 				if (context->video_frame_position == 0) {
 					replay_source_end_action(context);
-					break;
 				}
-				context->video_frame_position--;
-
-				frame = context->current_replay.video_frames[context->video_frame_position];
-
-				source_duration = (int64_t)((context->current_replay.last_frame_timestamp - frame->timestamp) *
-							    100.0 / context->speed_percent);
-			}
-			replay_output_frame(context, output_frame);
-			if (context->video_frame_position == 0) {
-				replay_source_end_action(context);
 			}
 		} else {
 			if (context->restart) {
@@ -2764,30 +2861,93 @@ static void replay_source_tick(void *data, float seconds)
 				}
 				pthread_mutex_unlock(&context->audio_mutex);
 			}
-			int64_t source_duration = (int64_t)((frame->timestamp - context->current_replay.first_frame_timestamp) *
-							    100.0 / context->speed_percent);
-			struct obs_source_frame *output_frame = frame;
-			while (context->play && video_duration >= source_duration) {
-				output_frame = frame;
-				if (frame->timestamp >=
-				    context->current_replay.last_frame_timestamp - context->current_replay.trim_end) {
-					replay_source_end_action(context);
-					break;
+			bool do_blend = (context->slowmo_blend == SLOWMO_BLEND_CROSSFADE) &&
+					(context->speed_percent < 100.0f);
+			if (do_blend) {
+				const size_t count = (size_t)context->current_replay.video_frame_count;
+				const uint64_t first_ts = context->current_replay.first_frame_timestamp;
+				const uint64_t last_ts = context->current_replay.last_frame_timestamp;
+				const int64_t trim_end = context->current_replay.trim_end;
+
+				while (context->play && context->video_frame_position + 1 < count) {
+					struct obs_source_frame *next_f =
+						context->current_replay.video_frames[context->video_frame_position + 1];
+					uint64_t next_t_out = context->start_timestamp +
+						(uint64_t)((next_f->timestamp - first_ts) * 100.0 / context->speed_percent);
+					if (os_timestamp < next_t_out)
+						break;
+
+					struct obs_source_frame *cur_f =
+						context->current_replay.video_frames[context->video_frame_position];
+					if (cur_f->timestamp >= last_ts - trim_end) {
+						replay_source_end_action(context);
+						break;
+					}
+					context->video_frame_position++;
 				}
-				context->video_frame_position++;
-				if (context->video_frame_position >= context->current_replay.video_frame_count) {
+
+				struct obs_source_frame *frame_a =
+					context->current_replay.video_frames[context->video_frame_position];
+				struct obs_source_frame *frame_b = frame_a;
+				uint32_t w8 = 0;
+
+				uint64_t t_a = context->start_timestamp +
+					(uint64_t)((frame_a->timestamp - first_ts) * 100.0 / context->speed_percent);
+
+				if (context->video_frame_position + 1 < count) {
+					frame_b = context->current_replay.video_frames[context->video_frame_position + 1];
+					uint64_t t_b = context->start_timestamp +
+						(uint64_t)((frame_b->timestamp - first_ts) * 100.0 / context->speed_percent);
+					if (t_b > t_a && os_timestamp >= t_a) {
+						double w = (double)(os_timestamp - t_a) / (double)(t_b - t_a);
+						if (w < 0.0)
+							w = 0.0;
+						if (w > 1.0)
+							w = 1.0;
+						w8 = (uint32_t)llround(w * 256.0);
+						if (w8 > 256)
+							w8 = 256;
+					}
+				}
+
+				if (os_timestamp >= context->previous_frame_timestamp) {
+					context->previous_frame_timestamp = os_timestamp;
+					if (!context->blend_worker)
+						context->blend_worker = replay_blend_worker_create(context->source);
+					replay_blend_worker_push(context->blend_worker, frame_a, frame_b, w8, os_timestamp);
+					replay_update_progress_crop(context, frame_a->timestamp);
+				}
+
+				if (context->video_frame_position >= count - 1 ||
+				    frame_a->timestamp >= last_ts - trim_end) {
+					replay_source_end_action(context);
+				}
+			} else {
+				int64_t source_duration = (int64_t)((frame->timestamp - context->current_replay.first_frame_timestamp) *
+								    100.0 / context->speed_percent);
+				struct obs_source_frame *output_frame = frame;
+				while (context->play && video_duration >= source_duration) {
+					output_frame = frame;
+					if (frame->timestamp >=
+					    context->current_replay.last_frame_timestamp - context->current_replay.trim_end) {
+						replay_source_end_action(context);
+						break;
+					}
+					context->video_frame_position++;
+					if (context->video_frame_position >= context->current_replay.video_frame_count) {
+						context->video_frame_position = context->current_replay.video_frame_count - 1;
+						replay_source_end_action(context);
+						break;
+					}
+					frame = context->current_replay.video_frames[context->video_frame_position];
+					source_duration = (int64_t)((frame->timestamp - context->current_replay.first_frame_timestamp) *
+								    100.0 / context->speed_percent);
+				}
+				replay_output_frame(context, output_frame);
+				if (context->video_frame_position >= context->current_replay.video_frame_count - 1) {
 					context->video_frame_position = context->current_replay.video_frame_count - 1;
 					replay_source_end_action(context);
-					break;
 				}
-				frame = context->current_replay.video_frames[context->video_frame_position];
-				source_duration = (int64_t)((frame->timestamp - context->current_replay.first_frame_timestamp) *
-							    100.0 / context->speed_percent);
-			}
-			replay_output_frame(context, output_frame);
-			if (context->video_frame_position >= context->current_replay.video_frame_count - 1) {
-				context->video_frame_position = context->current_replay.video_frame_count - 1;
-				replay_source_end_action(context);
 			}
 		}
 	} else if (context->current_replay.audio_frame_count) {
@@ -3028,6 +3188,11 @@ static obs_properties_t *replay_source_properties(void *data)
 	obs_properties_add_float_slider(props, SETTING_SPEED, obs_module_text("SpeedPercentage"), SETTING_SPEED_MIN,
 					SETTING_SPEED_MAX, 1.0);
 	obs_properties_add_bool(props, SETTING_BACKWARD, obs_module_text("Backwards"));
+	obs_property_t *p_blend = obs_properties_add_list(props, SETTING_SLOWMO_BLEND,
+							  obs_module_text("SlowmoBlend"),
+							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p_blend, obs_module_text("SlowmoBlend.Off"), SLOWMO_BLEND_OFF);
+	obs_property_list_add_int(p_blend, obs_module_text("SlowmoBlend.Crossfade"), SLOWMO_BLEND_CROSSFADE);
 
 	obs_properties_add_path(props, SETTING_DIRECTORY, obs_module_text("Directory"), OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_text(props, SETTING_FILE_FORMAT, obs_module_text("FilenameFormatting"), OBS_TEXT_DEFAULT);
@@ -3653,4 +3818,18 @@ void replay_source_test_set_playback_pos(struct replay_source *context, uint64_t
 	context->pause_timestamp = pause_ts;
 	context->start_timestamp = start_ts;
 	pthread_mutex_unlock(&context->video_mutex);
+}
+
+void replay_source_set_blend_output_hook(obs_source_t *source, replay_blend_output_cb cb, void *param)
+{
+	if (!source)
+		return;
+	struct replay_source *c = obs_obj_get_data(source);
+	if (!c)
+		return;
+	pthread_mutex_lock(&c->video_mutex);
+	if (!c->blend_worker)
+		c->blend_worker = replay_blend_worker_create(c->source);
+	replay_blend_worker_set_output_hook(c->blend_worker, cb, param);
+	pthread_mutex_unlock(&c->video_mutex);
 }
