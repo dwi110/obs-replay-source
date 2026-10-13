@@ -1,6 +1,7 @@
 #include "replay-save-queue.h"
 #include "replay-control.h"
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 #include <util/bmem.h>
 #include <util/darray.h>
@@ -534,17 +535,16 @@ static obs_output_t *create_save_output(const struct replay_save_job *job, const
 			obs_data_set_string(fo_settings, "audio_encoder", "pcm_s16le");
 		} else {
 			const bool mkv = job->save_container && astrcmpi(job->save_container, SAVE_CONTAINER_MKV) == 0;
-			struct dstr vs = {0};
+			char vs[128];
 			/* ffmpeg_output does not drain delayed video packets on stop. Every submitted frame must produce
 			 * its packet immediately, so NVENC uses zero-delay P-frames (no B-frames/lookahead). */
-			dstr_printf(&vs, "preset=p5 tune=hq rc=constqp qp=%d bf=0 delay=0 rc-lookahead=0 zerolatency=1",
-				    clamp_save_quality(job->save_quality));
+			snprintf(vs, sizeof(vs), "preset=p5 tune=hq rc=constqp qp=%d bf=0 delay=0 rc-lookahead=0 zerolatency=1",
+				 clamp_save_quality(job->save_quality));
 			obs_data_set_string(fo_settings, "format_name", mkv ? "matroska" : "mp4");
-			obs_data_set_string(fo_settings, "video_settings", vs.array);
+			obs_data_set_string(fo_settings, "video_settings", vs);
 			obs_data_set_int(fo_settings, "gop_size", (int)(2 * vi->fps_num / (vi->fps_den ? vi->fps_den : 1)));
 			obs_data_set_string(fo_settings, "audio_encoder", "aac");
 			obs_data_set_int(fo_settings, "audio_bitrate", 192);
-			dstr_free(&vs);
 		}
 		obs_data_set_string(fo_settings, "video_encoder", plan->codec);
 		obs_output_update(file_output, fo_settings);
@@ -704,6 +704,7 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 	}
 
 	bool started = false;
+	bool ffmpeg_nvenc = false;
 	for (size_t p = 0; p < plan_count && !started; p++) {
 		const struct save_plan *plan = &plans[p];
 		const char *backend_name = plan->backend == SAVE_BACKEND_FFMPEG_OUTPUT ? "ffmpeg_output" : "obs encoder";
@@ -746,6 +747,7 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 			continue;
 		}
 		started = true;
+		ffmpeg_nvenc = !job->lossless && plan->backend == SAVE_BACKEND_FFMPEG_OUTPUT;
 	}
 	if (!started) {
 		blog(LOG_ERROR, "[replay_save_queue] No encoder could be started for '%s'", job->output_path);
@@ -820,6 +822,15 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 		if (os_gettime_ns() - drain_wait_ns > 2000000000ULL)
 			break;
 		os_sleep_ms(2);
+	}
+
+	if (ffmpeg_nvenc) {
+		/* ffmpeg_output closes AAC without an encoder drain. Keep its audio callbacks alive for encoder
+		 * priming plus callback/packet scheduling; after the clip they supply only silence. Do not submit
+		 * extra video frames. This preserves the final real audio samples instead of losing ~80 ms. */
+		const uint64_t audio_tail_ns =
+			util_mul_div64(5ULL * AUDIO_OUTPUT_FRAMES, 1000000000ULL, oi.samples_per_sec);
+		sleep_until_interruptible(base_ts + job->duration_ns + audio_tail_ns);
 	}
 
 	if (is_shutting_down()) {
