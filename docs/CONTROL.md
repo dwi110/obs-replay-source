@@ -278,7 +278,7 @@ Example: button "Saving Cam 1" active while the latest event is `SaveStarted` wi
 
 ---
 
-## 5. Slow-Motion Blending (Crossfade)
+## 6. Slow-Motion Blending (Crossfade)
 
 ### Setting: `slowmo_blend`
 - **Type**: `int` (property dropdown on the replay source)
