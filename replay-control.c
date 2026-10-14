@@ -78,6 +78,17 @@ static void push_name_obj(obs_data_array_t *arr, const char *name)
 	obs_data_release(item);
 }
 
+static void push_skipped_obj(obs_data_array_t *arr, const char *name, const char *reason)
+{
+	if (!arr)
+		return;
+	obs_data_t *item = obs_data_create();
+	obs_data_set_string(item, "name", name ? name : "");
+	obs_data_set_string(item, "reason", reason);
+	obs_data_array_push_back(arr, item);
+	obs_data_release(item);
+}
+
 static void free_string_darray(string_list_t *names)
 {
 	for (size_t i = 0; i < names->num; i++)
@@ -235,6 +246,9 @@ struct load_all_entry {
 	int64_t trim_end_ns;
 };
 
+/* LoadAll: an angle whose newest frame is this far behind the freshest angle has stalled. */
+#define LOAD_ALL_STALE_NS 1000000000ULL
+
 static size_t replay_control_load_all_internal(const char *const *filter_names, size_t filter_count, bool has_filter,
 					       obs_data_t *response_out)
 {
@@ -253,9 +267,6 @@ static size_t replay_control_load_all_internal(const char *const *filter_names, 
 	DARRAY(struct load_all_entry) loaded;
 	da_init(loaded);
 
-	uint64_t common_start_ns = 0;
-	uint64_t common_end_ns = 0;
-
 	for (size_t i = 0; i < sources.num; i++) {
 		obs_source_t *s = sources.array[i];
 		const char *sname = obs_source_get_name(s);
@@ -264,15 +275,6 @@ static size_t replay_control_load_all_internal(const char *const *filter_names, 
 		uint64_t last_ts = 0;
 
 		if (ctx && replay_source_load_unaligned(ctx, &first_ts, &last_ts)) {
-			if (loaded.num == 0) {
-				common_start_ns = first_ts;
-				common_end_ns = last_ts;
-			} else {
-				if (first_ts > common_start_ns)
-					common_start_ns = first_ts;
-				if (last_ts < common_end_ns)
-					common_end_ns = last_ts;
-			}
 			struct load_all_entry entry = {
 				.source = s,
 				.ctx = ctx,
@@ -287,10 +289,55 @@ static size_t replay_control_load_all_internal(const char *const *filter_names, 
 			da_push_back(loaded, &entry);
 		} else {
 			skipped_count++;
-			push_name_obj(skipped_arr, sname ? sname : "");
+			push_skipped_obj(skipped_arr, sname ? sname : "", "empty");
 			blog(LOG_INFO, "[replay_control] LoadAll skipped '%s' (buffer empty or source unconfigured)",
 			     sname ? sname : "");
 		}
+	}
+
+	/* One stalled angle (old newest frame) or one with a short history (just reconnected) would shrink the
+	 * common window of every angle to nothing. Such angles are unloaded again and reported as skipped. */
+	uint64_t newest_ns = 0;
+	for (size_t i = 0; i < loaded.num; i++) {
+		if (loaded.array[i].last_ts > newest_ns)
+			newest_ns = loaded.array[i].last_ts;
+	}
+	uint64_t longest_ns = 0;
+	for (size_t i = 0; i < loaded.num; i++) {
+		const struct load_all_entry *e = &loaded.array[i];
+		if (e->last_ts + LOAD_ALL_STALE_NS >= newest_ns && e->duration_ns > longest_ns)
+			longest_ns = e->duration_ns;
+	}
+	size_t kept = 0;
+	for (size_t i = 0; i < loaded.num; i++) {
+		struct load_all_entry *e = &loaded.array[i];
+		const char *reason = NULL;
+		if (e->last_ts + LOAD_ALL_STALE_NS < newest_ns)
+			reason = "stalled";
+		else if (e->duration_ns < longest_ns / 2)
+			reason = "short";
+		if (reason) {
+			replay_source_unload_newest(e->ctx);
+			skipped_count++;
+			push_skipped_obj(skipped_arr, e->name, reason);
+			blog(LOG_INFO,
+			     "[replay_control] LoadAll skipped '%s' (%s: %.2fs history ending %.2fs before newest angle)",
+			     e->name, reason, (double)e->duration_ns / 1e9, (double)(newest_ns - e->last_ts) / 1e9);
+			bfree(e->name);
+			continue;
+		}
+		loaded.array[kept++] = *e;
+	}
+	loaded.num = kept;
+
+	uint64_t common_start_ns = 0;
+	uint64_t common_end_ns = 0;
+	for (size_t i = 0; i < loaded.num; i++) {
+		const struct load_all_entry *e = &loaded.array[i];
+		if (i == 0 || e->first_ts > common_start_ns)
+			common_start_ns = e->first_ts;
+		if (i == 0 || e->last_ts < common_end_ns)
+			common_end_ns = e->last_ts;
 	}
 
 	for (size_t i = 0; i < loaded.num; i++) {

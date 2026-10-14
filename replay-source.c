@@ -3528,6 +3528,17 @@ bool replay_source_load_unaligned(struct replay_source *context, uint64_t *first
 	return ok;
 }
 
+void replay_source_unload_newest(struct replay_source *context)
+{
+	if (!context)
+		return;
+	const int count = (int)(context->replays.size / sizeof(struct replay));
+	if (count <= 0)
+		return;
+	context->replay_position = count - 1;
+	replay_remove_hotkey(context, 0, NULL, true);
+}
+
 void replay_source_align_loaded_replay(struct replay_source *context, uint64_t common_start_ns, uint64_t common_end_ns,
 				       uint64_t *start_ns_out, uint64_t *duration_ns_out, int64_t *trim_front_ns_out,
 				       int64_t *trim_end_ns_out)

@@ -54,6 +54,8 @@ void replay_source_restart_playback(struct replay_source *context);
 void replay_source_toggle_pause(struct replay_source *context);
 bool replay_source_get_status(struct replay_source *context, struct replay_source_status *out);
 bool replay_source_load_unaligned(struct replay_source *context, uint64_t *first_ts_out, uint64_t *last_ts_out);
+/* Removes the replay added by replay_source_load_unaligned (the newest one). */
+void replay_source_unload_newest(struct replay_source *context);
 void replay_source_align_loaded_replay(struct replay_source *context, uint64_t common_start_ns, uint64_t common_end_ns,
 				       uint64_t *start_ns_out, uint64_t *duration_ns_out, int64_t *trim_front_ns_out,
 				       int64_t *trim_end_ns_out);
