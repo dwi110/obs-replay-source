@@ -54,7 +54,7 @@ Registered once at module load (`obs_hotkey_register_frontend`):
 
 | Hotkey Name | Description (en-US / de-DE) | Behavior |
 |---|---|---|
-| `ReplaySource.LoadAll` | `Replay: load all angles` / `Replay: Alle Winkel laden` | Snapshots `t_end = os_gettime_ns()`, loads all replay sources synchronously on the same thread, and trims each loaded replay (`trim_front`/`trim_end`) to the common time window `[max(first_ts), min(last_ts)]`. Ignores per-source `retrieve_delay` so all angles capture the exact same moment. Empty buffers are skipped. |
+| `ReplaySource.LoadAll` | `Replay: load all angles` / `Replay: Alle Winkel laden` | Snapshots `t_end = os_gettime_ns()`, loads all replay sources synchronously on the same thread, and trims each loaded replay (`trim_front`/`trim_end`) to the common time window `[max(first_ts), min(last_ts)]`. Ignores per-source `retrieve_delay` so all angles capture the exact same moment. Empty buffers are skipped; so are stalled angles (newest frame more than 1 s behind the freshest angle) and angles with less than half of the longest history (just reconnected) — they would otherwise shrink every angle's window to nothing. Skipped angles have no replay loaded. |
 | `ReplaySource.SaveAll` | `Replay: save all loaded replays` / `Replay: Alle geladenen Replays speichern` | Enqueues all loaded replays into the sequential save queue. |
 | `ReplaySource.AllNormalSpeed` | `Replay: all angles normal speed (100%)` / `Replay: Alle Winkel Normalgeschwindigkeit (100%)` | Sets playback speed to `100%` on all replay sources. |
 | `ReplaySource.AllHalfSpeed` | `Replay: all angles half speed (50%)` / `Replay: Alle Winkel halbe Geschwindigkeit (50%)` | Sets playback speed to `50%` on all replay sources. |
@@ -148,7 +148,7 @@ Sets arbitrary playback speed (`0.01`–`400.0`%) on one, several, or all replay
 ```
 
 #### `LoadAll`
-Synchronously loads and time-aligns all (or selected) replay sources to the common frame timestamp intersection `[max(first_ts), min(last_ts)]`.
+Synchronously loads and time-aligns all (or selected) replay sources to the common frame timestamp intersection `[max(first_ts), min(last_ts)]`. Angles are skipped with a `reason`: `empty` (no buffered frames), `stalled` (newest frame more than 1 s behind the freshest angle, e.g. camera or network dropped out) or `short` (less than half of the longest history, e.g. camera just reconnected). A skipped angle is not loaded and does not reduce the common window of the others.
 
 - **Request Data**: `{}` (or `{ "sources": [{ "name": "Replay Cam 1" }, { "name": "Replay Cam 2" }] }`)
 - **Response Data**:
@@ -171,7 +171,7 @@ Synchronously loads and time-aligns all (or selected) replay sources to the comm
       "trimEndMs": 66
     }
   ],
-  "skipped": [{ "name": "Replay Cam 3" }],
+  "skipped": [{ "name": "Replay Cam 3", "reason": "stalled" }],
   "unknown": [],
   "loadedCount": 2,
   "skippedCount": 1,
