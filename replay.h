@@ -73,6 +73,10 @@ struct replay_filter {
 	obs_weak_source_t *tap_parent;
 	volatile bool tap_active;
 	bool tap_checked;
+	/* Serializes tap attach (graphics thread) with detach (filter removal/destroy). After removal the
+	 * filter never attaches again, so no tap callback can outlive the filter. */
+	pthread_mutex_t tap_mutex;
+	bool tap_closed;
 
 	uint32_t capture_count;
 	uint64_t capture_sum_ns;

@@ -209,14 +209,17 @@ static void try_attach_frame_tap(struct replay_filter *filter)
 	if (!filter || filter->tap_checked || !filter->src)
 		return;
 
-	obs_source_t *parent = obs_filter_get_parent(filter->src);
-	if (!parent)
+	pthread_mutex_lock(&filter->tap_mutex);
+	obs_source_t *parent = NULL;
+	if (!filter->tap_checked && !filter->tap_closed)
+		parent = obs_filter_get_parent(filter->src);
+	proc_handler_t *ph = parent ? obs_source_get_proc_handler(parent) : NULL;
+	if (parent)
+		filter->tap_checked = true;
+	if (!ph) {
+		pthread_mutex_unlock(&filter->tap_mutex);
 		return;
-
-	filter->tap_checked = true;
-	proc_handler_t *ph = obs_source_get_proc_handler(parent);
-	if (!ph)
-		return;
+	}
 
 	struct calldata cd;
 	uint8_t stack[128];
@@ -232,18 +235,24 @@ static void try_attach_frame_tap(struct replay_filter *filter)
 		blog(LOG_INFO, "[replay-filter] '%s' frame tap active on source '%s'", fname ? fname : "",
 		     pname ? pname : "");
 	}
+	pthread_mutex_unlock(&filter->tap_mutex);
 }
 
+/* Terminal: called on filter removal and destroy; the filter never attaches again afterwards. The tap
+ * provider's remove waits for an in-flight callback, so no tap frame reaches the filter after this. */
 static void detach_frame_tap(struct replay_filter *filter, obs_source_t *explicit_parent)
 {
 	if (!filter)
 		return;
 
+	pthread_mutex_lock(&filter->tap_mutex);
+	filter->tap_closed = true;
 	if (!os_atomic_set_bool(&filter->tap_active, false)) {
 		if (filter->tap_parent) {
 			obs_weak_source_release(filter->tap_parent);
 			filter->tap_parent = NULL;
 		}
+		pthread_mutex_unlock(&filter->tap_mutex);
 		return;
 	}
 
@@ -256,16 +265,18 @@ static void detach_frame_tap(struct replay_filter *filter, obs_source_t *explici
 	if (!parent && filter->src)
 		parent = obs_filter_get_parent(filter->src);
 
-	if (parent) {
-		proc_handler_t *ph = obs_source_get_proc_handler(parent);
-		if (ph) {
-			struct calldata cd;
-			uint8_t stack[128];
-			calldata_init_fixed(&cd, stack, sizeof(stack));
-			calldata_set_ptr(&cd, "callback", (void *)(uintptr_t)replay_filter_tap_cb);
-			calldata_set_ptr(&cd, "param", filter);
-			proc_handler_call(ph, FRAME_TAP_PROC_REMOVE, &cd);
-		}
+	proc_handler_t *ph = parent ? obs_source_get_proc_handler(parent) : NULL;
+	if (ph) {
+		struct calldata cd;
+		uint8_t stack[128];
+		calldata_init_fixed(&cd, stack, sizeof(stack));
+		calldata_set_ptr(&cd, "callback", (void *)(uintptr_t)replay_filter_tap_cb);
+		calldata_set_ptr(&cd, "param", filter);
+		proc_handler_call(ph, FRAME_TAP_PROC_REMOVE, &cd);
+	} else {
+		const char *fname = filter->src ? obs_source_get_name(filter->src) : NULL;
+		blog(LOG_WARNING, "[replay-filter] '%s' frame tap could not be removed: parent source gone",
+		     fname ? fname : "");
 	}
 
 	if (strong_parent)
@@ -274,6 +285,7 @@ static void detach_frame_tap(struct replay_filter *filter, obs_source_t *explici
 		obs_weak_source_release(filter->tap_parent);
 		filter->tap_parent = NULL;
 	}
+	pthread_mutex_unlock(&filter->tap_mutex);
 }
 
 static void replay_filter_update(void *data, obs_data_t *settings)
@@ -327,6 +339,7 @@ static void *replay_filter_create(obs_data_t *settings, obs_source_t *source)
 	context->src = source;
 	context->logged_reserve_mode = -1;
 	pthread_mutex_init(&context->mutex, NULL);
+	pthread_mutex_init(&context->tap_mutex, NULL);
 	context->last_check = safe_video_frame_time();
 
 	obs_data_set_default_int(settings, SETTING_RESERVE_MODE, RESERVE_BUFFER_PLUS_ONE);
@@ -352,6 +365,7 @@ static void replay_filter_destroy(void *data)
 	circlebuf_free(&filter->video_frames);
 	circlebuf_free(&filter->audio_frames);
 	pthread_mutex_destroy(&filter->mutex);
+	pthread_mutex_destroy(&filter->tap_mutex);
 	bfree(data);
 }
 
@@ -360,7 +374,6 @@ static void replay_filter_remove(void *data, obs_source_t *parent)
 	struct replay_filter *filter = data;
 
 	detach_frame_tap(filter, parent);
-	filter->tap_checked = false;
 
 	pthread_mutex_lock(&filter->mutex);
 	free_video_data(filter);
