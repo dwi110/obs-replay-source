@@ -214,6 +214,13 @@ int main(void)
 	fake_tap_emit_frame(&cam, src_frame);
 	CHECK(cam.emit_calls == prev_emits, "callback was invoked after frame_tap_remove");
 
+	/* libobs clears filter_parent only after filter_remove returns, and the graphics thread can tick the
+	 * filter in between. A removed filter must never attach again: its tap would outlive the filter. */
+	replay_filter_async_info.video_tick(rf, 0.016f);
+	CHECK(cam.add_calls == 1 && cam.cb == NULL, "removed filter re-attached its frame tap (add_calls=%d)",
+	      cam.add_calls);
+	filter_src.parent = NULL;
+
 	replay_filter_async_info.destroy(rf);
 	obs_data_release(settings);
 
