@@ -52,6 +52,8 @@ struct replay {
 	int64_t align_end;
 	bool has_align;
 	bool auto_saved;
+	/* Receive-clock time of the newest frame (audio packet for audio-only replays) at load. */
+	uint64_t last_arrival_ns;
 };
 
 struct replay_source {
@@ -968,6 +970,7 @@ static bool replay_retrieve_internal(struct replay_source *context, bool emit_ev
 	new_replay.align_end = 0;
 	new_replay.has_align = false;
 	new_replay.auto_saved = false;
+	new_replay.last_arrival_ns = 0;
 	if (vf) {
 		struct obs_source_frame *frame;
 		pthread_mutex_lock(&vf->mutex);
@@ -995,6 +998,7 @@ static bool replay_retrieve_internal(struct replay_source *context, bool emit_ev
 				*(new_replay.video_frames + i) = frame;
 			}
 		}
+		new_replay.last_arrival_ns = vf->last_arrival_ns;
 		pthread_mutex_unlock(&vf->mutex);
 	} else {
 		new_replay.video_frames = NULL;
@@ -1009,6 +1013,8 @@ static bool replay_retrieve_internal(struct replay_source *context, bool emit_ev
 			new_replay.last_frame_timestamp = audio.timestamp;
 		}
 		new_replay.oai = af->oai;
+		if (!vf)
+			new_replay.last_arrival_ns = af->last_arrival_ns;
 		new_replay.audio_frame_count = af->audio_frames.size / sizeof(struct obs_audio_data);
 		new_replay.audio_frames = bzalloc((size_t)new_replay.audio_frame_count * sizeof(struct obs_audio_data));
 		if (context->keep_buffer) {
@@ -3504,7 +3510,8 @@ bool replay_source_get_status(struct replay_source *context, struct replay_sourc
 	return true;
 }
 
-bool replay_source_load_unaligned(struct replay_source *context, uint64_t *first_ts_out, uint64_t *last_ts_out)
+bool replay_source_load_unaligned(struct replay_source *context, uint64_t *first_ts_out, uint64_t *last_ts_out,
+				  uint64_t *last_arrival_ns_out)
 {
 	if (!context)
 		return false;
@@ -3521,6 +3528,8 @@ bool replay_source_load_unaligned(struct replay_source *context, uint64_t *first
 				*first_ts_out = r->first_frame_timestamp;
 			if (last_ts_out)
 				*last_ts_out = r->last_frame_timestamp;
+			if (last_arrival_ns_out)
+				*last_arrival_ns_out = r->last_arrival_ns;
 			ok = true;
 		}
 	}

@@ -86,8 +86,13 @@ static struct replay_pool *ensure_filter_pool_locked(struct replay_filter *filte
 	return filter->pool;
 }
 
-static void record_capture_timing_locked(struct replay_filter *filter, uint64_t t0_ns, uint64_t elapsed_ns)
+static void record_capture_timing_locked(struct replay_filter *filter, uint64_t t0_ns, uint64_t elapsed_ns,
+					 int64_t ts_arrival_ns)
 {
+	if (filter->capture_count == 0 || ts_arrival_ns < filter->ts_arrival_min_ns)
+		filter->ts_arrival_min_ns = ts_arrival_ns;
+	if (filter->capture_count == 0 || ts_arrival_ns > filter->ts_arrival_max_ns)
+		filter->ts_arrival_max_ns = ts_arrival_ns;
 	filter->capture_count++;
 	filter->capture_sum_ns += elapsed_ns;
 	if (elapsed_ns > filter->capture_max_ns)
@@ -103,9 +108,10 @@ static void record_capture_timing_locked(struct replay_filter *filter, uint64_t 
 		const double pool_gb = (double)stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0);
 		const char *name = filter->src ? obs_source_get_name(filter->src) : "";
 		blog(LOG_INFO,
-		     "[replay-filter] '%s' capture: frames=%u avg=%.3fms max=%.3fms pool=%u frames %.2f GB peak=%u",
+		     "[replay-filter] '%s' capture: frames=%u avg=%.3fms max=%.3fms pool=%u frames %.2f GB peak=%u "
+		     "ts-arrival=%+.0f..%+.0fms",
 		     name ? name : "", filter->capture_count, avg_ms, max_ms, stats.allocated_frames, pool_gb,
-		     stats.peak_frames);
+		     stats.peak_frames, (double)filter->ts_arrival_min_ns / 1e6, (double)filter->ts_arrival_max_ns / 1e6);
 		filter->capture_count = 0;
 		filter->capture_sum_ns = 0;
 		filter->capture_max_ns = 0;
@@ -155,9 +161,10 @@ static bool capture_single_frame_locked(struct replay_filter *filter, const stru
 	new_frame->timestamp = adjusted_time;
 	*last_timestamp = adjusted_time;
 	circlebuf_push_back(&filter->video_frames, &new_frame, sizeof(struct obs_source_frame *));
+	filter->last_arrival_ns = t0;
 
 	const uint64_t elapsed = os_gettime_ns() - t0;
-	record_capture_timing_locked(filter, t0, elapsed);
+	record_capture_timing_locked(filter, t0, elapsed, (int64_t)(adjusted_time - t0));
 	return true;
 }
 

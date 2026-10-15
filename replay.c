@@ -85,6 +85,7 @@ struct obs_audio_data *replay_filter_audio(void *data, struct obs_audio_data *au
 	pthread_mutex_lock(&filter->mutex);
 
 	circlebuf_push_back(&filter->audio_frames, &cached, sizeof(cached));
+	filter->last_arrival_ns = os_time;
 
 	circlebuf_peek_front(&filter->audio_frames, &cached, sizeof(cached));
 
