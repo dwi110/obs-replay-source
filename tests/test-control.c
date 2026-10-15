@@ -849,19 +849,21 @@ int main(int argc, char **argv)
 	CHECK(g_fake_ws.events.num == 0, "AUTO_SAVE_OFF Clear must emit no SaveStarted events");
 
 	/* =====================================================================
-	 * 6. LoadAll with a stalled and a just-reconnected angle: both must be skipped and unloaded instead of
-	 *    shrinking the common window of the healthy angle to nothing.
+	 * 6. LoadAll staleness uses the receive clock, not the cameras' timestamps:
+	 *    - Cam 5 stopped delivering 1.3 s before the trigger (its timestamps still end with the others),
+	 *    - Cam 6 just reconnected (67 ms history),
+	 *    - Cam 7 is healthy but its clock runs 1.5 s ahead of Cam 4 (real cameras differ by up to
+	 *      MAX_TS_VAR before the capture path rebases); it must not make Cam 4 look stalled.
+	 *    Cam 5 and Cam 6 must be skipped and unloaded, Cam 4 and Cam 7 loaded.
 	 * ===================================================================== */
-	obs_source_t *cam4 = obs_source_create("dummy_async_cam", "Cam 4", NULL, NULL);
-	obs_source_t *cam5 = obs_source_create("dummy_async_cam", "Cam 5", NULL, NULL);
-	obs_source_t *cam6 = obs_source_create("dummy_async_cam", "Cam 6", NULL, NULL);
-	obs_source_t *rs4 = obs_source_create(REPLAY_SOURCE_ID, "Replay Cam 4", NULL, NULL);
-	obs_source_t *rs5 = obs_source_create(REPLAY_SOURCE_ID, "Replay Cam 5", NULL, NULL);
-	obs_source_t *rs6 = obs_source_create(REPLAY_SOURCE_ID, "Replay Cam 6", NULL, NULL);
-	CHECK(cam4 && cam5 && cam6 && rs4 && rs5 && rs6, "failed to create stall-test sources");
-	obs_source_t *stall_rs[3] = {rs4, rs5, rs6};
-	const char *stall_cam[3] = {"Cam 4", "Cam 5", "Cam 6"};
-	for (int i = 0; i < 3; i++) {
+	obs_source_t *stall_cams[4];
+	obs_source_t *stall_rs[4];
+	const char *stall_cam[4] = {"Cam 4", "Cam 5", "Cam 6", "Cam 7"};
+	const char *stall_rs_name[4] = {"Replay Cam 4", "Replay Cam 5", "Replay Cam 6", "Replay Cam 7"};
+	for (int i = 0; i < 4; i++) {
+		stall_cams[i] = obs_source_create("dummy_async_cam", stall_cam[i], NULL, NULL);
+		stall_rs[i] = obs_source_create(REPLAY_SOURCE_ID, stall_rs_name[i], NULL, NULL);
+		CHECK(stall_cams[i] && stall_rs[i], "failed to create stall-test sources");
 		obs_data_t *st = obs_source_get_settings(stall_rs[i]);
 		obs_data_set_string(st, SETTING_SOURCE, stall_cam[i]);
 		obs_data_set_int(st, SETTING_DURATION, 5000);
@@ -870,31 +872,34 @@ int main(int argc, char **argv)
 		obs_data_release(st);
 	}
 
-	/* The capture path rebases timestamps further than 2 s from the video clock, so all three cameras stay
-	 * within +-2 s of "now": healthy 3 s history, stalled one ends 2.9 s before it, short one has 67 ms. */
+	/* Timestamps stay within +-2 s of the capture clock so the capture path keeps them unchanged. */
 	uint64_t stall_now = obs_get_video_frame_time();
 	if (!stall_now)
 		stall_now = os_gettime_ns();
-	const uint64_t stall_base = stall_now - 1500000000ULL;
-	feed_nv12_frames(cam4, 320, 180, 180, stall_base, interval_ns);
-	feed_nv12_frames(cam5, 320, 180, 30, stall_now - 1900000000ULL, interval_ns);
-	feed_nv12_frames(cam6, 320, 180, 5, stall_base + 175ULL * interval_ns, interval_ns);
+	const uint64_t trigger_ts = stall_now + 1300000000ULL;
+	feed_nv12_frames(stall_cams[1], 320, 180, 180, trigger_ts - 180ULL * interval_ns, interval_ns);
+	os_sleep_ms(1300);
+	feed_nv12_frames(stall_cams[0], 320, 180, 180, trigger_ts - 180ULL * interval_ns, interval_ns);
+	feed_nv12_frames(stall_cams[2], 320, 180, 5, trigger_ts - 5ULL * interval_ns, interval_ns);
+	feed_nv12_frames(stall_cams[3], 320, 180, 180, trigger_ts + 1500000000ULL - 180ULL * interval_ns, interval_ns);
 
 	clear_fake_events();
 	obs_data_t *stall_req = obs_data_create();
 	obs_data_t *stall_res = obs_data_create();
-	obs_data_set_string(stall_req, "sources", "Replay Cam 4,Replay Cam 5,Replay Cam 6");
+	obs_data_set_string(stall_req, "sources", "Replay Cam 4,Replay Cam 5,Replay Cam 6,Replay Cam 7");
 	CHECK(call_ws_request("LoadAll", stall_req, stall_res), "LoadAll (stall test) failed");
-	CHECK(obs_data_get_int(stall_res, "loadedCount") == 1 && obs_data_get_int(stall_res, "skippedCount") == 2,
-	      "expected 1 loaded / 2 skipped, got %lld / %lld", obs_data_get_int(stall_res, "loadedCount"),
+	CHECK(obs_data_get_int(stall_res, "loadedCount") == 2 && obs_data_get_int(stall_res, "skippedCount") == 2,
+	      "expected 2 loaded / 2 skipped, got %lld / %lld", obs_data_get_int(stall_res, "loadedCount"),
 	      obs_data_get_int(stall_res, "skippedCount"));
 
 	obs_data_array_t *stall_loaded = obs_data_get_array(stall_res, "replays");
-	obs_data_t *healthy = obs_data_array_item(stall_loaded, 0);
-	CHECK(strcmp(obs_data_get_string(healthy, "name"), "Replay Cam 4") == 0, "healthy angle not the loaded one");
-	CHECK(obs_data_get_int(healthy, "durationMs") >= 2900,
-	      "healthy angle window shrunk to %lld ms by a stalled/short angle", obs_data_get_int(healthy, "durationMs"));
-	obs_data_release(healthy);
+	for (size_t i = 0; i < obs_data_array_count(stall_loaded); i++) {
+		obs_data_t *item = obs_data_array_item(stall_loaded, i);
+		const char *nm = obs_data_get_string(item, "name");
+		CHECK(strcmp(nm, "Replay Cam 4") == 0 || strcmp(nm, "Replay Cam 7") == 0,
+		      "'%s' loaded, expected only the healthy Cam 4 and the clock-offset Cam 7", nm);
+		obs_data_release(item);
+	}
 	obs_data_array_release(stall_loaded);
 
 	obs_data_array_t *stall_skipped = obs_data_get_array(stall_res, "skipped");
@@ -904,6 +909,7 @@ int main(int argc, char **argv)
 		const char *nm = obs_data_get_string(sk, "name");
 		const char *reason = obs_data_get_string(sk, "reason");
 		const char *want = strcmp(nm, "Replay Cam 5") == 0 ? "stalled" : "short";
+		CHECK(strcmp(nm, "Replay Cam 5") == 0 || strcmp(nm, "Replay Cam 6") == 0, "unexpected skipped '%s'", nm);
 		CHECK(strcmp(reason, want) == 0, "'%s' skipped as '%s', expected '%s'", nm, reason, want);
 		obs_data_release(sk);
 	}
@@ -922,14 +928,13 @@ int main(int argc, char **argv)
 		if (strcmp(g_fake_ws.events.array[i].type, "ReplayLoaded") == 0)
 			stall_loaded_events++;
 	}
-	CHECK(stall_loaded_events == 1, "expected ReplayLoaded only for the healthy angle, got %zu",
+	CHECK(stall_loaded_events == 2, "expected ReplayLoaded only for the two healthy angles, got %zu",
 	      stall_loaded_events);
 
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < 4; i++) {
 		obs_source_release(stall_rs[i]);
-	obs_source_release(cam4);
-	obs_source_release(cam5);
-	obs_source_release(cam6);
+		obs_source_release(stall_cams[i]);
+	}
 
 	/* Cleanup */
 	obs_source_release(rs1);

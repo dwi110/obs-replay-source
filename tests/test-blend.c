@@ -466,7 +466,7 @@ static int test_headless_integration(void)
 	/* Retrieve the loaded replay into rs */
 	struct replay_source *ctx = obs_obj_get_data(rs);
 	uint64_t f_first = 0, f_last = 0;
-	CHECK(replay_source_load_unaligned(ctx, &f_first, &f_last), "replay_source_load_unaligned failed");
+	CHECK(replay_source_load_unaligned(ctx, &f_first, &f_last, NULL), "replay_source_load_unaligned failed");
 
 	/* Start playback at 25% speed */
 	replay_source_set_speed(ctx, 25.0f);

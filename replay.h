@@ -82,6 +82,13 @@ struct replay_filter {
 	uint64_t capture_sum_ns;
 	uint64_t capture_max_ns;
 	uint64_t capture_log_ts;
+	/* os_gettime_ns() when the newest frame or audio packet reached the filter. Unlike the stored
+	 * timestamps (the source's clock, only re-based beyond MAX_TS_VAR) this is the same clock for every
+	 * camera, so LoadAll can tell a stalled angle from one whose clock runs ahead or behind. */
+	uint64_t last_arrival_ns;
+	/* Range of (stored timestamp - arrival) since the last capture log line. */
+	int64_t ts_arrival_min_ns;
+	int64_t ts_arrival_max_ns;
 };
 
 /* Audio packet ownership: every struct obs_audio_data stored by a replay filter, a loaded replay or a

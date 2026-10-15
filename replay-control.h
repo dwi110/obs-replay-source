@@ -53,7 +53,10 @@ void replay_source_set_speed(struct replay_source *context, float speed_percent)
 void replay_source_restart_playback(struct replay_source *context);
 void replay_source_toggle_pause(struct replay_source *context);
 bool replay_source_get_status(struct replay_source *context, struct replay_source_status *out);
-bool replay_source_load_unaligned(struct replay_source *context, uint64_t *first_ts_out, uint64_t *last_ts_out);
+/* Loads the full buffer as a new replay without trimming. last_arrival_ns_out: receive-clock time
+ * (os_gettime_ns) of the newest frame, comparable across sources unlike the frame timestamps. */
+bool replay_source_load_unaligned(struct replay_source *context, uint64_t *first_ts_out, uint64_t *last_ts_out,
+				  uint64_t *last_arrival_ns_out);
 /* Removes the replay added by replay_source_load_unaligned (the newest one). */
 void replay_source_unload_newest(struct replay_source *context);
 void replay_source_align_loaded_replay(struct replay_source *context, uint64_t common_start_ns, uint64_t common_end_ns,

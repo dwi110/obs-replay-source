@@ -244,9 +244,12 @@ struct load_all_entry {
 	uint64_t duration_ns;
 	int64_t trim_front_ns;
 	int64_t trim_end_ns;
+	uint64_t last_arrival_ns;
 };
 
-/* LoadAll: an angle whose newest frame is this far behind the freshest angle has stalled. */
+/* LoadAll: an angle that received no frame for this long (receive clock) has stalled. Frame timestamps
+ * come from each camera's own clock and may differ by up to MAX_TS_VAR between cameras, so they are not
+ * compared across angles for this. */
 #define LOAD_ALL_STALE_NS 1000000000ULL
 
 static size_t replay_control_load_all_internal(const char *const *filter_names, size_t filter_count, bool has_filter,
@@ -273,8 +276,9 @@ static size_t replay_control_load_all_internal(const char *const *filter_names, 
 		struct replay_source *ctx = obs_obj_get_data(s);
 		uint64_t first_ts = 0;
 		uint64_t last_ts = 0;
+		uint64_t last_arrival_ns = 0;
 
-		if (ctx && replay_source_load_unaligned(ctx, &first_ts, &last_ts)) {
+		if (ctx && replay_source_load_unaligned(ctx, &first_ts, &last_ts, &last_arrival_ns)) {
 			struct load_all_entry entry = {
 				.source = s,
 				.ctx = ctx,
@@ -285,6 +289,7 @@ static size_t replay_control_load_all_internal(const char *const *filter_names, 
 				.duration_ns = (last_ts >= first_ts) ? (last_ts - first_ts) : 0,
 				.trim_front_ns = 0,
 				.trim_end_ns = 0,
+				.last_arrival_ns = last_arrival_ns,
 			};
 			da_push_back(loaded, &entry);
 		} else {
@@ -295,24 +300,19 @@ static size_t replay_control_load_all_internal(const char *const *filter_names, 
 		}
 	}
 
-	/* One stalled angle (old newest frame) or one with a short history (just reconnected) would shrink the
+	/* One stalled angle (no frames arriving) or one with a short history (just reconnected) would shrink the
 	 * common window of every angle to nothing. Such angles are unloaded again and reported as skipped. */
-	uint64_t newest_ns = 0;
-	for (size_t i = 0; i < loaded.num; i++) {
-		if (loaded.array[i].last_ts > newest_ns)
-			newest_ns = loaded.array[i].last_ts;
-	}
 	uint64_t longest_ns = 0;
 	for (size_t i = 0; i < loaded.num; i++) {
 		const struct load_all_entry *e = &loaded.array[i];
-		if (e->last_ts + LOAD_ALL_STALE_NS >= newest_ns && e->duration_ns > longest_ns)
+		if (e->last_arrival_ns + LOAD_ALL_STALE_NS >= t_end && e->duration_ns > longest_ns)
 			longest_ns = e->duration_ns;
 	}
 	size_t kept = 0;
 	for (size_t i = 0; i < loaded.num; i++) {
 		struct load_all_entry *e = &loaded.array[i];
 		const char *reason = NULL;
-		if (e->last_ts + LOAD_ALL_STALE_NS < newest_ns)
+		if (e->last_arrival_ns + LOAD_ALL_STALE_NS < t_end)
 			reason = "stalled";
 		else if (e->duration_ns < longest_ns / 2)
 			reason = "short";
@@ -321,8 +321,9 @@ static size_t replay_control_load_all_internal(const char *const *filter_names, 
 			skipped_count++;
 			push_skipped_obj(skipped_arr, e->name, reason);
 			blog(LOG_INFO,
-			     "[replay_control] LoadAll skipped '%s' (%s: %.2fs history ending %.2fs before newest angle)",
-			     e->name, reason, (double)e->duration_ns / 1e9, (double)(newest_ns - e->last_ts) / 1e9);
+			     "[replay_control] LoadAll skipped '%s' (%s: %.2fs history, last frame received %.2fs ago)",
+			     e->name, reason, (double)e->duration_ns / 1e9,
+			     e->last_arrival_ns < t_end ? (double)(t_end - e->last_arrival_ns) / 1e9 : 0.0);
 			bfree(e->name);
 			continue;
 		}
