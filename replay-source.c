@@ -66,6 +66,7 @@ struct replay_source {
 	bool backward;
 	bool backward_start;
 	int slowmo_blend;
+	bool blend_wanted;
 	struct replay_blend_worker *blend_worker;
 	int visibility_action;
 	int end_action;
@@ -2623,6 +2624,19 @@ void replay_source_end_action(struct replay_source *context)
 	}
 }
 
+/* Crossfade blending costs a CPU blend plus an extra frame copy per output frame and source. Multiview and
+ * studio-mode previews only make a source "showing"; blend only while it is active (program output), otherwise
+ * slow motion repeats stored frames. Drops a pending blended frame when blending stops. */
+static bool replay_blend_wanted(struct replay_source *c)
+{
+	const bool want = c->slowmo_blend == SLOWMO_BLEND_CROSSFADE && c->speed_percent < 100.0f &&
+			  obs_source_active(c->source);
+	if (!want && c->blend_wanted && c->blend_worker)
+		replay_blend_worker_flush(c->blend_worker);
+	c->blend_wanted = want;
+	return want;
+}
+
 static void replay_source_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -2711,8 +2725,7 @@ static void replay_source_tick(void *data, float seconds)
 				}
 			}
 
-			bool do_blend = (context->slowmo_blend == SLOWMO_BLEND_CROSSFADE) &&
-					(context->speed_percent < 100.0f);
+			bool do_blend = replay_blend_wanted(context);
 			if (do_blend) {
 				const uint64_t first_ts = context->current_replay.first_frame_timestamp;
 				const uint64_t last_ts = context->current_replay.last_frame_timestamp;
@@ -2867,8 +2880,7 @@ static void replay_source_tick(void *data, float seconds)
 				}
 				pthread_mutex_unlock(&context->audio_mutex);
 			}
-			bool do_blend = (context->slowmo_blend == SLOWMO_BLEND_CROSSFADE) &&
-					(context->speed_percent < 100.0f);
+			bool do_blend = replay_blend_wanted(context);
 			if (do_blend) {
 				const size_t count = (size_t)context->current_replay.video_frame_count;
 				const uint64_t first_ts = context->current_replay.first_frame_timestamp;
