@@ -311,6 +311,11 @@ Example: button "Saving Cam 1" active while the latest event is `SaveStarted` wi
 - Blending formula: per-plane 8-bit weighted average $\mathrm{out} = (A \cdot (256 - w8) + B \cdot w8 + 128) \gg 8$, implemented in SIMD (SSE2) with a bit-identical scalar fallback for NV12, UYVY, and I420.
 - Offloaded to a dedicated per-source worker thread without blocking the OBS graphics thread.
 - At $\ge 100\%$ speed, paused playback, or single-frame stepping, blending is bypassed and original behavior is retained.
+- Blending runs only while the replay source is **active** (part of the program output, including transitions).
+  A source that is only showing in the Multiview or the studio-mode preview plays slow motion with repeated stored
+  frames. Reason: each blending source costs a CPU blend and an extra frame copy per output frame; with seven
+  blending replays in the Multiview (Windows, 2026-10-16) NDI frames of all cameras reached OBS up to 1.9 s late and
+  OBS CPU rose from 6.0 % to 14.5 %; blending only the program angle removed that.
 - Clear, Remove, new replay load, restart, direction change, or speed change immediately flushes pending worker frames to guarantee strict monotonic timestamps and avoid stale frames.
 
 ### Motion Quality & Limitations (Ghosting)

@@ -468,8 +468,22 @@ static int test_headless_integration(void)
 	uint64_t f_first = 0, f_last = 0;
 	CHECK(replay_source_load_unaligned(ctx, &f_first, &f_last, NULL), "replay_source_load_unaligned failed");
 
-	/* Start playback at 25% speed */
+	/* Start playback at 25% speed while the source is only loaded, not on program: no blending */
 	replay_source_set_speed(ctx, 25.0f);
+	replay_source_restart_playback(ctx);
+	for (int k = 0; k < 6; k++) {
+		usleep(17000);
+	}
+	pthread_mutex_lock(&hd.lock);
+	CHECK(hd.count == 0, "Inactive (non-program) source must not blend, got %zu blended frames", hd.count);
+	pthread_mutex_unlock(&hd.lock);
+
+	/* On program (active): blending runs. Activation reaches the source on the next graphics tick. */
+	obs_source_inc_active(rs);
+	usleep(50000);
+	pthread_mutex_lock(&hd.lock);
+	hd.count = 0;
+	pthread_mutex_unlock(&hd.lock);
 	replay_source_restart_playback(ctx);
 
 	/* Wait ~150 ms so the video clock advances and ~8 ticks are processed */
@@ -522,6 +536,7 @@ static int test_headless_integration(void)
 
 	printf("[test-blend] Clear during playback cleanly flushed worker: 0 frames delivered after Clear.\n");
 
+	obs_source_dec_active(rs);
 	obs_source_release(cam);
 	obs_source_release(rs);
 	pthread_mutex_destroy(&hd.lock);
