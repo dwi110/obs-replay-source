@@ -2145,7 +2145,13 @@ static void replay_source_update(void *data, obs_data_t *settings)
 					     obs_source_get_name(context->source), context->source_name);
 				}
 				if (context->source_filter) {
-					obs_source_filter_add(s, context->source_filter);
+					/* The parent owns the filter; keep a weak pointer like EnumFilter. */
+					obs_source_t *f = context->source_filter;
+					obs_source_filter_add(s, f);
+					const bool added = obs_filter_get_parent(f) == s;
+					obs_source_release(f);
+					if (!added)
+						context->source_filter = NULL;
 				}
 			} else if (obs_obj_get_data(context->source_filter)) {
 				update_filter_settings(context->source_filter, settings);
@@ -2178,7 +2184,13 @@ static void replay_source_update(void *data, obs_data_t *settings)
 					     obs_source_get_name(context->source), context->source_audio_name);
 				}
 				if (context->source_audio_filter) {
-					obs_source_filter_add(s, context->source_audio_filter);
+					/* The parent owns the filter; keep a weak pointer like EnumAudioVideoFilter. */
+					obs_source_t *f = context->source_audio_filter;
+					obs_source_filter_add(s, f);
+					const bool added = obs_filter_get_parent(f) == s;
+					obs_source_release(f);
+					if (!added)
+						context->source_audio_filter = NULL;
 				}
 			} else if (obs_obj_get_data(context->source_audio_filter)) {
 				update_filter_settings(context->source_audio_filter, settings);
