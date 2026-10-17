@@ -372,3 +372,24 @@ Example: button "Saving Cam 1" active while the latest event is `SaveStarted` wi
 - Crossfade blending replaces discrete stuttering/judder with smooth motion transitions.
 - Because crossfade blends pixel values directly rather than tracking motion vectors (optical flow), very fast motion across high-contrast edges will produce a double-image/ghosting effect rather than true intermediate movement.
 - True motion-compensated frame interpolation (e.g. NVIDIA Optical Flow SDK / FRUC) requires GPU motion estimation and remains a potential future enhancement.
+
+---
+
+## 7. Half-Resolution Replay Previews (`preview_half`)
+
+### Setting: `preview_half`
+- **Type**: `bool` (checkbox on the replay source; default `false` / unchecked)
+- **UI Labels**:
+  - en-US: `Half-Resolution Replay Previews`
+  - de-DE: `Replay-Vorschau in halber Auflösung`
+
+### Behavior & Architecture
+- **Target scope**: Outside active program output (e.g. Multiview tiles, studio-mode preview, source projectors outside program), supported replay sources output video frames at **half width and half height** (e.g., 4K $3840\times 2160 \to 1920\times 1080$, 1080p $1920\times 1080 \to 960\times 540$).
+- **Internal scaling filter**: An internal scaling filter attached to the replay source ensures the preview scene geometry, bounding box, aspect ratio, and crops remain visually identical to full resolution while the asynchronous pixel buffer uploaded by the graphics thread is halved in each dimension (1/4 total pixel count).
+- **Program output guarantee**: Whenever the replay source is active on program (`obs_source_active`), including during scene transitions, output is strictly at original full resolution. Paused replays transitioned to program are refreshed to full resolution without leaving a half-resolution frame on program.
+- **Shared / active source reuse**: If a replay source is active on program or reused elsewhere in an active scene, `obs_source_active` evaluates to true, keeping it at full resolution everywhere.
+- **Source projectors**: Dedicated source projectors outside program output half resolution when not active on program.
+- **Frame buffer & saves**: Capture buffers in RAM and exported video files (`Save`, `SaveAll`, auto-save) remain completely untouched at their original captured resolution. The half image is a separate NV12 copy.
+- **Same-size replacement**: A new half frame is uploaded immediately. OBS otherwise keeps the previous async texture when the dimensions do not change, which left a cleared clip on screen.
+- **Format prerequisites**: Downscaling requires 8-bit YUV formats convertible to NV12 (NV12, UYVY, YUY2, I420, I422) with source width $\ge 1280\text{ px}$ and both width and height divisible by 4. Unsupported formats (e.g., RGB/RGBA or formats with non-divisible dimensions) remain at original resolution.
+- **Performance**: No guaranteed performance gains are promised until measured on target hardware. Windows platform support carries no performance claims prior to verified smoke tests.

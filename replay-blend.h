@@ -52,11 +52,13 @@ bool replay_blend_frames(struct obs_source_frame *dst,
 /* Blend worker thread API */
 struct replay_blend_worker *replay_blend_worker_create(obs_source_t *source);
 void replay_blend_worker_destroy(struct replay_blend_worker *worker);
+/* half: emit at half resolution (replay_convert_half_preview) for previews outside program. */
 bool replay_blend_worker_push(struct replay_blend_worker *worker,
 			      struct obs_source_frame *frame_a,
 			      struct obs_source_frame *frame_b,
 			      uint32_t weight_b_256,
-			      uint64_t output_timestamp);
+			      uint64_t output_timestamp,
+			      bool half);
 void replay_blend_worker_flush(struct replay_blend_worker *worker);
 void replay_blend_worker_set_output_hook(struct replay_blend_worker *worker,
 					 replay_blend_output_cb cb, void *param);

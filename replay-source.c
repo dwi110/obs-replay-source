@@ -13,6 +13,7 @@
 #include <inttypes.h>
 #include "replay-control.h"
 #include "replay-blend.h"
+#include "replay-convert.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -68,6 +69,17 @@ struct replay_source {
 	bool backward_start;
 	int slowmo_blend;
 	bool blend_wanted;
+	bool preview_half;
+	/* Last frame emitted at half resolution comes from the blend worker; cleared by any full-resolution output. */
+	bool half_emitted;
+	volatile long presentation_width;
+	volatile long presentation_height;
+	/* Weak references into current_replay (reset before that clip is released). Preserve the paused image, not the
+	 * next scheduled frame, when switching presentation resolution. */
+	struct obs_source_frame *presentation_a;
+	struct obs_source_frame *presentation_b;
+	uint32_t presentation_weight;
+	struct obs_source_frame *presentation_blend;
 	struct replay_blend_worker *blend_worker;
 	int visibility_action;
 	int end_action;
@@ -527,6 +539,9 @@ static void replay_update_position(struct replay_source *context, bool lock)
 	       circlebuf_data(&context->replays, context->replay_position * sizeof context->current_replay),
 	       sizeof context->current_replay);
 	context->video_frame_position = 0;
+	context->presentation_a = NULL;
+	context->presentation_b = NULL;
+	context->presentation_weight = 0;
 	context->audio_frame_position = 0;
 	context->start_timestamp = obs_get_video_frame_time();
 	context->backward = context->backward_start;
@@ -695,6 +710,7 @@ static void replay_source_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, SETTING_END_ACTION, END_ACTION_LOOP);
 	obs_data_set_default_bool(settings, SETTING_BACKWARD, false);
 	obs_data_set_default_int(settings, SETTING_SLOWMO_BLEND, SLOWMO_BLEND_OFF);
+	obs_data_set_default_bool(settings, SETTING_PREVIEW_HALF, false);
 	obs_data_set_default_string(settings, SETTING_FILE_FORMAT, "%CCYY-%MM-%DD %hh.%mm.%ss");
 	obs_data_set_default_bool(settings, SETTING_LOSSLESS, false);
 	obs_data_set_default_int(settings, SETTING_STORAGE_FORMAT, STORAGE_FORMAT_NV12);
@@ -1293,6 +1309,8 @@ static void replay_next_scene_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t 
 	}
 }
 
+static void replay_emit_frame(struct replay_source *c, struct obs_source_frame *frame, uint64_t ts);
+
 static struct obs_source_frame *replay_restart_at_begin(struct replay_source *c, const uint64_t os_timestamp)
 {
 	c->video_frame_position = 0;
@@ -1310,10 +1328,8 @@ static struct obs_source_frame *replay_restart_at_begin(struct replay_source *c,
 	if (c->current_replay.trim_front != 0) {
 		c->start_timestamp -= (uint64_t)(c->current_replay.trim_front * 100.0 / c->speed_percent);
 		if (c->current_replay.trim_front < 0) {
-			struct obs_source_frame out = *frame;
-			out.timestamp = os_timestamp;
-			c->previous_frame_timestamp = out.timestamp;
-			obs_source_output_video(c->source, &out);
+			c->previous_frame_timestamp = os_timestamp;
+			replay_emit_frame(c, frame, os_timestamp);
 			return NULL;
 		}
 		uint64_t desired_ts = c->current_replay.first_frame_timestamp + c->current_replay.trim_front;
@@ -1340,10 +1356,8 @@ static struct obs_source_frame *replay_restart_at_end(struct replay_source *c, c
 		c->start_timestamp -= (uint64_t)(c->current_replay.trim_end * 100.0 / c->speed_percent);
 
 		if (c->current_replay.trim_end < 0) {
-			struct obs_source_frame out = *frame;
-			out.timestamp = os_timestamp;
-			c->previous_frame_timestamp = out.timestamp;
-			obs_source_output_video(c->source, &out);
+			c->previous_frame_timestamp = os_timestamp;
+			replay_emit_frame(c, frame, os_timestamp);
 			return NULL;
 		}
 		uint64_t desired_ts = c->current_replay.last_frame_timestamp - c->current_replay.trim_end;
@@ -2025,6 +2039,108 @@ bool replay_source_execute_action(struct replay_source *context, const char *act
 	return true;
 }
 
+/* Keep the scene's logical geometry unchanged while the async texture is reduced. This internal filter sits below
+ * user filters, so crop/transform/filter coordinates keep referring to the original replay size. */
+#define REPLAY_PREVIEW_SCALE_ID "replay_preview_scale"
+
+static const char *replay_preview_scale_name(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("PreviewHalf");
+}
+
+static void *replay_preview_scale_create(obs_data_t *settings, obs_source_t *source)
+{
+	UNUSED_PARAMETER(settings);
+	return source;
+}
+
+static void replay_preview_scale_destroy(void *data)
+{
+	UNUSED_PARAMETER(data);
+}
+
+static uint32_t replay_preview_dimension(void *data, bool height)
+{
+	obs_source_t *parent = obs_filter_get_parent(data);
+	if (!parent)
+		return 0;
+	const uint32_t native = height ? obs_source_get_base_height(parent) : obs_source_get_base_width(parent);
+	if (!native)
+		return 0;
+	struct replay_source *c = strcmp(obs_source_get_unversioned_id(parent), REPLAY_SOURCE_ID) == 0
+					  ? obs_obj_get_data(parent)
+					  : NULL;
+	const long logical = c ? os_atomic_load_long(height ? &c->presentation_height : &c->presentation_width) : 0;
+	return logical > 0 ? (uint32_t)logical : native;
+}
+
+static uint32_t replay_preview_width(void *data)
+{
+	return replay_preview_dimension(data, false);
+}
+
+static uint32_t replay_preview_height(void *data)
+{
+	return replay_preview_dimension(data, true);
+}
+
+static void replay_preview_scale_render(void *data, gs_effect_t *effect)
+{
+	UNUSED_PARAMETER(effect);
+	obs_source_t *parent = obs_filter_get_parent(data);
+	if (!parent)
+		return;
+	const uint32_t w = obs_source_get_base_width(parent);
+	const uint32_t h = obs_source_get_base_height(parent);
+	gs_matrix_push();
+	if (w && h)
+		gs_matrix_scale3f((float)replay_preview_width(data) / w, (float)replay_preview_height(data) / h, 1.0f);
+	obs_source_skip_video_filter(data);
+	gs_matrix_pop();
+}
+
+struct obs_source_info replay_preview_scale_info = {
+	.id = REPLAY_PREVIEW_SCALE_ID,
+	.type = OBS_SOURCE_TYPE_FILTER,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_CAP_DISABLED,
+	.get_name = replay_preview_scale_name,
+	.create = replay_preview_scale_create,
+	.destroy = replay_preview_scale_destroy,
+	.get_width = replay_preview_width,
+	.get_height = replay_preview_height,
+	.video_render = replay_preview_scale_render,
+};
+
+static void find_preview_scale(obs_source_t *parent, obs_source_t *filter, void *param)
+{
+	UNUSED_PARAMETER(parent);
+	if (strcmp(obs_source_get_unversioned_id(filter), REPLAY_PREVIEW_SCALE_ID) == 0)
+		*(obs_source_t **)param = filter;
+}
+
+static void replay_ensure_preview_scale(struct replay_source *c)
+{
+	obs_source_t *filter = NULL;
+	obs_source_enum_filters(c->source, find_preview_scale, &filter);
+	if (!filter && c->preview_half) {
+		filter = obs_source_create_private(REPLAY_PREVIEW_SCALE_ID, obs_module_text("PreviewHalf"), NULL);
+		if (filter) {
+			obs_source_filter_add(c->source, filter);
+			const bool added = obs_filter_get_parent(filter) == c->source;
+			obs_source_release(filter);
+			if (!added)
+				filter = NULL;
+		}
+		if (!filter) {
+			c->preview_half = false;
+			blog(LOG_ERROR, "[replay_source] Cannot create replay preview sizing filter; preview remains full size");
+		}
+	}
+	if (filter)
+		obs_source_filter_set_order(c->source, filter, OBS_ORDER_MOVE_BOTTOM);
+}
+
 static void replay_source_update(void *data, obs_data_t *settings)
 {
 	struct replay_source *context = data;
@@ -2118,6 +2234,8 @@ static void replay_source_update(void *data, obs_data_t *settings)
 	}
 	int old_blend = context->slowmo_blend;
 	context->slowmo_blend = (int)obs_data_get_int(settings, SETTING_SLOWMO_BLEND);
+	context->preview_half = obs_data_get_bool(settings, SETTING_PREVIEW_HALF);
+	replay_ensure_preview_scale(context);
 	/* The worker lives until source destroy: other threads (hotkeys, vendor requests) may flush it unlocked.
 	 * Switching off only drops pending blended frames so the normal output path continues in order. */
 	if (old_blend != context->slowmo_blend && context->slowmo_blend == SLOWMO_BLEND_OFF)
@@ -2535,11 +2653,112 @@ static void replay_source_destroy(void *data)
 		replay_blend_worker_destroy(context->blend_worker);
 		context->blend_worker = NULL;
 	}
+	if (context->presentation_blend)
+		obs_source_frame_destroy(context->presentation_blend);
 
 	pthread_mutex_destroy(&context->video_mutex);
 	pthread_mutex_destroy(&context->audio_mutex);
 	pthread_mutex_destroy(&context->replay_mutex);
 	bfree(context);
+}
+
+/* Preview outside program: the blend worker emits a half-resolution copy, so OBS's graphics thread copies and
+ * uploads a quarter of the frame. Program (active, incl. transitions) always gets full resolution. */
+static bool replay_half_wanted(struct replay_source *c, const struct obs_source_frame *frame)
+{
+	return c->preview_half && !obs_source_active(c->source) && replay_half_preview_supported(frame);
+}
+
+static bool replay_push_half(struct replay_source *c, struct obs_source_frame *a, struct obs_source_frame *b,
+			     uint32_t w8, uint64_t ts)
+{
+	if (!c->blend_worker)
+		c->blend_worker = replay_blend_worker_create(c->source);
+	if (!c->blend_worker || !replay_blend_worker_push(c->blend_worker, a, b, w8, ts, true))
+		return false;
+	c->half_emitted = true;
+	return true;
+}
+
+/* Outputs one stored frame (video_mutex held), preserving the existing playback cadence. */
+static void replay_emit_frame(struct replay_source *c, struct obs_source_frame *frame, uint64_t ts)
+{
+	os_atomic_set_long(&c->presentation_width, (long)frame->width);
+	os_atomic_set_long(&c->presentation_height, (long)frame->height);
+	c->presentation_a = frame;
+	c->presentation_b = frame;
+	c->presentation_weight = 0;
+	if (replay_half_wanted(c, frame) && replay_push_half(c, frame, frame, 0, ts))
+		return;
+	c->half_emitted = false;
+	struct obs_source_frame out = *frame;
+	out.timestamp = ts;
+	obs_source_output_video(c->source, &out);
+}
+
+/* Crossfaded output (blend worker); halves it outside program. */
+static void replay_blend_push(struct replay_source *c, struct obs_source_frame *a, struct obs_source_frame *b,
+			      uint32_t w8, uint64_t ts)
+{
+	os_atomic_set_long(&c->presentation_width, (long)a->width);
+	os_atomic_set_long(&c->presentation_height, (long)a->height);
+	c->presentation_a = a;
+	c->presentation_b = b;
+	c->presentation_weight = w8;
+	if (replay_half_wanted(c, a) && replay_push_half(c, a, b, w8, ts))
+		return;
+	if (!c->blend_worker)
+		c->blend_worker = replay_blend_worker_create(c->source);
+	c->half_emitted = false;
+	replay_blend_worker_push(c->blend_worker, a, b, w8, ts, false);
+}
+
+/* Refresh even paused views when activation or the setting changes. async_tick precedes video_tick in libobs:
+ * remove its previously selected half frame and upload the full texture immediately on a program cut. */
+static void replay_restore_full_frame(struct replay_source *c, uint64_t ts)
+{
+	if (!c->current_replay.video_frame_count || !c->current_replay.video_frames || c->disabled)
+		return;
+	if (c->end && (c->end_action == END_ACTION_HIDE || c->end_action == END_ACTION_HIDE_ALL))
+		return;
+	uint64_t pos = c->video_frame_position;
+	if (pos >= c->current_replay.video_frame_count)
+		pos = c->current_replay.video_frame_count - 1;
+	struct obs_source_frame *a = c->presentation_a ? c->presentation_a : c->current_replay.video_frames[pos];
+	struct obs_source_frame *b = c->presentation_b ? c->presentation_b : a;
+	const uint32_t w8 = c->presentation_a ? c->presentation_weight : 0;
+	const bool half = replay_half_wanted(c, a);
+	if (half == c->half_emitted && (c->presentation_a || !half))
+		return;
+	if (c->blend_worker)
+		replay_blend_worker_flush(c->blend_worker);
+	if (half) {
+		if (w8)
+			replay_blend_push(c, a, b, w8, ts);
+		else
+			replay_emit_frame(c, a, ts);
+		return;
+	}
+	struct obs_source_frame out = *(w8 == 256 ? b : a);
+	if (w8 > 0 && w8 < 256) {
+		struct obs_source_frame *scratch = c->presentation_blend;
+		if (!scratch || scratch->format != a->format || scratch->width != a->width || scratch->height != a->height) {
+			if (scratch)
+				obs_source_frame_destroy(scratch);
+			c->presentation_blend = scratch = obs_source_frame_create(a->format, a->width, a->height);
+		}
+		if (scratch && replay_blend_frames(scratch, a, b, w8)) {
+			replay_copy_frame_metadata(scratch, a);
+			out = *scratch;
+		}
+	}
+	struct obs_source_frame *selected = obs_source_get_frame(c->source);
+	if (selected)
+		obs_source_release_frame(c->source, selected);
+	out.timestamp = ts;
+	obs_source_set_video_frame(c->source, &out);
+	obs_source_output_video(c->source, &out);
+	c->half_emitted = false;
 }
 
 static void replay_output_frame(struct replay_source *context, struct obs_source_frame *frame)
@@ -2559,7 +2778,7 @@ static void replay_output_frame(struct replay_source *context, struct obs_source
 	out.timestamp += context->start_timestamp;
 	if (context->previous_frame_timestamp <= out.timestamp) {
 		context->previous_frame_timestamp = out.timestamp;
-		obs_source_output_video(context->source, &out);
+		replay_emit_frame(context, frame, out.timestamp);
 	}
 	replay_update_progress_crop(context, t);
 }
@@ -2696,6 +2915,7 @@ static void replay_source_tick(void *data, float seconds)
 	}
 
 	pthread_mutex_lock(&context->video_mutex);
+	replay_restore_full_frame(context, os_timestamp);
 	if (!context->current_replay.video_frame_count && !context->current_replay.audio_frame_count) {
 		if (context->play) {
 			context->play = false;
@@ -2716,9 +2936,7 @@ static void replay_source_tick(void *data, float seconds)
 		if (context->stepped && context->current_replay.video_frame_count) {
 			context->stepped = false;
 			struct obs_source_frame *frame = context->current_replay.video_frames[context->video_frame_position];
-			struct obs_source_frame out = *frame;
-			out.timestamp = os_timestamp;
-			obs_source_output_video(context->source, &out);
+			replay_emit_frame(context, frame, os_timestamp);
 			replay_update_text(context);
 		}
 		pthread_mutex_unlock(&context->video_mutex);
@@ -2793,9 +3011,7 @@ static void replay_source_tick(void *data, float seconds)
 
 				if (os_timestamp >= context->previous_frame_timestamp) {
 					context->previous_frame_timestamp = os_timestamp;
-					if (!context->blend_worker)
-						context->blend_worker = replay_blend_worker_create(context->source);
-					replay_blend_worker_push(context->blend_worker, frame_a, frame_b, w8, os_timestamp);
+					replay_blend_push(context, frame_a, frame_b, w8, os_timestamp);
 					replay_update_progress_crop(context, frame_a->timestamp);
 				}
 
@@ -2949,9 +3165,7 @@ static void replay_source_tick(void *data, float seconds)
 
 				if (os_timestamp >= context->previous_frame_timestamp) {
 					context->previous_frame_timestamp = os_timestamp;
-					if (!context->blend_worker)
-						context->blend_worker = replay_blend_worker_create(context->source);
-					replay_blend_worker_push(context->blend_worker, frame_a, frame_b, w8, os_timestamp);
+					replay_blend_push(context, frame_a, frame_b, w8, os_timestamp);
 					replay_update_progress_crop(context, frame_a->timestamp);
 				}
 
@@ -3231,6 +3445,8 @@ static obs_properties_t *replay_source_properties(void *data)
 	obs_property_list_add_int(p_blend, obs_module_text("SlowmoBlend.Off"), SLOWMO_BLEND_OFF);
 	obs_property_list_add_int(p_blend, obs_module_text("SlowmoBlend.Program"), SLOWMO_BLEND_PROGRAM);
 	obs_property_list_add_int(p_blend, obs_module_text("SlowmoBlend.Always"), SLOWMO_BLEND_ALWAYS);
+	obs_property_t *p_half = obs_properties_add_bool(props, SETTING_PREVIEW_HALF, obs_module_text("PreviewHalf"));
+	obs_property_set_long_description(p_half, obs_module_text("PreviewHalf.Description"));
 
 	obs_properties_add_path(props, SETTING_DIRECTORY, obs_module_text("Directory"), OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_text(props, SETTING_FILE_FORMAT, obs_module_text("FilenameFormatting"), OBS_TEXT_DEFAULT);

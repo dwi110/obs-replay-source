@@ -10,10 +10,12 @@ extern struct obs_source_info replay_filter_info;
 extern struct obs_source_info replay_filter_audio_info;
 extern struct obs_source_info replay_filter_async_info;
 extern struct obs_source_info replay_source_info;
+extern struct obs_source_info replay_preview_scale_info;
 
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "[Replay Source] loaded version %s", PROJECT_VERSION);
+	obs_register_source(&replay_preview_scale_info);
 	obs_register_source(&replay_source_info);
 	obs_register_source(&replay_filter_info);
 	obs_register_source(&replay_filter_audio_info);

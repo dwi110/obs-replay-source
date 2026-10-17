@@ -1073,3 +1073,33 @@ bool replay_convert_frame(struct obs_source_frame *dst, const struct obs_source_
 {
 	return convert_frame_impl(dst, src, true);
 }
+
+bool replay_half_preview_supported(const struct obs_source_frame *src)
+{
+	return src && src->width >= REPLAY_HALF_PREVIEW_MIN_WIDTH && src->height >= 4 &&
+	       (src->width & 3U) == 0 && (src->height & 3U) == 0 && is_nv12_convertible(src->format);
+}
+
+bool replay_convert_half_preview(struct obs_source_frame **scratch, const struct obs_source_frame *src)
+{
+	if (!scratch || !replay_half_preview_supported(src))
+		return false;
+	const uint32_t w = src->width / 2;
+	const uint32_t h = src->height / 2;
+	struct obs_source_frame *dst = *scratch;
+	if (!dst || dst->format != VIDEO_FORMAT_NV12 || dst->width != w || dst->height != h) {
+		if (dst)
+			obs_source_frame_destroy(dst);
+		dst = obs_source_frame_create(VIDEO_FORMAT_NV12, w, h);
+		*scratch = dst;
+	}
+	return dst && convert_frame_impl(dst, src, true);
+}
+
+void replay_half_preview_free(struct obs_source_frame **scratch)
+{
+	if (scratch && *scratch) {
+		obs_source_frame_destroy(*scratch);
+		*scratch = NULL;
+	}
+}

@@ -843,6 +843,173 @@ static int test_metadata_and_unsupported_formats(void)
 	return 0;
 }
 
+static int test_half_preview_conversions(void)
+{
+	/* 1. Predicate checks: replay_half_preview_supported */
+	CHECK(!replay_half_preview_supported(NULL), "NULL frame must not be supported for half preview");
+
+	struct obs_source_frame dummy;
+	memset(&dummy, 0, sizeof(dummy));
+
+	/* Formats that can convert to NV12: UYVY, YUY2, I420, I422, NV12 */
+	const enum video_format supported_fmts[] = {
+		VIDEO_FORMAT_UYVY,
+		VIDEO_FORMAT_YUY2,
+		VIDEO_FORMAT_I420,
+		VIDEO_FORMAT_I422,
+		VIDEO_FORMAT_NV12,
+	};
+	for (size_t i = 0; i < sizeof(supported_fmts) / sizeof(supported_fmts[0]); i++) {
+		dummy.format = supported_fmts[i];
+		dummy.width = 1280;
+		dummy.height = 720;
+		CHECK(replay_half_preview_supported(&dummy),
+		      "Format %d (1280x720) must be supported for half preview", (int)dummy.format);
+
+		dummy.width = 1920;
+		dummy.height = 1080;
+		CHECK(replay_half_preview_supported(&dummy),
+		      "Format %d (1920x1080) must be supported for half preview", (int)dummy.format);
+	}
+
+	/* Formats not convertible to NV12 */
+	const enum video_format unsupported_fmts[] = {
+		VIDEO_FORMAT_BGRA,
+		VIDEO_FORMAT_RGBA,
+		VIDEO_FORMAT_BGRX,
+		VIDEO_FORMAT_I444,
+		VIDEO_FORMAT_I010,
+	};
+	for (size_t i = 0; i < sizeof(unsupported_fmts) / sizeof(unsupported_fmts[0]); i++) {
+		dummy.format = unsupported_fmts[i];
+		dummy.width = 1920;
+		dummy.height = 1080;
+		CHECK(!replay_half_preview_supported(&dummy),
+		      "Format %d must not be supported for half preview", (int)dummy.format);
+	}
+
+	/* Dimension checks with NV12:
+	 * - Width below REPLAY_HALF_PREVIEW_MIN_WIDTH (1280)
+	 * - Dims not divisible by 4
+	 */
+	dummy.format = VIDEO_FORMAT_NV12;
+
+	dummy.width = 1276;
+	dummy.height = 720;
+	CHECK(!replay_half_preview_supported(&dummy), "Width 1276 (< 1280) must not be supported");
+
+	dummy.width = 640;
+	dummy.height = 360;
+	CHECK(!replay_half_preview_supported(&dummy), "Width 640 (< 1280) must not be supported");
+
+	dummy.width = 1280;
+	dummy.height = 722; /* 722 % 4 != 0 */
+	CHECK(!replay_half_preview_supported(&dummy), "Height 722 (not divisible by 4) must not be supported");
+
+	dummy.width = 1282; /* 1282 % 4 != 0 */
+	dummy.height = 720;
+	CHECK(!replay_half_preview_supported(&dummy), "Width 1282 (not divisible by 4) must not be supported");
+
+	dummy.width = 1921; /* odd width */
+	dummy.height = 1080;
+	CHECK(!replay_half_preview_supported(&dummy), "Odd width 1921 must not be supported");
+
+	dummy.width = 1920;
+	dummy.height = 1081; /* odd height */
+	CHECK(!replay_half_preview_supported(&dummy), "Odd height 1081 must not be supported");
+
+	dummy.width = 1284;
+	dummy.height = 724;
+	CHECK(replay_half_preview_supported(&dummy), "1284x724 (divisible by 4, >= 1280) must be supported");
+
+	/* 2. Conversion checks: replay_convert_half_preview */
+	struct obs_source_frame *scratch = NULL;
+
+	/* NULL scratch pointer or unsupported source format */
+	CHECK(!replay_convert_half_preview(NULL, &dummy), "NULL scratch pointer must fail");
+
+	struct replay_pool *bgra_pool = replay_pool_create(VIDEO_FORMAT_BGRA, 1920, 1080, 1);
+	CHECK(bgra_pool, "bgra_pool create failed");
+	struct obs_source_frame *bgra_src = replay_pool_acquire(bgra_pool);
+	fill_deterministic(bgra_src, 0x11223344U);
+	CHECK(!replay_convert_half_preview(&scratch, bgra_src), "Unsupported BGRA frame must fail");
+	CHECK(scratch == NULL, "scratch must remain NULL after failed conversion");
+	replay_frame_release(bgra_src);
+	replay_pool_close(bgra_pool);
+
+	/* Conversion across all 5 supported formats at 1280x720 and 1920x1080, bit-exact vs ref_convert_2x_to_nv12 */
+	const struct {
+		uint32_t sw, sh;
+	} resolutions[] = {
+		{1280, 720},
+		{1920, 1080},
+	};
+
+	struct obs_source_frame *initial_scratch_ptr = NULL;
+
+	for (size_t ri = 0; ri < sizeof(resolutions) / sizeof(resolutions[0]); ri++) {
+		const uint32_t sw = resolutions[ri].sw;
+		const uint32_t sh = resolutions[ri].sh;
+		const uint32_t dw = sw / 2;
+		const uint32_t dh = sh / 2;
+
+		struct obs_source_frame *ref_frame = obs_source_frame_create(VIDEO_FORMAT_NV12, dw, dh);
+		CHECK(ref_frame, "ref_frame allocation failed");
+
+		for (size_t fi = 0; fi < sizeof(supported_fmts) / sizeof(supported_fmts[0]); fi++) {
+			const enum video_format fmt = supported_fmts[fi];
+			struct replay_pool *src_pool = replay_pool_create(fmt, sw, sh, 1);
+			CHECK(src_pool, "src_pool create failed");
+
+			struct obs_source_frame *src = replay_pool_acquire(src_pool);
+			fill_deterministic(src, (uint32_t)(0xAA0000U + ri * 0x1000 + fi * 0x100));
+
+			ref_convert_2x_to_nv12(ref_frame, src);
+
+			CHECK(replay_convert_half_preview(&scratch, src),
+			      "replay_convert_half_preview failed for fmt=%d %ux%u", (int)fmt, sw, sh);
+			CHECK(scratch != NULL, "scratch must be non-NULL after successful conversion");
+			CHECK(scratch->format == VIDEO_FORMAT_NV12, "scratch format must be NV12");
+			CHECK(scratch->width == dw, "scratch width expected %u, got %u", dw, scratch->width);
+			CHECK(scratch->height == dh, "scratch height expected %u, got %u", dh, scratch->height);
+
+			char label[128];
+			snprintf(label, sizeof(label), "half_preview fmt=%d %ux%u->%ux%u", (int)fmt, sw, sh, dw, dh);
+			if (compare_nv12_frames(scratch, ref_frame, label) != 0) {
+				obs_source_frame_destroy(ref_frame);
+				replay_frame_release(src);
+				replay_pool_close(src_pool);
+				replay_half_preview_free(&scratch);
+				return 1;
+			}
+
+			if (ri == 0 && fi == 0) {
+				initial_scratch_ptr = scratch;
+			} else if (ri == 0) {
+				/* Within the same resolution (1280x720), scratch frame buffer must be reused */
+				CHECK(scratch == initial_scratch_ptr,
+				      "scratch frame buffer should be reused across conversions of identical dimensions");
+			}
+
+			replay_frame_release(src);
+			replay_pool_close(src_pool);
+		}
+
+		obs_source_frame_destroy(ref_frame);
+	}
+
+	/* 3. Cleanup: replay_half_preview_free */
+	replay_half_preview_free(NULL);
+	struct obs_source_frame *null_scratch = NULL;
+	replay_half_preview_free(&null_scratch);
+
+	CHECK(scratch != NULL, "scratch should still be valid before free");
+	replay_half_preview_free(&scratch);
+	CHECK(scratch == NULL, "scratch must be NULL after replay_half_preview_free");
+
+	return 0;
+}
+
 static int run_bench(const char *label, enum video_format src_fmt, uint32_t sw, uint32_t sh, enum video_format dst_fmt,
 		     uint32_t dw, uint32_t dh, int iterations)
 {
@@ -911,6 +1078,8 @@ int main(void)
 	if (test_target_format_decision_table() != 0)
 		return 1;
 	if (test_metadata_and_unsupported_formats() != 0)
+		return 1;
+	if (test_half_preview_conversions() != 0)
 		return 1;
 	if (bench_conversions() != 0)
 		return 1;
