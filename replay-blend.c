@@ -305,6 +305,7 @@ struct replay_blend_item {
 	struct obs_source_frame *frame_b;
 	uint32_t weight_b_256;
 	uint64_t output_timestamp;
+	bool half;
 };
 
 struct replay_blend_worker {
@@ -325,10 +326,33 @@ struct replay_blend_worker {
 
 	uint64_t last_output_timestamp;
 	struct obs_source_frame *scratch_frame;
+	struct obs_source_frame *half_frame;
 
 	replay_blend_output_cb output_hook;
 	void *output_hook_param;
 };
+
+/* Hands one frame to OBS; half-resolution items are converted first (preview outside program). */
+static void replay_blend_emit(struct replay_blend_worker *worker, const struct obs_source_frame *src, uint64_t ts,
+			      bool half)
+{
+	struct obs_source_frame out = *src;
+	const struct obs_source_frame *emit = &out;
+	out.timestamp = ts;
+	if (half && (!worker->source || !obs_source_active(worker->source)) &&
+	    replay_convert_half_preview(&worker->half_frame, src)) {
+		worker->half_frame->timestamp = ts;
+		emit = worker->half_frame;
+		/* Same-size async output does not replace a paused texture: OBS keeps the previous
+		 * upload until a later tick selects this frame. Set it now so a clip change is visible. */
+		if (worker->source)
+			obs_source_set_video_frame(worker->source, emit);
+	}
+	if (worker->output_hook)
+		worker->output_hook(worker->output_hook_param, worker->source, emit);
+	if (worker->source)
+		obs_source_output_video(worker->source, emit);
+}
 
 static void replay_blend_process_item(struct replay_blend_worker *worker,
 				      const struct replay_blend_item *item)
@@ -348,22 +372,12 @@ static void replay_blend_process_item(struct replay_blend_worker *worker,
 			  fa->format == VIDEO_FORMAT_I420);
 
 	if (w8 == 0 || !can_blend) {
-		struct obs_source_frame out = *fa;
-		out.timestamp = ts;
-		if (worker->output_hook)
-			worker->output_hook(worker->output_hook_param, worker->source, &out);
-		if (worker->source)
-			obs_source_output_video(worker->source, &out);
+		replay_blend_emit(worker, fa, ts, item->half);
 		return;
 	}
 
 	if (w8 == 256) {
-		struct obs_source_frame out = *fb;
-		out.timestamp = ts;
-		if (worker->output_hook)
-			worker->output_hook(worker->output_hook_param, worker->source, &out);
-		if (worker->source)
-			obs_source_output_video(worker->source, &out);
+		replay_blend_emit(worker, fb, ts, item->half);
 		return;
 	}
 
@@ -377,12 +391,7 @@ static void replay_blend_process_item(struct replay_blend_worker *worker,
 	}
 
 	if (!worker->scratch_frame) {
-		struct obs_source_frame out = *fa;
-		out.timestamp = ts;
-		if (worker->output_hook)
-			worker->output_hook(worker->output_hook_param, worker->source, &out);
-		if (worker->source)
-			obs_source_output_video(worker->source, &out);
+		replay_blend_emit(worker, fa, ts, item->half);
 		return;
 	}
 
@@ -390,11 +399,7 @@ static void replay_blend_process_item(struct replay_blend_worker *worker,
 	worker->scratch_frame->timestamp = ts;
 
 	replay_blend_frames(worker->scratch_frame, fa, fb, w8);
-
-	if (worker->output_hook)
-		worker->output_hook(worker->output_hook_param, worker->source, worker->scratch_frame);
-	if (worker->source)
-		obs_source_output_video(worker->source, worker->scratch_frame);
+	replay_blend_emit(worker, worker->scratch_frame, ts, item->half);
 }
 
 static void *replay_blend_worker_thread(void *arg)
@@ -480,6 +485,7 @@ void replay_blend_worker_destroy(struct replay_blend_worker *worker)
 		obs_source_frame_destroy(worker->scratch_frame);
 		worker->scratch_frame = NULL;
 	}
+	replay_half_preview_free(&worker->half_frame);
 
 	pthread_mutex_destroy(&worker->mutex);
 	pthread_cond_destroy(&worker->cond_work);
@@ -491,7 +497,8 @@ bool replay_blend_worker_push(struct replay_blend_worker *worker,
 			      struct obs_source_frame *frame_a,
 			      struct obs_source_frame *frame_b,
 			      uint32_t weight_b_256,
-			      uint64_t output_timestamp)
+			      uint64_t output_timestamp,
+			      bool half)
 {
 	if (!worker || !frame_a)
 		return false;
@@ -557,6 +564,7 @@ bool replay_blend_worker_push(struct replay_blend_worker *worker,
 
 	worker->queue[slot].weight_b_256 = weight_b_256;
 	worker->queue[slot].output_timestamp = output_timestamp;
+	worker->queue[slot].half = half;
 
 	worker->q_tail = (worker->q_tail + 1) % REPLAY_BLEND_QUEUE_CAP;
 	worker->q_count++;

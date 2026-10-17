@@ -352,7 +352,7 @@ static void feed_async_filter_cb(obs_source_t *parent, obs_source_t *filter, voi
 }
 
 static void feed_synthetic_frames(obs_source_t *cam, uint32_t width, uint32_t height,
-				 uint64_t count, uint64_t start_ts, uint64_t interval_ns)
+				 uint64_t count, uint64_t start_ts, uint64_t interval_ns, uint8_t first_luma)
 {
 	struct obs_source_frame frame;
 	memset(&frame, 0, sizeof(frame));
@@ -360,11 +360,13 @@ static void feed_synthetic_frames(obs_source_t *cam, uint32_t width, uint32_t he
 	frame.width = width;
 	frame.height = height;
 	frame.format = VIDEO_FORMAT_NV12;
+	video_format_get_parameters(VIDEO_CS_709, VIDEO_RANGE_PARTIAL, frame.color_matrix,
+				    frame.color_range_min, frame.color_range_max);
 
 	for (uint64_t i = 0; i < count; i++) {
 		frame.timestamp = start_ts + i * interval_ns;
 		/* Encode frame index into luma: Frame 0 = 40, Frame 1 = 80, Frame 2 = 120, Frame 3 = 160 */
-		memset(frame.data[0], (int)(40 + i * 40), (size_t)frame.linesize[0] * height);
+		memset(frame.data[0], (int)(first_luma + i * 40), (size_t)frame.linesize[0] * height);
 		memset(frame.data[1], 128, (size_t)frame.linesize[1] * (height / 2));
 		obs_source_enum_filters(cam, feed_async_filter_cb, &frame);
 	}
@@ -394,6 +396,145 @@ static void test_output_hook_cb(void *param, obs_source_t *source, const struct 
 	pthread_mutex_unlock(&hd->lock);
 }
 
+#define VISIBILITY_ACTION_NONE 3
+
+/* Render the actual source, not just the worker callback: the half-size texture must still cover the original
+ * scene rectangle, and a paused resolution switch must preserve its pixels. */
+static bool preview_image(obs_source_t *source, uint32_t native_width, uint8_t pixel[4])
+{
+	bool ok = false;
+	obs_enter_graphics();
+	gs_texrender_t *tr = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	gs_stagesurf_t *stage = gs_stagesurface_create(1280, 720, GS_BGRA);
+	if (tr && stage && gs_texrender_begin(tr, 1280, 720)) {
+		struct vec4 bg;
+		vec4_zero(&bg);
+		gs_clear(GS_CLEAR_COLOR, &bg, 0.0f, 0);
+		gs_matrix_push();
+		gs_matrix_identity();
+		gs_ortho(0, 1280, 0, 720, -100, 100);
+		obs_source_video_render(source);
+		gs_matrix_pop();
+		gs_texrender_end(tr);
+		gs_stage_texture(stage, gs_texrender_get_texture(tr));
+		uint8_t *data = NULL;
+		uint32_t pitch = 0;
+		if (gs_stagesurface_map(stage, &data, &pitch)) {
+			memcpy(pixel, data + 360 * pitch + 640 * 4, 4);
+			ok = data[8 * pitch + 8 * 4 + 3] == 255 &&
+			     data[712 * pitch + 1272 * 4 + 3] == 255 &&
+			     pixel[0] > 8 && obs_source_get_base_width(source) == native_width &&
+			     obs_source_get_base_height(source) == native_width * 720 / 1280 &&
+			     obs_source_get_width(source) == 1280 && obs_source_get_height(source) == 720;
+			gs_stagesurface_unmap(stage);
+		}
+	}
+	gs_stagesurface_destroy(stage);
+	gs_texrender_destroy(tr);
+	obs_leave_graphics();
+	return ok;
+}
+
+static bool await_preview_image(obs_source_t *source, uint32_t native_width, uint8_t pixel[4])
+{
+	const uint64_t end = os_gettime_ns() + 2000000000ULL;
+	do {
+		if (preview_image(source, native_width, pixel))
+			return true;
+		os_sleep_ms(5);
+	} while (os_gettime_ns() < end);
+	return false;
+}
+
+static bool same_preview_pixel(const uint8_t a[4], const uint8_t b[4])
+{
+	for (size_t i = 0; i < 4; i++) {
+		if (abs((int)a[i] - (int)b[i]) > 2)
+			return false;
+	}
+	return true;
+}
+
+static int test_preview_half_integration(void)
+{
+	obs_source_t *cam = obs_source_create("dummy_blend_cam", "Synthetic Half Cam", NULL, NULL);
+	obs_source_t *rs = obs_source_create("replay_source", "Synthetic Half Replay", NULL, NULL);
+	CHECK(cam && rs, "preview source creation failed");
+	obs_data_t *settings = obs_source_get_settings(rs);
+	obs_data_set_string(settings, SETTING_SOURCE, "Synthetic Half Cam");
+	obs_data_set_int(settings, SETTING_DURATION, 250);
+	obs_data_set_int(settings, SETTING_VISIBILITY_ACTION, 3); /* keep paused across activation */
+	obs_data_set_bool(settings, SETTING_PREVIEW_HALF, true);
+	obs_source_update(rs, settings);
+	obs_source_load(rs);
+	obs_data_release(settings);
+
+	const uint64_t step = 1000000000ULL / 60;
+	const uint64_t base = os_gettime_ns();
+	feed_synthetic_frames(cam, 1280, 720, 10, base, step, 40);
+	struct replay_source *ctx = obs_obj_get_data(rs);
+	uint64_t first, last;
+	CHECK(replay_source_load_unaligned(ctx, &first, &last, NULL), "half preview load failed");
+	uint8_t original[4], pixel[4];
+	CHECK(await_preview_image(rs, 640, original), "half preview lost logical size or corner coverage");
+
+	obs_source_inc_active(rs);
+	CHECK(await_preview_image(rs, 1280, pixel), "paused program did not restore full texture");
+	CHECK(same_preview_pixel(original, pixel), "paused program cut changed the displayed frame");
+	obs_source_dec_active(rs);
+	CHECK(await_preview_image(rs, 640, pixel), "paused preview did not halve after leaving program");
+	CHECK(same_preview_pixel(original, pixel), "deactivation changed the paused image");
+
+	for (int enabled = 0; enabled < 2; enabled++) {
+		settings = obs_source_get_settings(rs);
+		obs_data_set_bool(settings, SETTING_PREVIEW_HALF, enabled != 0);
+		obs_source_update(rs, settings);
+		obs_data_release(settings);
+		CHECK(await_preview_image(rs, enabled ? 640 : 1280, pixel), "paused option toggle did not refresh");
+		CHECK(same_preview_pixel(original, pixel), "paused option toggle changed the frame");
+	}
+
+	CHECK(replay_source_execute_action(ctx, "Clear", false), "Clear failed");
+	CHECK(obs_source_get_width(rs) == 0, "Clear left a visible preview frame");
+	/* Reload from a fresh capture source with different pixels: Clear must not retain the previous texture. */
+	obs_source_t *replacement = obs_source_create("dummy_blend_cam", "Replacement Half Cam", NULL, NULL);
+	CHECK(replacement, "replacement camera creation failed");
+	settings = obs_source_get_settings(rs);
+	obs_data_set_string(settings, SETTING_SOURCE, "Replacement Half Cam");
+	obs_source_update(rs, settings);
+	obs_source_load(rs);
+	obs_data_release(settings);
+	feed_synthetic_frames(replacement, 1280, 720, 2, os_gettime_ns(), step, 140);
+	CHECK(replay_source_load_unaligned(ctx, &first, &last, NULL), "reload after Clear failed");
+	CHECK(await_preview_image(rs, 640, pixel), "reloaded clip did not produce a half preview");
+	CHECK(!same_preview_pixel(original, pixel), "reload displayed the cleared clip");
+
+	/* Blend-always still uses a half texture outside program and a full one on program. */
+	settings = obs_source_get_settings(rs);
+	obs_data_set_int(settings, SETTING_DURATION, 250);
+	obs_source_update(rs, settings);
+	obs_source_load(rs);
+	obs_data_release(settings);
+	feed_synthetic_frames(replacement, 1280, 720, 10, os_gettime_ns(), step, 140);
+	CHECK(replay_source_load_unaligned(ctx, &first, &last, NULL), "blend preview load failed");
+	replay_source_set_slowmo_blend(ctx, SLOWMO_BLEND_ALWAYS);
+	replay_source_set_speed(ctx, 25.0f);
+	replay_source_restart_playback(ctx);
+	CHECK(await_preview_image(rs, 640, pixel), "blend-always preview not reduced");
+	replay_source_toggle_pause(ctx);
+	/* Let the last requested worker frame arrive before comparing the paused presentation. */
+	os_sleep_ms(50);
+	CHECK(await_preview_image(rs, 640, original), "paused blended preview missing");
+	obs_source_inc_active(rs);
+	CHECK(await_preview_image(rs, 1280, pixel), "paused blended program not full resolution");
+	CHECK(same_preview_pixel(original, pixel), "program cut changed the paused blend");
+	obs_source_dec_active(rs);
+	obs_source_release(rs);
+	obs_source_release(cam);
+	obs_source_release(replacement);
+	printf("[test-blend] Half-preview texture/geometry/pause/clear regression: PASSED\n");
+	return 0;
+}
 static int test_headless_integration(void)
 {
 	printf("[test-blend] Running headless integration test with synthetic frames...\n");
@@ -461,7 +602,7 @@ static int test_headless_integration(void)
 	if (!base_ts)
 		base_ts = os_gettime_ns();
 
-	feed_synthetic_frames(cam, 320, 180, 10, base_ts, interval_ns);
+	feed_synthetic_frames(cam, 320, 180, 10, base_ts, interval_ns, 40);
 
 	/* Retrieve the loaded replay into rs */
 	struct replay_source *ctx = obs_obj_get_data(rs);
@@ -555,6 +696,13 @@ static int test_headless_integration(void)
 	obs_source_release(cam);
 	obs_source_release(rs);
 	pthread_mutex_destroy(&hd.lock);
+
+	printf("[test-blend] Running preview-half regression integration test...\n");
+	if (test_preview_half_integration() != 0) {
+		obs_module_unload();
+		obs_shutdown();
+		return 1;
+	}
 
 	obs_module_unload();
 	obs_shutdown();

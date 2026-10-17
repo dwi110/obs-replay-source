@@ -135,6 +135,9 @@ void replay_filter_check(void *data);
 #define SLOWMO_BLEND_PROGRAM 1
 /* Crossfade wherever the replay plays, also Multiview/preview: one CPU blend per source and output frame. */
 #define SLOWMO_BLEND_ALWAYS 2
+/* Outside program (Multiview, studio preview, projectors) emit sources >= 1280 px wide at half resolution: OBS copies
+ * and uploads every async frame in its graphics thread, which a full-size replay per Multiview tile pays for. */
+#define SETTING_PREVIEW_HALF "preview_half"
 #define SETTING_VISIBILITY_ACTION "visibility_action"
 #define SETTING_START_DELAY "start_delay"
 #define SETTING_FRAME_STEP_COUNT "frame_step_count"
