@@ -13,6 +13,22 @@
 #include <media-io/video-scaler.h>
 #include <media-io/audio-io.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
+enum save_queue_state {
+	SAVE_STATE_IDLE,
+	SAVE_STATE_WAITING_LIVE,
+	SAVE_STATE_WAITING_SLOT,
+	SAVE_STATE_ENCODING,
+};
+
 struct replay_save_job {
 	struct replay_save_job *next;
 
@@ -55,6 +71,7 @@ struct replay_save_queue_state {
 
 	volatile long active_encoders;
 	volatile long max_concurrent_encoders;
+	volatile long state;
 
 	obs_hotkey_id save_all_hotkey;
 };
@@ -66,6 +83,127 @@ static struct replay_save_queue_state g_queue = {
 static inline bool is_shutting_down(void)
 {
 	return os_atomic_load_bool(&g_queue.shutting_down);
+}
+
+/* ---- PC-wide encoder slot ---- */
+
+struct save_slot {
+#ifdef _WIN32
+	HANDLE mutex;
+#else
+	int fd;
+#endif
+	bool held;
+};
+
+/* Blocks until the slot is held. Returns false on shutdown. If the OS object cannot be opened the save runs
+ * unthrottled (logged) rather than never. */
+static bool save_slot_acquire(struct save_slot *slot)
+{
+	slot->held = false;
+#ifdef _WIN32
+	slot->mutex = CreateMutexW(NULL, FALSE, REPLAY_SAVE_SLOT_WIN_NAME);
+	if (!slot->mutex) {
+		blog(LOG_WARNING, "[replay_save_queue] Cannot open PC-wide encoder slot (error %lu); not throttling",
+		     (unsigned long)GetLastError());
+		return true;
+	}
+	while (!is_shutting_down()) {
+		const DWORD r = WaitForSingleObject(slot->mutex, 100);
+		if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) {
+			slot->held = true;
+			return true;
+		}
+		if (r != WAIT_TIMEOUT) {
+			blog(LOG_WARNING, "[replay_save_queue] Encoder slot wait failed (%lu); not throttling",
+			     (unsigned long)GetLastError());
+			return true;
+		}
+	}
+	CloseHandle(slot->mutex);
+	slot->mutex = NULL;
+	return false;
+#else
+	slot->fd = open(REPLAY_SAVE_SLOT_POSIX_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+	if (slot->fd < 0) {
+		blog(LOG_WARNING, "[replay_save_queue] Cannot open PC-wide encoder slot '%s'; not throttling",
+		     REPLAY_SAVE_SLOT_POSIX_PATH);
+		return true;
+	}
+	while (!is_shutting_down()) {
+		if (flock(slot->fd, LOCK_EX | LOCK_NB) == 0) {
+			slot->held = true;
+			return true;
+		}
+		os_sleep_ms(100);
+	}
+	close(slot->fd);
+	slot->fd = -1;
+	return false;
+#endif
+}
+
+static void save_slot_release(struct save_slot *slot)
+{
+#ifdef _WIN32
+	if (slot->mutex) {
+		if (slot->held)
+			ReleaseMutex(slot->mutex);
+		CloseHandle(slot->mutex);
+		slot->mutex = NULL;
+	}
+#else
+	if (slot->fd >= 0) {
+		if (slot->held)
+			flock(slot->fd, LOCK_UN);
+		close(slot->fd);
+		slot->fd = -1;
+	}
+#endif
+	slot->held = false;
+}
+
+/* ---- Live protection ---- */
+
+#define LIVE_CALM_PROBE_NS 500000000ULL
+#define LIVE_CALM_AFTER_LAG_NS 2000000000ULL
+#define LIVE_CALM_MAX_WAIT_NS 30000000000ULL
+
+static uint64_t live_lag_counter(void)
+{
+	uint64_t n = obs_get_lagged_frames();
+	video_t *video = obs_get_video();
+	if (video)
+		n += video_output_get_skipped_frames(video);
+	return n;
+}
+
+/* Delays a save start while this OBS is dropping program frames: no new lagged render or skipped output frame for
+ * 0.5 s, or for 2 s after one was seen; gives up after 30 s so a permanently overloaded PC still saves. */
+static uint64_t wait_for_calm_live(void)
+{
+	const uint64_t start_ns = os_gettime_ns();
+	uint64_t last = live_lag_counter();
+	uint64_t calm_since_ns = start_ns;
+	uint64_t needed_ns = LIVE_CALM_PROBE_NS;
+	while (!is_shutting_down()) {
+		os_sleep_ms(100);
+		const uint64_t now_ns = os_gettime_ns();
+		const uint64_t cur = live_lag_counter();
+		if (cur != last) {
+			last = cur;
+			calm_since_ns = now_ns;
+			needed_ns = LIVE_CALM_AFTER_LAG_NS;
+		}
+		if (now_ns - calm_since_ns >= needed_ns)
+			break;
+		if (now_ns - start_ns >= LIVE_CALM_MAX_WAIT_NS) {
+			blog(LOG_WARNING, "[replay_save_queue] Live output still lagging after %.0f s; saving anyway",
+			     (double)LIVE_CALM_MAX_WAIT_NS / 1e9);
+			break;
+		}
+	}
+	return os_gettime_ns() - start_ns;
 }
 
 static size_t estimate_frame_bytes(const struct obs_source_frame *frame)
@@ -927,17 +1065,31 @@ static void *save_queue_worker(void *param)
 		const size_t pinned_before = g_queue.pinned_bytes;
 		pthread_mutex_unlock(&g_queue.mutex);
 
+		const uint64_t queued_ns = os_gettime_ns();
+		os_atomic_set_long(&g_queue.state, SAVE_STATE_WAITING_LIVE);
+		const uint64_t live_wait_ns = wait_for_calm_live();
+		os_atomic_set_long(&g_queue.state, SAVE_STATE_WAITING_SLOT);
+		const uint64_t slot_wait_start_ns = os_gettime_ns();
+		struct save_slot slot;
+		const bool have_slot = save_slot_acquire(&slot);
+		const uint64_t slot_wait_ns = os_gettime_ns() - slot_wait_start_ns;
+		os_atomic_set_long(&g_queue.state, SAVE_STATE_ENCODING);
+
 		const uint64_t start_ns = os_gettime_ns();
 		blog(LOG_INFO,
 		     "[replay_save_queue] Job start: source='%s' path='%s' frames=%" PRIu64
-		     " duration=%.2fs queue_pending=%zu pinned=%zu bytes (%.2f MB)",
+		     " duration=%.2fs queue_pending=%zu pinned=%zu bytes (%.2f MB) waited_live=%.2fs waited_slot=%.2fs",
 		     job->source_name, job->output_path, job->video_frame_count, (double)job->duration_ns / 1e9,
-		     remaining_before, pinned_before, (double)pinned_before / (1024.0 * 1024.0));
+		     remaining_before, pinned_before, (double)pinned_before / (1024.0 * 1024.0),
+		     (double)live_wait_ns / 1e9, (double)slot_wait_ns / 1e9);
 
 		replay_control_emit_save_started(job->source_name, job->output_path, job->trigger);
-		bool aborted = false;
-		const bool ok = run_save_job(job, &aborted);
+		bool aborted = !have_slot;
+		const bool ok = have_slot && run_save_job(job, &aborted);
+		save_slot_release(&slot);
+		os_atomic_set_long(&g_queue.state, SAVE_STATE_IDLE);
 		const double elapsed_s = (double)(os_gettime_ns() - start_ns) / 1e9;
+		const double total_s = (double)(os_gettime_ns() - queued_ns) / 1e9;
 
 		pthread_mutex_lock(&g_queue.mutex);
 		g_queue.active_job = NULL;
@@ -953,10 +1105,10 @@ static void *save_queue_worker(void *param)
 
 		blog(LOG_INFO,
 		     "[replay_save_queue] Job end: status=%s source='%s' path='%s' frames=%" PRIu64
-		     " clip_duration=%.2fs encode_time=%.2fs queue_pending=%zu pinned=%zu bytes (%.2f MB)",
+		     " clip_duration=%.2fs encode_time=%.2fs total_time=%.2fs queue_pending=%zu pinned=%zu bytes (%.2f MB)",
 		     ok ? "OK" : (aborted ? "ABORTED" : "FAILED"), job->source_name, job->output_path,
-		     job->video_frame_count, (double)job->duration_ns / 1e9, elapsed_s, remaining_after, pinned_after,
-		     (double)pinned_after / (1024.0 * 1024.0));
+		     job->video_frame_count, (double)job->duration_ns / 1e9, elapsed_s, total_s, remaining_after,
+		     pinned_after, (double)pinned_after / (1024.0 * 1024.0));
 
 
 		replay_control_emit_save_finished(job->source_name, job->output_path, ok);
@@ -1276,6 +1428,20 @@ uint64_t replay_save_queue_completed_count(void)
 long replay_save_queue_max_concurrent_encoders(void)
 {
 	return os_atomic_load_long(&g_queue.max_concurrent_encoders);
+}
+
+const char *replay_save_queue_state(void)
+{
+	switch (os_atomic_load_long(&g_queue.state)) {
+	case SAVE_STATE_WAITING_LIVE:
+		return "waitingLive";
+	case SAVE_STATE_WAITING_SLOT:
+		return "waitingSlot";
+	case SAVE_STATE_ENCODING:
+		return "encoding";
+	default:
+		return "idle";
+	}
 }
 
 bool replay_save_queue_wait_idle(uint32_t timeout_ms)

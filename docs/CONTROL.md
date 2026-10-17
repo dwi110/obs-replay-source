@@ -102,7 +102,8 @@ Returns status for all replay sources and the sequential save queue.
   ],
   "saveQueue": {
     "pending": 0,
-    "completed": 4
+    "completed": 4,
+    "state": "idle"
   }
 }
 ```
@@ -268,7 +269,19 @@ Configured per replay source under settings:
 
 Each replay is auto-saved at most once (tracked via an internal replay flag). Manual saves (`Save`, `SaveAll`) always remain available.
 
-Saving still uses one global sequential queue. NVENC HEVC/H.264 uses OBS's raw `ffmpeg_output` with the bundled
+Saving uses one sequential queue per OBS process, and every save encodes in real time (a 12-s clip takes about 12 s).
+Two extra rules protect the live output, at the cost of a later file:
+- **Live first:** a save starts only when this OBS has shown no new lagged render frame and no skipped output frame for
+  0.5 s (2 s after a lag was seen); after 30 s of continuous lag it starts anyway.
+- **One save encoder per PC:** all OBS instances running this plugin share one encoder slot (Windows named mutex
+  `Local\ReplaySource.SaveEncoderSlot`, POSIX `flock` on `/tmp/obs-replay-source-save-encoder.lock`). A second instance
+  queues until the first finishes its current clip. The OS releases the slot if an OBS process exits or crashes.
+  Other plugins' encoders (main recording, streaming, other replay approaches) are not part of this slot.
+`GetReplays.saveQueue.state` reports `idle`, `waitingLive`, `waitingSlot` or `encoding`; the log line `Job start`
+reports `waited_live`/`waited_slot` and `Job end` the `total_time` from dequeue to file. Saved frames stay in RAM
+(shared with the loaded replay, no copy) until their job ends.
+
+NVENC HEVC/H.264 uses OBS's raw `ffmpeg_output` with the bundled
 FFmpeg `hevc_nvenc`/`h264_nvenc` encoders, not OBS's canvas-bound NVENC encoders. The latter crash with the private
 replay `video_t` on OBS 31.1+ (`cuda_surface_init` calls `obs_encoder_video_tex_active` without a core video mix).
 If a backend cannot start, the next plan is tried before feeding the clip: HEVC NVENC → H.264 NVENC → x264;

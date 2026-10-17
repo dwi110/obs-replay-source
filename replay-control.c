@@ -763,6 +763,7 @@ static void vendor_req_get_replays(obs_data_t *request_data, obs_data_t *respons
 	obs_data_t *sq = obs_data_create();
 	obs_data_set_int(sq, "pending", (long long)replay_save_queue_pending_count());
 	obs_data_set_int(sq, "completed", (long long)replay_save_queue_completed_count());
+	obs_data_set_string(sq, "state", replay_save_queue_state());
 
 	obs_data_set_bool(response_data, "ok", true);
 	obs_data_set_array(response_data, "replays", replays_arr);

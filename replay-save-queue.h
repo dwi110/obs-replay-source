@@ -18,6 +18,11 @@ extern "C" {
 #define SAVE_CONTAINER_MP4 "mp4"
 #define SAVE_CONTAINER_MKV "mkv"
 
+/* PC-wide save-encoder slot shared by every OBS instance running this plugin: at most one replay save encodes at a
+ * time on the PC. Crash-safe: the OS releases it when the owning process exits (Windows named mutex, POSIX flock). */
+#define REPLAY_SAVE_SLOT_WIN_NAME L"Local\\ReplaySource.SaveEncoderSlot"
+#define REPLAY_SAVE_SLOT_POSIX_PATH "/tmp/obs-replay-source-save-encoder.lock"
+
 struct replay_source;
 void replay_save(struct replay_source *context);
 void replay_save_with_trigger(struct replay_source *context, const char *trigger);
@@ -56,6 +61,8 @@ size_t replay_save_queue_pinned_bytes(void);
 uint64_t replay_save_queue_completed_count(void);
 long replay_save_queue_max_concurrent_encoders(void);
 bool replay_save_queue_wait_idle(uint32_t timeout_ms);
+/* "idle", "waitingLive" (own OBS render/encode lagging), "waitingSlot" (other instance encoding) or "encoding". */
+const char *replay_save_queue_state(void);
 
 #ifdef __cplusplus
 }
