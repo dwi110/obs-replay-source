@@ -9,6 +9,7 @@
 #include <obs-frontend-api.h>
 #include "replay.h"
 #include "replay-save-queue.h"
+#include "replay-save-fast.h"
 #include <inttypes.h>
 #include "replay-control.h"
 #include "replay-blend.h"
@@ -155,6 +156,7 @@ struct replay_source {
 	char *save_encoder;
 	char *save_container;
 	int save_quality;
+	int save_speed;
 	char *progress_source_name;
 	char *text_source_name;
 	char *text_format;
@@ -703,6 +705,7 @@ static void replay_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, SETTING_SAVE_ENCODER, SAVE_ENCODER_AUTO);
 	obs_data_set_default_string(settings, SETTING_SAVE_CONTAINER, SAVE_CONTAINER_MP4);
 	obs_data_set_default_int(settings, SETTING_SAVE_QUALITY, SETTING_SAVE_QUALITY_DEFAULT);
+	obs_data_set_default_int(settings, SETTING_SAVE_SPEED, SAVE_SPEED_REALTIME);
 	obs_data_set_default_int(settings, SETTING_AUTO_SAVE, AUTO_SAVE_OFF);
 }
 
@@ -886,6 +889,7 @@ static bool replay_save_replay(struct replay_source *context, struct replay *r, 
 		.save_encoder = context->save_encoder,
 		.save_container = context->save_container,
 		.save_quality = context->save_quality,
+		.save_speed = context->save_speed,
 		.lossless = context->lossless,
 		.trigger = trigger ? trigger : "manual",
 		.video_frames = r->video_frames,
@@ -2268,6 +2272,7 @@ static void replay_source_update(void *data, obs_data_t *settings)
 	if (save_quality < SETTING_SAVE_QUALITY_MIN || save_quality > SETTING_SAVE_QUALITY_MAX)
 		save_quality = SETTING_SAVE_QUALITY_DEFAULT;
 	context->save_quality = save_quality;
+	context->save_speed = (int)obs_data_get_int(settings, SETTING_SAVE_SPEED);
 	context->auto_save = (int)obs_data_get_int(settings, SETTING_AUTO_SAVE);
 	replay_update_text(context);
 }
@@ -2410,6 +2415,7 @@ static void *replay_source_create(obs_data_t *settings, obs_source_t *source)
 	context->auto_save = AUTO_SAVE_OFF;
 	context->destroying = false;
 	context->save_quality = SETTING_SAVE_QUALITY_DEFAULT;
+	context->save_speed = SAVE_SPEED_REALTIME;
 	obs_source_set_async_unbuffered(source, true);
 	pthread_mutex_init(&context->video_mutex, NULL);
 	pthread_mutex_init(&context->audio_mutex, NULL);
@@ -3230,6 +3236,15 @@ static obs_properties_t *replay_source_properties(void *data)
 
 	obs_properties_add_int(props, SETTING_SAVE_QUALITY, obs_module_text("SaveQuality"), SETTING_SAVE_QUALITY_MIN,
 			       SETTING_SAVE_QUALITY_MAX, 1);
+	if (replay_save_fast_supported()) {
+		prop = obs_properties_add_list(props, SETTING_SAVE_SPEED, obs_module_text("SaveSpeed"),
+					       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+		obs_property_list_add_int(prop, obs_module_text("SaveSpeed.Realtime"), SAVE_SPEED_REALTIME);
+		obs_property_list_add_int(prop, obs_module_text("SaveSpeed.Up2x"), SAVE_SPEED_2X);
+		obs_property_list_add_int(prop, obs_module_text("SaveSpeed.Up4x"), SAVE_SPEED_4X);
+		obs_property_list_add_int(prop, obs_module_text("SaveSpeed.Max"), SAVE_SPEED_MAX);
+		obs_property_set_long_description(prop, obs_module_text("SaveSpeed.Description"));
+	}
 	prop = obs_properties_add_list(props, SETTING_AUTO_SAVE, obs_module_text("AutoSave"), OBS_COMBO_TYPE_LIST,
 				       OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(prop, obs_module_text("AutoSave.Off"), AUTO_SAVE_OFF);

@@ -26,6 +26,8 @@ target_sources(${PROJECT_NAME} PRIVATE
 	replay-filter-async.c
 	replay-save-queue.c
 	replay-save-queue.h
+	replay-save-fast.c
+	replay-save-fast.h
 	replay-control.c
 	replay-control.h
 	obs-websocket-api.h
@@ -68,9 +70,54 @@ elseif(OS_MACOS)
 		target_compile_options(${PROJECT_NAME} PRIVATE -Wall)
 endif()
 
-target_link_libraries(${PROJECT_NAME}
+target_link_libraries(${PROJECT_NAME} PRIVATE
 	OBS::${OBS_FRONTEND_API_NAME}
 	OBS::libobs)
+
+# Faster-than-real-time saving encodes directly with libavcodec/libavformat (FFmpeg >= 6 API). Without FFmpeg the
+# plugin builds and saves at real time only. Windows: point REPLAY_FFMPEG_DIR at the FFmpeg (include/, lib/) that the
+# target OBS ships; the DLLs are delay-loaded so the plugin still loads on an OBS with another FFmpeg version.
+set(REPLAY_FFMPEG_DIR "" CACHE PATH "FFmpeg prefix (include/, lib/) for the fast save path")
+if(NOT REPLAY_FFMPEG_DIR AND NOT WIN32)
+	find_package(PkgConfig QUIET)
+	if(PKG_CONFIG_FOUND)
+		pkg_check_modules(REPLAY_FFMPEG QUIET IMPORTED_TARGET GLOBAL libavcodec>=60 libavformat>=60 libavutil>=58)
+	endif()
+endif()
+
+function(replay_enable_fast_save target)
+	if(REPLAY_FFMPEG_DIR)
+		target_include_directories(${target} BEFORE PRIVATE "${REPLAY_FFMPEG_DIR}/include")
+		target_compile_definitions(${target} PRIVATE REPLAY_FAST_SAVE)
+		if(MSVC)
+			foreach(lib avcodec avformat avutil)
+				target_link_libraries(${target} PRIVATE "${REPLAY_FFMPEG_DIR}/lib/${lib}.lib")
+			endforeach()
+			foreach(hdr libavcodec/version_major.h libavformat/version_major.h libavutil/version.h)
+				file(STRINGS "${REPLAY_FFMPEG_DIR}/include/${hdr}" _major REGEX "^#define LIBAV[A-Z]+_VERSION_MAJOR")
+				string(REGEX MATCH "LIBAV([A-Z]+)_VERSION_MAJOR +([0-9]+)" _m "${_major}")
+				string(TOLOWER "${CMAKE_MATCH_1}" _name)
+				target_link_options(${target} PRIVATE "/DELAYLOAD:av${_name}-${CMAKE_MATCH_2}.dll")
+			endforeach()
+			target_link_libraries(${target} PRIVATE delayimp)
+		else()
+			foreach(lib avcodec avformat avutil)
+				find_library(_ff_${lib} ${lib} PATHS "${REPLAY_FFMPEG_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+				target_link_libraries(${target} PRIVATE "${_ff_${lib}}")
+			endforeach()
+		endif()
+	elseif(TARGET PkgConfig::REPLAY_FFMPEG)
+		target_compile_definitions(${target} PRIVATE REPLAY_FAST_SAVE)
+		target_link_libraries(${target} PRIVATE PkgConfig::REPLAY_FFMPEG)
+	endif()
+endfunction()
+
+replay_enable_fast_save(${PROJECT_NAME})
+if(REPLAY_FFMPEG_DIR OR TARGET PkgConfig::REPLAY_FFMPEG)
+	message(STATUS "replay-source: faster-than-real-time saving enabled")
+else()
+	message(STATUS "replay-source: no FFmpeg >= 6 found, saving at real time only")
+endif()
 
 if(BUILD_OUT_OF_TREE)
     if(NOT LIB_OUT_DIR)

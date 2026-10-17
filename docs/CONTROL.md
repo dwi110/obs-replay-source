@@ -269,7 +269,8 @@ Configured per replay source under settings:
 
 Each replay is auto-saved at most once (tracked via an internal replay flag). Manual saves (`Save`, `SaveAll`) always remain available.
 
-Saving uses one sequential queue per OBS process, and every save encodes in real time (a 12-s clip takes about 12 s).
+Saving uses one sequential queue per OBS process. By default every save encodes in real time (a 12-s clip takes about
+12 s); the source setting **Save Speed** (`save_speed`) allows faster saves, see below.
 Two extra rules protect the live output, at the cost of a later file:
 - **Live first:** a save starts only when this OBS has shown no new lagged render frame and no skipped output frame for
   0.5 s (2 s after a lag was seen); after 30 s of continuous lag it starts anyway.
@@ -280,6 +281,17 @@ Two extra rules protect the live output, at the cost of a later file:
 `GetReplays.saveQueue.state` reports `idle`, `waitingLive`, `waitingSlot` or `encoding`; the log line `Job start`
 reports `waited_live`/`waited_slot` and `Job end` the `total_time` from dequeue to file. Saved frames stay in RAM
 (shared with the loaded replay, no copy) until their job ends.
+
+**Save Speed** (`save_speed`: `1` real time, default; `2` up to 2×; `4` up to 4×; `-1` as fast as possible). Faster
+saves free the pinned replay frames sooner but load CPU (frame copy/conversion) and the encoder harder; the reachable
+speed depends on the PC. Faster than real time cannot go through OBS outputs, whose audio clock runs in real time, so
+the plugin encodes and muxes directly with libavcodec/libavformat: same encoders and order (HEVC NVENC → H.264 NVENC →
+x264, lossless UtVideo/PCM AVI), same picture settings, same constant-frame-rate schedule with held frames in reception
+gaps, PCM laid onto the clip timeline. Any new lagged/skipped program frame during a fast save drops it to real-time
+pace for 2 s. The log line `Fast save … limit= achieved= live_slowdowns=` reports the result. If the FFmpeg libraries
+are missing (Windows build targets the FFmpeg 8 DLLs `avcodec-62`/`avformat-62`/`avutil-60` of OBS 32, delay-loaded)
+or no encoder opens, the save runs at real time instead. Builds without FFmpeg ≥ 6 (e.g. Ubuntu 22.04) do not offer the
+setting.
 
 NVENC HEVC/H.264 uses OBS's raw `ffmpeg_output` with the bundled
 FFmpeg `hevc_nvenc`/`h264_nvenc` encoders, not OBS's canvas-bound NVENC encoders. The latter crash with the private

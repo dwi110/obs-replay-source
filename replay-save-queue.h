@@ -18,6 +18,14 @@ extern "C" {
 #define SAVE_CONTAINER_MP4 "mp4"
 #define SAVE_CONTAINER_MKV "mkv"
 
+/* Upper save speed as a multiple of real time. Faster than real time needs the FFmpeg save path
+ * (replay-save-fast.c); without it saves stay at real time. 0/unknown values (unset parameters) mean real time. */
+#define SETTING_SAVE_SPEED "save_speed"
+#define SAVE_SPEED_REALTIME 1
+#define SAVE_SPEED_2X 2
+#define SAVE_SPEED_4X 4
+#define SAVE_SPEED_MAX -1 /* as fast as the hardware allows */
+
 /* PC-wide save-encoder slot shared by every OBS instance running this plugin: at most one replay save encodes at a
  * time on the PC. Crash-safe: the OS releases it when the owning process exits (Windows named mutex, POSIX flock). */
 #define REPLAY_SAVE_SLOT_WIN_NAME L"Local\\ReplaySource.SaveEncoderSlot"
@@ -35,6 +43,7 @@ struct replay_save_job_params {
 	const char *save_container;
 	int save_quality;
 	bool lossless;
+	int save_speed;
 	const char *trigger;
 	struct obs_source_frame **video_frames;
 	uint64_t video_frame_count;
@@ -59,6 +68,8 @@ size_t replay_save_all_loaded_replays(void);
 size_t replay_save_queue_pending_count(void);
 size_t replay_save_queue_pinned_bytes(void);
 uint64_t replay_save_queue_completed_count(void);
+/* Completed saves written faster than real time by the FFmpeg path. */
+uint64_t replay_save_queue_fast_completed_count(void);
 long replay_save_queue_max_concurrent_encoders(void);
 bool replay_save_queue_wait_idle(uint32_t timeout_ms);
 /* "idle", "waitingLive" (own OBS render/encode lagging), "waitingSlot" (other instance encoding) or "encoding". */

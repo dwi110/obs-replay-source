@@ -123,3 +123,8 @@ if(UNIX AND NOT APPLE)
 	target_link_libraries(test-blend PRIVATE m)
 endif()
 add_test(NAME replay_blend COMMAND test-blend)
+
+foreach(t test-save-queue test-control test-tap-hidden test-blend)
+	target_sources(${t} PRIVATE ../replay-save-fast.c)
+	replay_enable_fast_save(${t})
+endforeach()

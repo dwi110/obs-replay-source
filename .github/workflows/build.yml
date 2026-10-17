@@ -78,6 +78,9 @@ jobs:
       CMAKE_GENERATOR: "Visual Studio 17 2022"
       CMAKE_SYSTEM_VERSION: "10.0.18363.657"
       WINDOWS_DEPS_VERSION: '2023-04-12'
+      # FFmpeg 8 (avcodec-62/avformat-62/avutil-60) as shipped by OBS 32.x, for the faster-than-real-time save path.
+      FFMPEG_DEPS_VERSION: '2026-08-26'
+      FFMPEG_DEPS_SHA256: 'EB5E67AD110543BCB65A4612BCD654B6427972EA70D26412B48D7E21532DFE67'
     steps:
       - name: Add msbuild to PATH
         uses: microsoft/setup-msbuild@v2
@@ -106,11 +109,25 @@ jobs:
         run: |
           curl -kLO https://github.com/obsproject/obs-deps/releases/download/${{ env.WINDOWS_DEPS_VERSION }}/windows-deps-${{ env.WINDOWS_DEPS_VERSION }}-${{ matrix.target }}.zip -f --retry 5 -C -
           7z x windows-deps-${{ env.WINDOWS_DEPS_VERSION }}-${{ matrix.target }}.zip -o"${{ github.workspace }}/cmbuild/deps"
+      - name: 'Install prerequisite: FFmpeg of OBS 32 (fast save)'
+        shell: pwsh
+        run: |
+          $zip = "windows-deps-${{ env.FFMPEG_DEPS_VERSION }}-${{ matrix.target }}.zip"
+          curl.exe -kLO "https://github.com/obsproject/obs-deps/releases/download/${{ env.FFMPEG_DEPS_VERSION }}/$zip" -f --retry 5
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          if ($hash -ne '${{ env.FFMPEG_DEPS_SHA256 }}') { throw "obs-deps hash mismatch: $hash" }
+          Expand-Archive $zip -DestinationPath ffmpeg-deps
+          $dst = "${{ github.workspace }}/cmbuild/ffmpeg-obs32"
+          New-Item -ItemType Directory -Force "$dst/include", "$dst/lib" | Out-Null
+          foreach ($l in 'avcodec', 'avformat', 'avutil') {
+            Copy-Item -Recurse "ffmpeg-deps/include/lib$l" "$dst/include/"
+            Copy-Item "ffmpeg-deps/lib/$l.lib" "$dst/lib/"
+          }
       - name: Configure
         run: |
           mkdir ./package
           mkdir ./build
-          cmake -S . -B "${{ github.workspace }}/build" -G"${{ env.CMAKE_GENERATOR }}" -DCMAKE_PREFIX_PATH:PATH="${{ github.workspace }}/cmbuild/deps" -A"${{ matrix.cmake_build }}" -DCMAKE_SYSTEM_VERSION="${{ env.CMAKE_SYSTEM_VERSION }}" -DBUILD_BROWSER=false -DBUILD_VST=false -DBUILD_VIRTUALCAM=false -DBUILD_CAPTIONS=false -DCOMPILE_D3D12_HOOK=false -DENABLE_SCRIPTING=false -DDepsPath="${{ github.workspace }}/cmbuild/deps" -DDepsPath${{ matrix.deps_ext }}="${{ github.workspace }}/cmbuild/deps" -DQTDIR="${{ github.workspace }}/cmbuild/deps/qt6" -DCOPIED_DEPENDENCIES=FALSE -DCOPY_DEPENDENCIES=TRUE -DENABLE_PLUGINS=TRUE -DDISABLE_PLUGINS=FALSE -DENABLE_BROWSER=FALSE -DENABLE_WEBSOCKET=FALSE
+          cmake -S . -B "${{ github.workspace }}/build" -G"${{ env.CMAKE_GENERATOR }}" -DCMAKE_PREFIX_PATH:PATH="${{ github.workspace }}/cmbuild/deps" -A"${{ matrix.cmake_build }}" -DCMAKE_SYSTEM_VERSION="${{ env.CMAKE_SYSTEM_VERSION }}" -DBUILD_BROWSER=false -DBUILD_VST=false -DBUILD_VIRTUALCAM=false -DBUILD_CAPTIONS=false -DCOMPILE_D3D12_HOOK=false -DENABLE_SCRIPTING=false -DDepsPath="${{ github.workspace }}/cmbuild/deps" -DDepsPath${{ matrix.deps_ext }}="${{ github.workspace }}/cmbuild/deps" -DQTDIR="${{ github.workspace }}/cmbuild/deps/qt6" -DCOPIED_DEPENDENCIES=FALSE -DCOPY_DEPENDENCIES=TRUE -DENABLE_PLUGINS=TRUE -DDISABLE_PLUGINS=FALSE -DENABLE_BROWSER=FALSE -DENABLE_WEBSOCKET=FALSE -DREPLAY_FFMPEG_DIR="${{ github.workspace }}/cmbuild/ffmpeg-obs32"
       - name: 'Build'
         run: msbuild /m /p:Configuration=RelWithDebInfo .\build\obs-studio.sln
       - name: Package
