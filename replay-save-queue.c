@@ -1,5 +1,6 @@
 #include "replay-save-queue.h"
 #include "replay-control.h"
+#include "replay-save-fast.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -39,6 +40,8 @@ struct replay_save_job {
 	char *trigger;
 	int save_quality;
 	bool lossless;
+	int save_speed;
+	bool saved_fast;
 	struct obs_source_frame **video_frames;
 	uint64_t video_frame_count;
 
@@ -72,6 +75,7 @@ struct replay_save_queue_state {
 	volatile long active_encoders;
 	volatile long max_concurrent_encoders;
 	volatile long state;
+	uint64_t fast_completed_count;
 
 	obs_hotkey_id save_all_hotkey;
 };
@@ -754,6 +758,15 @@ static void ensure_parent_dir(const char *file_path)
 	dstr_free(&dir);
 }
 
+static void note_encoder_start(void)
+{
+	const long cur_enc = os_atomic_inc_long(&g_queue.active_encoders);
+	long prev_max = os_atomic_load_long(&g_queue.max_concurrent_encoders);
+	while (cur_enc > prev_max) {
+		os_atomic_compare_exchange_long(&g_queue.max_concurrent_encoders, &prev_max, cur_enc);
+	}
+}
+
 static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 {
 	*aborted_out = false;
@@ -761,6 +774,52 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 		return false;
 
 	ensure_parent_dir(job->output_path);
+
+	if (job->save_speed != SAVE_SPEED_REALTIME && replay_save_fast_available()) {
+		struct replay_save_fast_input in = {
+			.output_path = job->output_path,
+			.save_container = job->save_container,
+			.save_encoder = job->save_encoder,
+			.save_quality = job->save_quality,
+			.lossless = job->lossless,
+			.nvenc_present = nvenc_present(),
+			.max_speed = job->save_speed == SAVE_SPEED_MAX ? 0 : job->save_speed,
+			.video_frames = job->video_frames,
+			.video_frame_count = job->video_frame_count,
+			.audio_frames = job->audio_frames,
+			.audio_frame_count = job->audio_frame_count,
+			.oai = job->oai,
+			.first_frame_timestamp = job->first_frame_timestamp,
+			.duration_ns = job->duration_ns,
+			.should_abort = is_shutting_down,
+			.live_lag_counter = live_lag_counter,
+		};
+		struct replay_save_fast_stats stats;
+		note_encoder_start();
+		const enum replay_save_fast_result r = replay_save_fast_run(&in, &stats);
+		os_atomic_dec_long(&g_queue.active_encoders);
+		const double secs = (double)stats.encode_ns / 1e9;
+		if (r == REPLAY_SAVE_FAST_OK) {
+			char limit[16];
+			if (job->save_speed == SAVE_SPEED_MAX)
+				snprintf(limit, sizeof(limit), "max");
+			else
+				snprintf(limit, sizeof(limit), "%dx", job->save_speed);
+			blog(LOG_INFO,
+			     "[replay_save_queue] Fast save '%s' with '%s': limit=%s achieved=%.1fx encode_time=%.2fs"
+			     " live_slowdowns=%u",
+			     job->output_path, stats.codec, limit, secs > 0.0 ? (double)job->duration_ns / 1e9 / secs : 0.0,
+			     secs, stats.slowdowns);
+			job->saved_fast = true;
+			return true;
+		}
+		if (r == REPLAY_SAVE_FAST_ABORTED) {
+			*aborted_out = true;
+			return false;
+		}
+		blog(LOG_WARNING, "[replay_save_queue] Fast save of '%s' %s; saving at real time", job->output_path,
+		     r == REPLAY_SAVE_FAST_UNAVAILABLE ? "unavailable" : "failed");
+	}
 
 	const uint32_t width = job->video_frames[0]->width;
 	const uint32_t height = job->video_frames[0]->height;
@@ -827,11 +886,7 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 	uint32_t scaler_src_h = 0;
 	bool success = false;
 
-	const long cur_enc = os_atomic_inc_long(&g_queue.active_encoders);
-	long prev_max = os_atomic_load_long(&g_queue.max_concurrent_encoders);
-	while (cur_enc > prev_max) {
-		os_atomic_compare_exchange_long(&g_queue.max_concurrent_encoders, &prev_max, cur_enc);
-	}
+	note_encoder_start();
 
 	struct save_plan plans[MAX_SAVE_PLANS];
 	size_t plan_count;
@@ -1097,8 +1152,11 @@ static void *save_queue_worker(void *param)
 			g_queue.pinned_bytes -= job->pinned_bytes;
 		else
 			g_queue.pinned_bytes = 0;
-		if (ok)
+		if (ok) {
 			g_queue.completed_count++;
+			if (job->saved_fast)
+				g_queue.fast_completed_count++;
+		}
 		const size_t remaining_after = g_queue.pending_count;
 		const size_t pinned_after = g_queue.pinned_bytes;
 		pthread_mutex_unlock(&g_queue.mutex);
@@ -1199,6 +1257,7 @@ void replay_save_queue_init(void)
 	g_queue.pinned_bytes = 0;
 	g_queue.completed_count = 0;
 	g_queue.enqueued_count = 0;
+	g_queue.fast_completed_count = 0;
 	os_atomic_set_long(&g_queue.active_encoders, 0);
 	os_atomic_set_long(&g_queue.max_concurrent_encoders, 0);
 	os_atomic_set_bool(&g_queue.shutting_down, false);
@@ -1312,6 +1371,16 @@ bool replay_save_queue_enqueue(const struct replay_save_job_params *params)
 		save_quality = SETTING_SAVE_QUALITY_MAX;
 	job->save_quality = save_quality;
 	job->lossless = params->lossless;
+	switch (params->save_speed) {
+	case SAVE_SPEED_2X:
+	case SAVE_SPEED_4X:
+	case SAVE_SPEED_MAX:
+		job->save_speed = params->save_speed;
+		break;
+	default:
+		job->save_speed = SAVE_SPEED_REALTIME;
+		break;
+	}
 	job->video_frames = bzalloc((size_t)valid_v_count * sizeof(struct obs_source_frame *));
 	uint64_t v_idx = 0;
 	for (uint64_t i = 0; i < params->video_frame_count; i++) {
@@ -1421,6 +1490,16 @@ uint64_t replay_save_queue_completed_count(void)
 		return 0;
 	pthread_mutex_lock(&g_queue.mutex);
 	const uint64_t count = g_queue.completed_count;
+	pthread_mutex_unlock(&g_queue.mutex);
+	return count;
+}
+
+uint64_t replay_save_queue_fast_completed_count(void)
+{
+	if (!g_queue.initialized)
+		return 0;
+	pthread_mutex_lock(&g_queue.mutex);
+	const uint64_t count = g_queue.fast_completed_count;
 	pthread_mutex_unlock(&g_queue.mutex);
 	return count;
 }

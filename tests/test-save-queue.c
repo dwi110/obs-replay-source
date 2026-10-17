@@ -14,6 +14,7 @@
 #include <util/dstr.h>
 #include "replay.h"
 #include "replay-save-queue.h"
+#include "replay-save-fast.h"
 #include "replay-pool.h"
 
 extern bool obs_module_load(void);
@@ -210,10 +211,11 @@ static bool validate_with_ffprobe(const char *filepath, const char *expected_vco
 	return true;
 }
 
-static bool validate_gap_content(void)
+static bool validate_gap_content(const char *path)
 {
-	FILE *fp = popen("ffmpeg -v error -i '/tmp/replay-save-queue-test/test_clip - Cam_Gap.avi' "
-			"-vf crop=2:2:0:0 -pix_fmt yuv420p -f rawvideo -", "r");
+	char cmd[512];
+	snprintf(cmd, sizeof(cmd), "ffmpeg -v error -i '%s' -vf crop=2:2:0:0 -pix_fmt yuv420p -f rawvideo -", path);
+	FILE *fp = popen(cmd, "r");
 	if (!fp)
 		return false;
 	bool ok = true;
@@ -230,6 +232,44 @@ static bool validate_gap_content(void)
 	if (ok && fgetc(fp) != EOF)
 		ok = false;
 	return pclose(fp) == 0 && ok;
+}
+
+/* Decodes the first audio track: the 440 Hz test tone must be audible in the first and last 100 ms. expected_samples
+ * > 0 also requires that exact decoded length (lossless PCM). */
+static bool validate_tone(const char *path, size_t expected_samples)
+{
+	char cmd[512];
+	snprintf(cmd, sizeof(cmd), "ffmpeg -v error -i '%s' -map 0:a:0 -ac 1 -f s16le -", path);
+	FILE *fp = popen(cmd, "r");
+	if (!fp)
+		return false;
+	size_t cap = 96000, n = 0;
+	int16_t *s = bmalloc(cap * sizeof(int16_t));
+	size_t got;
+	while ((got = fread(s + n, sizeof(int16_t), cap - n, fp)) > 0) {
+		n += got;
+		if (n == cap) {
+			cap *= 2;
+			s = brealloc(s, cap * sizeof(int16_t));
+		}
+	}
+	const bool exited = pclose(fp) == 0;
+	bool ok = exited && n >= 9600 && (!expected_samples || n == expected_samples);
+	for (int part = 0; ok && part < 2; part++) {
+		const size_t from = part == 0 ? 0 : n - 4800;
+		double sum = 0.0;
+		for (size_t i = from; i < from + 4800; i++)
+			sum += (double)s[i] * s[i];
+		const double rms = sqrt(sum / 4800.0);
+		if (rms < 2000.0) {
+			fprintf(stderr, "[test] %s: tone missing at %s (rms %.0f)\n", path, part == 0 ? "start" : "end", rms);
+			ok = false;
+		}
+	}
+	if (expected_samples && n != expected_samples)
+		fprintf(stderr, "[test] %s: %zu audio samples, expected %zu\n", path, n, expected_samples);
+	bfree(s);
+	return ok;
 }
 
 int main(int argc, char **argv)
@@ -320,6 +360,9 @@ int main(int argc, char **argv)
 	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_Lossless.avi");
 	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_Gap.avi");
 	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_Slot.avi");
+	os_unlink("/tmp/replay-save-queue-test/test_clip - Fast_NV12.mp4");
+	os_unlink("/tmp/replay-save-queue-test/test_clip - Fast_UYVY.mkv");
+	os_unlink("/tmp/replay-save-queue-test/test_clip - Fast_Gap.avi");
 
 	const uint64_t frame_count = 60;
 	const uint64_t interval_ns = 1000000000ULL / 60ULL;
@@ -493,7 +536,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	if (!validate_with_ffprobe("/tmp/replay-save-queue-test/test_clip - Cam_Gap.avi", "utvideo", 60) ||
-	    !validate_gap_content()) {
+	    !validate_gap_content("/tmp/replay-save-queue-test/test_clip - Cam_Gap.avi")) {
 		fprintf(stderr, "[test] Sparse input timestamps changed saved playback duration\n");
 		return 1;
 	}
@@ -540,6 +583,77 @@ int main(int argc, char **argv)
 		return 1;
 	}
 #endif
+
+	/* Faster than real time (FFmpeg path): same CFR schedule, held frames in gaps and PCM timeline as real time. */
+	if (replay_save_fast_supported()) {
+		const uint64_t completed_before = replay_save_queue_completed_count();
+		struct obs_source_frame **fast_nv12 =
+			create_clip_video_frames(VIDEO_FORMAT_NV12, 640, 360, frame_count, start_ts, interval_ns);
+		struct obs_source_frame **fast_uyvy =
+			create_clip_video_frames(VIDEO_FORMAT_UYVY, 640, 360, frame_count, start_ts, interval_ns);
+		uint64_t fast_audio_count = 0;
+		struct obs_audio_data *fast_audio =
+			create_clip_audio_frames(start_ts, duration_ns, 48000, &fast_audio_count);
+
+		struct replay_save_job_params fast_mp4 = job1;
+		fast_mp4.source_name = "Fast_NV12";
+		fast_mp4.video_frames = fast_nv12;
+		fast_mp4.audio_frames = fast_audio;
+		fast_mp4.audio_frame_count = fast_audio_count;
+		fast_mp4.save_speed = SAVE_SPEED_MAX;
+		struct replay_save_job_params fast_mkv = fast_mp4;
+		fast_mkv.source_name = "Fast_UYVY";
+		fast_mkv.save_container = SAVE_CONTAINER_MKV;
+		fast_mkv.video_frames = fast_uyvy;
+		fast_mkv.save_speed = SAVE_SPEED_4X;
+		struct obs_source_frame *fast_gap_frames[50];
+		size_t fast_gap_count = 0;
+		for (uint64_t i = 0; i < frame_count; i++) {
+			if (i < 20 || i >= 30)
+				fast_gap_frames[fast_gap_count++] = fast_nv12[i];
+		}
+		struct replay_save_job_params fast_gap = fast_mp4;
+		fast_gap.source_name = "Fast_Gap";
+		fast_gap.lossless = true;
+		fast_gap.video_frames = fast_gap_frames;
+		fast_gap.video_frame_count = fast_gap_count;
+
+		if (!replay_save_queue_enqueue(&fast_mp4) || !replay_save_queue_enqueue(&fast_mkv) ||
+		    !replay_save_queue_enqueue(&fast_gap)) {
+			fprintf(stderr, "[test] Failed to enqueue fast saves\n");
+			return 1;
+		}
+		for (uint64_t i = 0; i < frame_count; i++) {
+			replay_frame_release(fast_nv12[i]);
+			replay_frame_release(fast_uyvy[i]);
+		}
+		bfree(fast_nv12);
+		bfree(fast_uyvy);
+		for (uint64_t i = 0; i < fast_audio_count; i++)
+			free_audio_packet(&fast_audio[i]);
+		bfree(fast_audio);
+
+		if (!replay_save_queue_wait_idle(30000) ||
+		    replay_save_queue_completed_count() != completed_before + 3 ||
+		    replay_save_queue_fast_completed_count() != 3) {
+			fprintf(stderr, "[test] Fast saves did not complete through the FFmpeg path (fast=%" PRIu64 ")\n",
+				replay_save_queue_fast_completed_count());
+			return 1;
+		}
+		if (!validate_with_ffprobe("/tmp/replay-save-queue-test/test_clip - Fast_NV12.mp4", "h264", 60) ||
+		    !validate_with_ffprobe("/tmp/replay-save-queue-test/test_clip - Fast_UYVY.mkv", "h264", 60) ||
+		    !validate_with_ffprobe("/tmp/replay-save-queue-test/test_clip - Fast_Gap.avi", "utvideo", 60) ||
+		    !validate_gap_content("/tmp/replay-save-queue-test/test_clip - Fast_Gap.avi")) {
+			fprintf(stderr, "[test] Fast save output invalid\n");
+			return 1;
+		}
+		/* PCM is lossless: exactly 60 frames x 800 samples, tone present at clip start and end. */
+		if (!validate_tone("/tmp/replay-save-queue-test/test_clip - Fast_Gap.avi", 48000) ||
+		    !validate_tone("/tmp/replay-save-queue-test/test_clip - Fast_NV12.mp4", 0)) {
+			fprintf(stderr, "[test] Fast save audio timeline invalid\n");
+			return 1;
+		}
+	}
 
 	obs_module_unload();
 	obs_shutdown();
