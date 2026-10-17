@@ -26,6 +26,7 @@ struct replay_source_status {
 	uint64_t effective_duration_ns;
 	int64_t mark_in_ms;
 	int64_t mark_out_ms;
+	int slowmo_blend;
 };
 
 /* Lifecycle called from replay-module.c */
@@ -36,6 +37,7 @@ void replay_control_register_vendor(void);
 /* Global multi-angle actions */
 size_t replay_control_load_all(const char *const *filter_names, size_t filter_count, obs_data_t *response_out);
 void replay_control_set_all_speed(float speed_percent);
+void replay_control_set_all_slowmo_blend(int mode);
 void replay_control_restart_all(void);
 void replay_control_pause_all(void);
 void replay_control_all_mark_in(void);
@@ -50,6 +52,8 @@ void replay_control_emit_save_finished(const char *source_name, const char *path
 /* Per-source hooks implemented in replay-source.c */
 bool replay_source_execute_action(struct replay_source *context, const char *action, bool from_update);
 void replay_source_set_speed(struct replay_source *context, float speed_percent);
+/* Sets SLOWMO_BLEND_* at runtime and stores it in the source settings (persisted with the scene collection). */
+void replay_source_set_slowmo_blend(struct replay_source *context, int mode);
 void replay_source_restart_playback(struct replay_source *context);
 void replay_source_toggle_pause(struct replay_source *context);
 bool replay_source_get_status(struct replay_source *context, struct replay_source_status *out);

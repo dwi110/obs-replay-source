@@ -20,6 +20,9 @@ struct replay_control_state {
 	obs_hotkey_id all_mark_in_hotkey;
 	obs_hotkey_id all_mark_out_hotkey;
 	obs_hotkey_id all_mark_reset_hotkey;
+	obs_hotkey_id slowmo_off_hotkey;
+	obs_hotkey_id slowmo_program_hotkey;
+	obs_hotkey_id slowmo_always_hotkey;
 	obs_websocket_vendor vendor;
 };
 
@@ -33,6 +36,9 @@ static struct replay_control_state g_ctrl = {
 	.all_mark_in_hotkey = OBS_INVALID_HOTKEY_ID,
 	.all_mark_out_hotkey = OBS_INVALID_HOTKEY_ID,
 	.all_mark_reset_hotkey = OBS_INVALID_HOTKEY_ID,
+	.slowmo_off_hotkey = OBS_INVALID_HOTKEY_ID,
+	.slowmo_program_hotkey = OBS_INVALID_HOTKEY_ID,
+	.slowmo_always_hotkey = OBS_INVALID_HOTKEY_ID,
 	.vendor = NULL,
 };
 
@@ -417,6 +423,47 @@ void replay_control_set_all_speed(float speed_percent)
 	da_free(sources);
 }
 
+static const char *slowmo_blend_name(int mode)
+{
+	switch (mode) {
+	case SLOWMO_BLEND_PROGRAM:
+		return "program";
+	case SLOWMO_BLEND_ALWAYS:
+		return "always";
+	default:
+		return "off";
+	}
+}
+
+static bool parse_slowmo_blend(const char *name, int *mode_out)
+{
+	if (!name)
+		return false;
+	if (strcmp(name, "off") == 0)
+		*mode_out = SLOWMO_BLEND_OFF;
+	else if (strcmp(name, "program") == 0)
+		*mode_out = SLOWMO_BLEND_PROGRAM;
+	else if (strcmp(name, "always") == 0)
+		*mode_out = SLOWMO_BLEND_ALWAYS;
+	else
+		return false;
+	return true;
+}
+
+void replay_control_set_all_slowmo_blend(int mode)
+{
+	source_list_t sources;
+	da_init(sources);
+	obs_enum_sources(enum_replay_sources_cb, &sources);
+	for (size_t i = 0; i < sources.num; i++) {
+		struct replay_source *ctx = obs_obj_get_data(sources.array[i]);
+		if (ctx)
+			replay_source_set_slowmo_blend(ctx, mode);
+		obs_source_release(sources.array[i]);
+	}
+	da_free(sources);
+}
+
 void replay_control_restart_all(void)
 {
 	source_list_t sources;
@@ -658,6 +705,20 @@ static void all_mark_reset_hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t 
 	replay_control_all_mark_reset();
 }
 
+static void slowmo_mode_hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(hotkey);
+	if (!pressed)
+		return;
+	if (id == g_ctrl.slowmo_off_hotkey)
+		replay_control_set_all_slowmo_blend(SLOWMO_BLEND_OFF);
+	else if (id == g_ctrl.slowmo_program_hotkey)
+		replay_control_set_all_slowmo_blend(SLOWMO_BLEND_PROGRAM);
+	else if (id == g_ctrl.slowmo_always_hotkey)
+		replay_control_set_all_slowmo_blend(SLOWMO_BLEND_ALWAYS);
+}
+
 
 /* ==================== VENDOR REQUEST CALLBACKS ==================== */
 
@@ -691,6 +752,7 @@ static void vendor_req_get_replays(obs_data_t *request_data, obs_data_t *respons
 			obs_data_set_int(item, "bufferedMs", (long long)st.buffered_ms);
 			obs_data_set_int(item, "markInMs", (long long)st.mark_in_ms);
 			obs_data_set_int(item, "markOutMs", (long long)st.mark_out_ms);
+			obs_data_set_string(item, "slowmoBlend", slowmo_blend_name(st.slowmo_blend));
 			obs_data_array_push_back(replays_arr, item);
 			obs_data_release(item);
 		}
@@ -701,6 +763,7 @@ static void vendor_req_get_replays(obs_data_t *request_data, obs_data_t *respons
 	obs_data_t *sq = obs_data_create();
 	obs_data_set_int(sq, "pending", (long long)replay_save_queue_pending_count());
 	obs_data_set_int(sq, "completed", (long long)replay_save_queue_completed_count());
+	obs_data_set_string(sq, "state", replay_save_queue_state());
 
 	obs_data_set_bool(response_data, "ok", true);
 	obs_data_set_array(response_data, "replays", replays_arr);
@@ -817,6 +880,61 @@ static void vendor_req_set_speed(obs_data_t *request_data, obs_data_t *response_
 
 	obs_data_set_bool(response_data, "ok", true);
 	obs_data_set_double(response_data, "speedPercent", speed);
+	obs_data_set_array(response_data, "applied", applied_arr);
+	obs_data_set_array(response_data, "unknown", unknown_arr);
+	obs_data_set_int(response_data, "appliedCount", (long long)applied_count);
+	obs_data_set_int(response_data, "unknownCount", (long long)unknown_count);
+	obs_data_array_release(applied_arr);
+	obs_data_array_release(unknown_arr);
+}
+
+static void vendor_req_set_slowmo_blend(obs_data_t *request_data, obs_data_t *response_data, void *priv_data)
+{
+	UNUSED_PARAMETER(priv_data);
+	if (!response_data)
+		return;
+
+	int mode = SLOWMO_BLEND_OFF;
+	if (!request_data || !parse_slowmo_blend(obs_data_get_string(request_data, "mode"), &mode)) {
+		obs_data_set_bool(response_data, "ok", false);
+		obs_data_set_string(response_data, "error", "mode must be \"off\", \"program\" or \"always\"");
+		return;
+	}
+
+	string_list_t filter_names;
+	da_init(filter_names);
+	bool has_filter = false;
+	if (!extract_target_names(request_data, &filter_names, &has_filter)) {
+		free_string_darray(&filter_names);
+		set_invalid_sources_error(response_data);
+		return;
+	}
+
+	obs_data_array_t *applied_arr = obs_data_array_create();
+	obs_data_array_t *unknown_arr = obs_data_array_create();
+	size_t unknown_count = 0;
+
+	source_list_t sources;
+	da_init(sources);
+	resolve_target_sources((const char *const *)filter_names.array, filter_names.num, has_filter, &sources,
+			       unknown_arr, &unknown_count);
+
+	size_t applied_count = 0;
+	for (size_t i = 0; i < sources.num; i++) {
+		obs_source_t *s = sources.array[i];
+		struct replay_source *ctx = obs_obj_get_data(s);
+		if (ctx) {
+			replay_source_set_slowmo_blend(ctx, mode);
+			push_name_obj(applied_arr, obs_source_get_name(s));
+			applied_count++;
+		}
+		obs_source_release(s);
+	}
+	da_free(sources);
+	free_string_darray(&filter_names);
+
+	obs_data_set_bool(response_data, "ok", true);
+	obs_data_set_string(response_data, "mode", slowmo_blend_name(mode));
 	obs_data_set_array(response_data, "applied", applied_arr);
 	obs_data_set_array(response_data, "unknown", unknown_arr);
 	obs_data_set_int(response_data, "appliedCount", (long long)applied_count);
@@ -1158,6 +1276,19 @@ void replay_control_init(void)
 	g_ctrl.all_mark_reset_hotkey = obs_hotkey_register_frontend(
 		"ReplaySource.AllMarkReset", lookup_hotkey_desc("AllMarkReset", "Replay: reset marks (all angles)"),
 		all_mark_reset_hotkey_cb, NULL);
+	g_ctrl.slowmo_off_hotkey = obs_hotkey_register_frontend(
+		"ReplaySource.SlowmoBlendOff",
+		lookup_hotkey_desc("SlowmoBlendOffHotkey", "Replay: smooth slow motion off (all angles)"),
+		slowmo_mode_hotkey_cb, NULL);
+	g_ctrl.slowmo_program_hotkey = obs_hotkey_register_frontend(
+		"ReplaySource.SlowmoBlendProgram",
+		lookup_hotkey_desc("SlowmoBlendProgramHotkey",
+				   "Replay: smooth slow motion only on program (all angles)"),
+		slowmo_mode_hotkey_cb, NULL);
+	g_ctrl.slowmo_always_hotkey = obs_hotkey_register_frontend(
+		"ReplaySource.SlowmoBlendAlways",
+		lookup_hotkey_desc("SlowmoBlendAlwaysHotkey", "Replay: smooth slow motion always (all angles)"),
+		slowmo_mode_hotkey_cb, NULL);
 
 	g_ctrl.initialized = true;
 }
@@ -1181,6 +1312,9 @@ void replay_control_shutdown(void)
 	unregister_hotkey_slot(&g_ctrl.all_mark_in_hotkey);
 	unregister_hotkey_slot(&g_ctrl.all_mark_out_hotkey);
 	unregister_hotkey_slot(&g_ctrl.all_mark_reset_hotkey);
+	unregister_hotkey_slot(&g_ctrl.slowmo_off_hotkey);
+	unregister_hotkey_slot(&g_ctrl.slowmo_program_hotkey);
+	unregister_hotkey_slot(&g_ctrl.slowmo_always_hotkey);
 
 	g_ctrl.vendor = NULL;
 	_ph = NULL;
@@ -1200,6 +1334,7 @@ void replay_control_register_vendor(void)
 	obs_websocket_vendor_register_request(g_ctrl.vendor, "GetReplays", vendor_req_get_replays, NULL);
 	obs_websocket_vendor_register_request(g_ctrl.vendor, "Action", vendor_req_action, NULL);
 	obs_websocket_vendor_register_request(g_ctrl.vendor, "SetSpeed", vendor_req_set_speed, NULL);
+	obs_websocket_vendor_register_request(g_ctrl.vendor, "SetSlowmoBlend", vendor_req_set_slowmo_blend, NULL);
 	obs_websocket_vendor_register_request(g_ctrl.vendor, "LoadAll", vendor_req_load_all, NULL);
 	obs_websocket_vendor_register_request(g_ctrl.vendor, "SaveAll", vendor_req_save_all, NULL);
 	obs_websocket_vendor_register_request(g_ctrl.vendor, "MarkIn", vendor_req_mark_in, NULL);
@@ -1207,6 +1342,6 @@ void replay_control_register_vendor(void)
 	obs_websocket_vendor_register_request(g_ctrl.vendor, "MarkReset", vendor_req_mark_reset, NULL);
 
 	blog(LOG_INFO,
-	     "[Replay Source] Registered obs-websocket vendor '%s' (GetReplays, Action, SetSpeed, LoadAll, SaveAll, MarkIn, MarkOut, MarkReset)",
+	     "[Replay Source] Registered obs-websocket vendor '%s' (GetReplays, Action, SetSpeed, SetSlowmoBlend, LoadAll, SaveAll, MarkIn, MarkOut, MarkReset)",
 	     REPLAY_WS_VENDOR_NAME);
 }

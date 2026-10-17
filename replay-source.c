@@ -2625,12 +2625,13 @@ void replay_source_end_action(struct replay_source *context)
 }
 
 /* Crossfade blending costs a CPU blend plus an extra frame copy per output frame and source. Multiview and
- * studio-mode previews only make a source "showing"; blend only while it is active (program output), otherwise
- * slow motion repeats stored frames. Drops a pending blended frame when blending stops. */
+ * studio-mode previews only make a source "showing"; SLOWMO_BLEND_PROGRAM blends only while the source is active
+ * (program output), otherwise slow motion repeats stored frames. Drops a pending blended frame when blending stops. */
 static bool replay_blend_wanted(struct replay_source *c)
 {
-	const bool want = c->slowmo_blend == SLOWMO_BLEND_CROSSFADE && c->speed_percent < 100.0f &&
-			  obs_source_active(c->source);
+	const int mode = c->slowmo_blend;
+	const bool want = c->speed_percent < 100.0f &&
+			  (mode == SLOWMO_BLEND_ALWAYS || (mode == SLOWMO_BLEND_PROGRAM && obs_source_active(c->source)));
 	if (!want && c->blend_wanted && c->blend_worker)
 		replay_blend_worker_flush(c->blend_worker);
 	c->blend_wanted = want;
@@ -3210,7 +3211,8 @@ static obs_properties_t *replay_source_properties(void *data)
 							  obs_module_text("SlowmoBlend"),
 							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p_blend, obs_module_text("SlowmoBlend.Off"), SLOWMO_BLEND_OFF);
-	obs_property_list_add_int(p_blend, obs_module_text("SlowmoBlend.Crossfade"), SLOWMO_BLEND_CROSSFADE);
+	obs_property_list_add_int(p_blend, obs_module_text("SlowmoBlend.Program"), SLOWMO_BLEND_PROGRAM);
+	obs_property_list_add_int(p_blend, obs_module_text("SlowmoBlend.Always"), SLOWMO_BLEND_ALWAYS);
 
 	obs_properties_add_path(props, SETTING_DIRECTORY, obs_module_text("Directory"), OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_text(props, SETTING_FILE_FORMAT, obs_module_text("FilenameFormatting"), OBS_TEXT_DEFAULT);
@@ -3363,6 +3365,19 @@ struct obs_source_info replay_source_info = {
 	.media_set_time = replay_set_time,
 };
 
+void replay_source_set_slowmo_blend(struct replay_source *context, int mode)
+{
+	if (!context || mode < SLOWMO_BLEND_OFF || mode > SLOWMO_BLEND_ALWAYS)
+		return;
+	/* Read by the tick; replay_blend_wanted() flushes the worker on the next tick when blending stops. */
+	context->slowmo_blend = mode;
+	obs_data_t *settings = obs_source_get_settings(context->source);
+	if (settings) {
+		obs_data_set_int(settings, SETTING_SLOWMO_BLEND, mode);
+		obs_data_release(settings);
+	}
+}
+
 void replay_source_set_speed(struct replay_source *context, float speed_percent)
 {
 	if (!context)
@@ -3491,6 +3506,7 @@ bool replay_source_get_status(struct replay_source *context, struct replay_sourc
 	out->playing = context->play;
 	out->speed_percent = context->speed_percent;
 	out->backward = context->backward;
+	out->slowmo_blend = context->slowmo_blend;
 
 	if (out->loaded_replays > 0) {
 		compute_replay_window_ns(&context->current_replay, &out->effective_start_ns, &out->effective_end_ns,

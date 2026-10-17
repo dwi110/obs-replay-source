@@ -4,6 +4,8 @@
 #include <math.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <obs.h>
 #include <obs-module.h>
 #include <obs-nix-platform.h>
@@ -317,6 +319,7 @@ int main(int argc, char **argv)
 	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_UYVY.mkv");
 	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_Lossless.avi");
 	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_Gap.avi");
+	os_unlink("/tmp/replay-save-queue-test/test_clip - Cam_Slot.avi");
 
 	const uint64_t frame_count = 60;
 	const uint64_t interval_ns = 1000000000ULL / 60ULL;
@@ -494,6 +497,49 @@ int main(int argc, char **argv)
 		fprintf(stderr, "[test] Sparse input timestamps changed saved playback duration\n");
 		return 1;
 	}
+
+#ifndef _WIN32
+	/* Another OBS instance holds the PC-wide encoder slot: a new save must wait and start only after release. */
+	int other_instance = open(REPLAY_SAVE_SLOT_POSIX_PATH, O_RDWR | O_CREAT, 0666);
+	if (other_instance < 0 || flock(other_instance, LOCK_EX) != 0) {
+		fprintf(stderr, "[test] Cannot hold encoder slot '%s'\n", REPLAY_SAVE_SLOT_POSIX_PATH);
+		return 1;
+	}
+	struct obs_source_frame **slot_frames =
+		create_clip_video_frames(VIDEO_FORMAT_NV12, 640, 360, frame_count, start_ts, interval_ns);
+	struct replay_save_job_params slot_job = job3;
+	slot_job.source_name = "Cam_Slot";
+	slot_job.video_frames = slot_frames;
+	slot_job.audio_frames = NULL;
+	slot_job.audio_frame_count = 0;
+	if (!replay_save_queue_enqueue(&slot_job)) {
+		fprintf(stderr, "[test] Failed to enqueue slot job\n");
+		return 1;
+	}
+	for (uint64_t i = 0; i < frame_count; i++)
+		replay_frame_release(slot_frames[i]);
+	bfree(slot_frames);
+
+	os_sleep_ms(2000);
+	const char *state_while_held = replay_save_queue_state();
+	const uint64_t completed_while_held = replay_save_queue_completed_count();
+	printf("[test] Slot held by other instance: state=%s completed=%" PRIu64 "\n", state_while_held,
+	       completed_while_held);
+	if (strcmp(state_while_held, "waitingSlot") != 0 || completed_while_held != 4) {
+		fprintf(stderr, "[test] Save must wait while another instance holds the encoder slot\n");
+		return 1;
+	}
+	flock(other_instance, LOCK_UN);
+	close(other_instance);
+	if (!replay_save_queue_wait_idle(30000) || replay_save_queue_completed_count() != 5) {
+		fprintf(stderr, "[test] Save did not run after the encoder slot was released\n");
+		return 1;
+	}
+	if (!validate_with_ffprobe("/tmp/replay-save-queue-test/test_clip - Cam_Slot.avi", "utvideo", 60)) {
+		fprintf(stderr, "[test] Validation failed for slot-delayed clip\n");
+		return 1;
+	}
+#endif
 
 	obs_module_unload();
 	obs_shutdown();

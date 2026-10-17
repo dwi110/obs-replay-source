@@ -443,7 +443,7 @@ static int test_headless_integration(void)
 	obs_data_set_string(settings, SETTING_SOURCE, "Synthetic Cam");
 	obs_data_set_int(settings, SETTING_DURATION, 5000);
 	obs_data_set_double(settings, SETTING_SPEED, 25.0);
-	obs_data_set_int(settings, SETTING_SLOWMO_BLEND, SLOWMO_BLEND_CROSSFADE);
+	obs_data_set_int(settings, SETTING_SLOWMO_BLEND, SLOWMO_BLEND_PROGRAM);
 	obs_source_update(rs, settings);
 	obs_source_load(rs);
 	obs_data_release(settings);
@@ -477,6 +477,21 @@ static int test_headless_integration(void)
 	pthread_mutex_lock(&hd.lock);
 	CHECK(hd.count == 0, "Inactive (non-program) source must not blend, got %zu blended frames", hd.count);
 	pthread_mutex_unlock(&hd.lock);
+
+	/* "Always" blends without being on program (Multiview/preview), and the mode is stored in the settings */
+	replay_source_set_slowmo_blend(ctx, SLOWMO_BLEND_ALWAYS);
+	replay_source_restart_playback(ctx);
+	for (int k = 0; k < 6; k++) {
+		usleep(17000);
+	}
+	pthread_mutex_lock(&hd.lock);
+	CHECK(hd.count > 0, "SLOWMO_BLEND_ALWAYS must blend while inactive, got 0 blended frames");
+	pthread_mutex_unlock(&hd.lock);
+	obs_data_t *stored = obs_source_get_settings(rs);
+	CHECK(obs_data_get_int(stored, SETTING_SLOWMO_BLEND) == SLOWMO_BLEND_ALWAYS,
+	      "SetSlowmoBlend not stored in source settings");
+	obs_data_release(stored);
+	replay_source_set_slowmo_blend(ctx, SLOWMO_BLEND_PROGRAM);
 
 	/* On program (active): blending runs. Activation reaches the source on the next graphics tick. */
 	obs_source_inc_active(rs);

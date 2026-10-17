@@ -131,7 +131,10 @@ void replay_filter_check(void *data);
 #define SETTING_BACKWARD "backward"
 #define SETTING_SLOWMO_BLEND "slowmo_blend"
 #define SLOWMO_BLEND_OFF 0
-#define SLOWMO_BLEND_CROSSFADE 1
+/* Crossfade only while the replay source is active (program output, incl. transitions). */
+#define SLOWMO_BLEND_PROGRAM 1
+/* Crossfade wherever the replay plays, also Multiview/preview: one CPU blend per source and output frame. */
+#define SLOWMO_BLEND_ALWAYS 2
 #define SETTING_VISIBILITY_ACTION "visibility_action"
 #define SETTING_START_DELAY "start_delay"
 #define SETTING_FRAME_STEP_COUNT "frame_step_count"

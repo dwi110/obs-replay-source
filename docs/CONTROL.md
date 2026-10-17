@@ -64,6 +64,9 @@ Registered once at module load (`obs_hotkey_register_frontend`):
 | `ReplaySource.AllMarkIn` | `Replay: mark in (all angles)` / `Replay: Mark In (alle Winkel)` | Sets Mark In across all loaded angles using the absolute playhead timestamp of the reference camera (the replay source currently active in program if exactly one is active, otherwise the first playing/paused replay source with a loaded replay). Trims are clamped to each angle's aligned base window. |
 | `ReplaySource.AllMarkOut` | `Replay: mark out (all angles)` / `Replay: Mark Out (alle Winkel)` | Sets Mark Out across all loaded angles using the absolute playhead timestamp of the reference camera. Trims are clamped to each angle's aligned base window. |
 | `ReplaySource.AllMarkReset` | `Replay: reset marks (all angles)` / `Replay: Marken zurücksetzen (alle Winkel)` | Restores the aligned base window across all loaded angles (or start-delay behavior if unaligned), preventing angles from becoming misaligned after custom trims. |
+| `ReplaySource.SlowmoBlendOff` | `Replay: smooth slow motion off (all angles)` / `Replay: Zeitlupe glätten aus (alle Winkel)` | Sets `slowmo_blend` to off on all replay sources (stored in the scene collection). |
+| `ReplaySource.SlowmoBlendProgram` | `Replay: smooth slow motion only on program (all angles)` / `Replay: Zeitlupe glätten nur im Programm (alle Winkel)` | Sets `slowmo_blend` to "only on program" on all replay sources. |
+| `ReplaySource.SlowmoBlendAlways` | `Replay: smooth slow motion always (all angles)` / `Replay: Zeitlupe glätten immer (alle Winkel)` | Sets `slowmo_blend` to "always" on all replay sources. |
 
 ---
 
@@ -94,11 +97,13 @@ Returns status for all replay sources and the sequential save queue.
       "bufferedMs": 5000,
       "markInMs": 0,
       "markOutMs": 4850,
+      "slowmoBlend": "program"
     }
   ],
   "saveQueue": {
     "pending": 0,
-    "completed": 4
+    "completed": 4,
+    "state": "idle"
   }
 }
 ```
@@ -140,6 +145,23 @@ Sets arbitrary playback speed (`0.01`–`400.0`%) on one, several, or all replay
 {
   "ok": true,
   "speedPercent": 25.0,
+  "applied": [{ "name": "Replay Cam 1" }, { "name": "Replay Cam 2" }],
+  "unknown": [],
+  "appliedCount": 2,
+  "unknownCount": 0
+}
+```
+
+#### `SetSlowmoBlend`
+Sets the slow-motion blending mode (section 6) on one, several, or all replay sources; same `source`/`sources`
+targeting as `Action`. The mode is stored in the source settings.
+
+- **Request Data**: `{"mode": "off"}`, `{"mode": "program"}` or `{"mode": "always"}`
+- **Response Data**:
+```json
+{
+  "ok": true,
+  "mode": "program",
   "applied": [{ "name": "Replay Cam 1" }, { "name": "Replay Cam 2" }],
   "unknown": [],
   "appliedCount": 2,
@@ -247,7 +269,19 @@ Configured per replay source under settings:
 
 Each replay is auto-saved at most once (tracked via an internal replay flag). Manual saves (`Save`, `SaveAll`) always remain available.
 
-Saving still uses one global sequential queue. NVENC HEVC/H.264 uses OBS's raw `ffmpeg_output` with the bundled
+Saving uses one sequential queue per OBS process, and every save encodes in real time (a 12-s clip takes about 12 s).
+Two extra rules protect the live output, at the cost of a later file:
+- **Live first:** a save starts only when this OBS has shown no new lagged render frame and no skipped output frame for
+  0.5 s (2 s after a lag was seen); after 30 s of continuous lag it starts anyway.
+- **One save encoder per PC:** all OBS instances running this plugin share one encoder slot (Windows named mutex
+  `Local\ReplaySource.SaveEncoderSlot`, POSIX `flock` on `/tmp/obs-replay-source-save-encoder.lock`). A second instance
+  queues until the first finishes its current clip. The OS releases the slot if an OBS process exits or crashes.
+  Other plugins' encoders (main recording, streaming, other replay approaches) are not part of this slot.
+`GetReplays.saveQueue.state` reports `idle`, `waitingLive`, `waitingSlot` or `encoding`; the log line `Job start`
+reports `waited_live`/`waited_slot` and `Job end` the `total_time` from dequeue to file. Saved frames stay in RAM
+(shared with the loaded replay, no copy) until their job ends.
+
+NVENC HEVC/H.264 uses OBS's raw `ffmpeg_output` with the bundled
 FFmpeg `hevc_nvenc`/`h264_nvenc` encoders, not OBS's canvas-bound NVENC encoders. The latter crash with the private
 replay `video_t` on OBS 31.1+ (`cuda_surface_init` calls `obs_encoder_video_tex_active` without a core video mix).
 If a backend cannot start, the next plan is tried before feeding the clip: HEVC NVENC → H.264 NVENC → x264;
@@ -276,11 +310,14 @@ new name on its buttons.
 ### Triggering Actions ("Custom - Send Vendor Request")
 Add an OBS action **"Custom - Send Vendor Request"**:
 - **Vendor Name**: `ReplaySource`
-- **Request Type**: `LoadAll` / `SaveAll` / `SetSpeed` / `Action` / `GetReplays`
+- **Request Type**: `LoadAll` / `SaveAll` / `SetSpeed` / `SetSlowmoBlend` / `Action` / `GetReplays`
 - **Request Data**:
   - Load all angles aligned: `{}`
   - Set all angles to 25% slow-motion: `{"speedPercent": 25}`
   - Pause a single angle: `{"source": "Replay Cam 1", "action": "Pause"}`
+  - Smooth slow motion switched by buttons: `SetSlowmoBlend` `{"mode": "program"}` / `{"mode": "off"}`. In
+    `program` mode the angle on program blends and Multiview/preview angles do not, so taking a replay scene live
+    and leaving it needs no extra action. Avoid `always` with many replay sources in the Multiview (section 6).
 
 ### Button Feedback ("Custom - Vendor Event")
 Add an OBS feedback **"Custom - Vendor Event"**:
@@ -297,13 +334,14 @@ Example: button "Saving Cam 1" active while the latest event is `SaveStarted` wi
 ## 6. Slow-Motion Blending (Crossfade)
 
 ### Setting: `slowmo_blend`
-- **Type**: `int` (property dropdown on the replay source)
+- **Type**: `int` (property dropdown on the replay source; also `SetSlowmoBlend` and the `ReplaySource.SlowmoBlend*` hotkeys)
 - **Values**:
   - `0` (`SLOWMO_BLEND_OFF`): Off (default, original behavior). Each stored frame is output once with a stretched timestamp, resulting in step-stutter at low speeds (e.g., each frame held for 4 output frames at 25%).
-  - `1` (`SLOWMO_BLEND_CROSSFADE`): Smooth slow-motion via crossfade blending.
+  - `1` (`SLOWMO_BLEND_PROGRAM`): Crossfade only while the replay source is active (program output, incl. transitions).
+  - `2` (`SLOWMO_BLEND_ALWAYS`): Crossfade wherever the replay plays, including Multiview and studio-mode preview.
 - **UI Labels**:
-  - en-US: `Smooth Slow Motion` ("Off" / "Crossfade (motion blur instead of stutter)")
-  - de-DE: `Zeitlupe glätten` ("Aus" / "Überblenden (Bewegungsunschärfe statt Ruckeln)")
+  - en-US: `Smooth Slow Motion` ("Off" / "Crossfade only on program" / "Crossfade always (also Multiview/preview, high CPU load)")
+  - de-DE: `Zeitlupe glätten` ("Aus" / "Überblenden nur im Programm" / "Überblenden immer (auch Multiview/Vorschau, hohe CPU-Last)")
 
 ### Behavior
 - When enabled and playback speed is < 100% (both forward and backward), intermediate frames are synthesized between consecutive source frames $A$ and $B$ at the OBS output frame interval.
@@ -311,11 +349,11 @@ Example: button "Saving Cam 1" active while the latest event is `SaveStarted` wi
 - Blending formula: per-plane 8-bit weighted average $\mathrm{out} = (A \cdot (256 - w8) + B \cdot w8 + 128) \gg 8$, implemented in SIMD (SSE2) with a bit-identical scalar fallback for NV12, UYVY, and I420.
 - Offloaded to a dedicated per-source worker thread without blocking the OBS graphics thread.
 - At $\ge 100\%$ speed, paused playback, or single-frame stepping, blending is bypassed and original behavior is retained.
-- Blending runs only while the replay source is **active** (part of the program output, including transitions).
-  A source that is only showing in the Multiview or the studio-mode preview plays slow motion with repeated stored
-  frames. Reason: each blending source costs a CPU blend and an extra frame copy per output frame; with seven
-  blending replays in the Multiview (Windows, 2026-10-16) NDI frames of all cameras reached OBS up to 1.9 s late and
-  OBS CPU rose from 6.0 % to 14.5 %; blending only the program angle removed that.
+- "Only on program": a source that is only showing in the Multiview or the studio-mode preview plays slow motion with
+  repeated stored frames. Reason: each blending source costs a CPU blend and an extra frame copy per output frame;
+  with seven blending replays in the Multiview (Windows, 2026-10-16) NDI frames of all cameras reached OBS up to
+  1.9 s late and OBS CPU rose from 6.0 % to 14.5 %; blending only the program angle removed that. "Always" restores
+  that load and is meant for setups with few replay sources.
 - Clear, Remove, new replay load, restart, direction change, or speed change immediately flushes pending worker frames to guarantee strict monotonic timestamps and avoid stale frames.
 
 ### Motion Quality & Limitations (Ghosting)
