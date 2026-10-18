@@ -954,6 +954,27 @@ static void handle_mark_reset(obs_data_t *response)
 	obs_data_set_int(response, "markInMs", (long long)mark_in);
 	obs_data_set_int(response, "markOutMs", (long long)mark_out);
 }
+/* MSVC has no strtok_r. Comma-only split with the same save-pointer contract. */
+static char *split_comma(char *s, char **save)
+{
+	if (!s)
+		s = *save;
+	if (!s)
+		return NULL;
+	while (*s == ',')
+		s++;
+	if (!*s)
+		return NULL;
+	char *end = strchr(s, ',');
+	if (end) {
+		*end = '\0';
+		*save = end + 1;
+	} else {
+		*save = s + strlen(s);
+	}
+	return s;
+}
+
 static bool valid_tag(const char *tag)
 {
 	const size_t len = strlen(tag);
@@ -979,7 +1000,7 @@ static bool normalize_tags(const char *raw, char *out, size_t out_size)
 	buf[sizeof buf - 1] = '\0';
 	out[0] = '\0';
 	char *saveptr = NULL;
-	for (char *tok = strtok_r(buf, ",", &saveptr); tok; tok = strtok_r(NULL, ",", &saveptr)) {
+	for (char *tok = split_comma(buf, &saveptr); tok; tok = split_comma(NULL, &saveptr)) {
 		while (*tok == ' ')
 			tok++;
 		if (!valid_tag(tok))
@@ -999,7 +1020,7 @@ static void union_tags(char *dst, size_t dst_size, const char *add)
 	strncpy(buf, add, sizeof buf - 1);
 	buf[sizeof buf - 1] = '\0';
 	char *saveptr = NULL;
-	for (char *tok = strtok_r(buf, ",", &saveptr); tok; tok = strtok_r(NULL, ",", &saveptr)) {
+	for (char *tok = split_comma(buf, &saveptr); tok; tok = split_comma(NULL, &saveptr)) {
 		char wrapped[64];
 		snprintf(wrapped, sizeof wrapped, ",%s,", tok);
 		char haystack[300];
