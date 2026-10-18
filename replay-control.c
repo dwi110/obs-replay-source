@@ -788,121 +788,6 @@ static void vendor_req_get_replays(obs_data_t *request_data, obs_data_t *respons
 	obs_data_release(sq);
 }
 
-static void vendor_req_action(obs_data_t *request_data, obs_data_t *response_data, void *priv_data)
-{
-	UNUSED_PARAMETER(priv_data);
-	if (!response_data)
-		return;
-
-	const char *action = request_data ? obs_data_get_string(request_data, "action") : NULL;
-	if (!action || !*action || !replay_source_execute_action(NULL, action, false)) {
-		obs_data_set_bool(response_data, "ok", false);
-		obs_data_set_string(response_data, "error", "Unknown or missing action");
-		return;
-	}
-
-	string_list_t filter_names;
-	da_init(filter_names);
-	bool has_filter = false;
-	if (!extract_target_names(request_data, &filter_names, &has_filter)) {
-		free_string_darray(&filter_names);
-		set_invalid_sources_error(response_data);
-		return;
-	}
-
-	obs_data_array_t *applied_arr = obs_data_array_create();
-	obs_data_array_t *unknown_arr = obs_data_array_create();
-	size_t unknown_count = 0;
-
-	source_list_t sources;
-	da_init(sources);
-	resolve_target_sources((const char *const *)filter_names.array, filter_names.num, has_filter, &sources,
-			       unknown_arr, &unknown_count);
-
-	size_t applied_count = 0;
-	for (size_t i = 0; i < sources.num; i++) {
-		obs_source_t *s = sources.array[i];
-		struct replay_source *ctx = obs_obj_get_data(s);
-		if (ctx && replay_source_execute_action(ctx, action, false)) {
-			push_name_obj(applied_arr, obs_source_get_name(s));
-			applied_count++;
-		}
-		obs_source_release(s);
-	}
-	da_free(sources);
-	free_string_darray(&filter_names);
-
-	obs_data_set_bool(response_data, "ok", true);
-	obs_data_set_string(response_data, "action", action);
-	obs_data_set_array(response_data, "applied", applied_arr);
-	obs_data_set_array(response_data, "unknown", unknown_arr);
-	obs_data_set_int(response_data, "appliedCount", (long long)applied_count);
-	obs_data_set_int(response_data, "unknownCount", (long long)unknown_count);
-	obs_data_array_release(applied_arr);
-	obs_data_array_release(unknown_arr);
-}
-
-static void vendor_req_set_speed(obs_data_t *request_data, obs_data_t *response_data, void *priv_data)
-{
-	UNUSED_PARAMETER(priv_data);
-	if (!response_data)
-		return;
-
-	if (!request_data || !obs_data_has_user_value(request_data, "speedPercent")) {
-		obs_data_set_bool(response_data, "ok", false);
-		obs_data_set_string(response_data, "error", "Missing speedPercent");
-		return;
-	}
-
-	const double speed = obs_data_get_double(request_data, "speedPercent");
-	if (speed < (double)SETTING_SPEED_MIN || speed > (double)SETTING_SPEED_MAX) {
-		obs_data_set_bool(response_data, "ok", false);
-		obs_data_set_string(response_data, "error", "speedPercent out of range");
-		return;
-	}
-
-	string_list_t filter_names;
-	da_init(filter_names);
-	bool has_filter = false;
-	if (!extract_target_names(request_data, &filter_names, &has_filter)) {
-		free_string_darray(&filter_names);
-		set_invalid_sources_error(response_data);
-		return;
-	}
-
-	obs_data_array_t *applied_arr = obs_data_array_create();
-	obs_data_array_t *unknown_arr = obs_data_array_create();
-	size_t unknown_count = 0;
-
-	source_list_t sources;
-	da_init(sources);
-	resolve_target_sources((const char *const *)filter_names.array, filter_names.num, has_filter, &sources,
-			       unknown_arr, &unknown_count);
-
-	size_t applied_count = 0;
-	for (size_t i = 0; i < sources.num; i++) {
-		obs_source_t *s = sources.array[i];
-		struct replay_source *ctx = obs_obj_get_data(s);
-		if (ctx) {
-			replay_source_set_speed(ctx, (float)speed);
-			push_name_obj(applied_arr, obs_source_get_name(s));
-			applied_count++;
-		}
-		obs_source_release(s);
-	}
-	da_free(sources);
-	free_string_darray(&filter_names);
-
-	obs_data_set_bool(response_data, "ok", true);
-	obs_data_set_double(response_data, "speedPercent", speed);
-	obs_data_set_array(response_data, "applied", applied_arr);
-	obs_data_set_array(response_data, "unknown", unknown_arr);
-	obs_data_set_int(response_data, "appliedCount", (long long)applied_count);
-	obs_data_set_int(response_data, "unknownCount", (long long)unknown_count);
-	obs_data_array_release(applied_arr);
-	obs_data_array_release(unknown_arr);
-}
-
 static void vendor_req_set_slowmo_blend(obs_data_t *request_data, obs_data_t *response_data, void *priv_data)
 {
 	UNUSED_PARAMETER(priv_data);
@@ -958,262 +843,6 @@ static void vendor_req_set_slowmo_blend(obs_data_t *request_data, obs_data_t *re
 	obs_data_array_release(unknown_arr);
 }
 
-static void vendor_req_load_all(obs_data_t *request_data, obs_data_t *response_data, void *priv_data)
-{
-	UNUSED_PARAMETER(priv_data);
-	if (!response_data)
-		return;
-
-	string_list_t filter_names;
-	da_init(filter_names);
-	bool has_filter = false;
-	if (!extract_target_names(request_data, &filter_names, &has_filter)) {
-		free_string_darray(&filter_names);
-		set_invalid_sources_error(response_data);
-		return;
-	}
-
-	replay_control_load_all_internal((const char *const *)filter_names.array, filter_names.num, has_filter,
-					 response_data);
-	free_string_darray(&filter_names);
-}
-
-static void vendor_req_save_all(obs_data_t *request_data, obs_data_t *response_data, void *priv_data)
-{
-	UNUSED_PARAMETER(request_data);
-	UNUSED_PARAMETER(priv_data);
-	if (!response_data)
-		return;
-
-	const size_t queued = replay_save_all_loaded_replays();
-	obs_data_set_bool(response_data, "ok", true);
-	obs_data_set_int(response_data, "queued", (long long)queued);
-}
-static void vendor_req_mark_in(obs_data_t *request_data, obs_data_t *response_data, void *priv_data)
-{
-	UNUSED_PARAMETER(priv_data);
-	if (!response_data)
-		return;
-
-	string_list_t filter_names;
-	da_init(filter_names);
-	bool has_filter = false;
-	if (!extract_target_names(request_data, &filter_names, &has_filter)) {
-		free_string_darray(&filter_names);
-		set_invalid_sources_error(response_data);
-		return;
-	}
-
-	obs_data_array_t *applied_arr = obs_data_array_create();
-	obs_data_array_t *sources_arr = obs_data_array_create();
-	obs_data_array_t *unknown_arr = obs_data_array_create();
-	size_t unknown_count = 0;
-
-	source_list_t targets;
-	da_init(targets);
-	resolve_target_sources((const char *const *)filter_names.array, filter_names.num, has_filter, &targets,
-			       unknown_arr, &unknown_count);
-
-	source_list_t all_sources;
-	da_init(all_sources);
-	obs_enum_sources(enum_replay_sources_cb, &all_sources);
-
-	const char *preferred = (has_filter && filter_names.num == 1) ? filter_names.array[0] : NULL;
-	obs_source_t *ref = find_reference_source(&all_sources, preferred);
-	uint64_t ref_ts = 0;
-	bool got_ts = false;
-	if (ref) {
-		struct replay_source *ref_ctx = obs_obj_get_data(ref);
-		if (ref_ctx && replay_source_get_current_playback_time(ref_ctx, &ref_ts))
-			got_ts = true;
-	}
-
-	size_t applied_count = 0;
-	if (got_ts) {
-		for (size_t i = 0; i < targets.num; i++) {
-			obs_source_t *s = targets.array[i];
-			struct replay_source *ctx = obs_obj_get_data(s);
-			if (ctx && replay_source_set_mark_in(ctx, ref_ts)) {
-				int64_t in_ms = 0, out_ms = 0, dur_ms = 0;
-				replay_source_get_marks_ms(ctx, &in_ms, &out_ms, &dur_ms);
-				obs_data_t *item = obs_data_create();
-				obs_data_set_string(item, "name", obs_source_get_name(s));
-				obs_data_set_int(item, "inMs", (long long)in_ms);
-				obs_data_set_int(item, "outMs", (long long)out_ms);
-				obs_data_set_int(item, "durationMs", (long long)dur_ms);
-				obs_data_array_push_back(sources_arr, item);
-				obs_data_release(item);
-
-				push_name_obj(applied_arr, obs_source_get_name(s));
-				applied_count++;
-			}
-		}
-	}
-
-	for (size_t i = 0; i < targets.num; i++)
-		obs_source_release(targets.array[i]);
-	da_free(targets);
-	for (size_t i = 0; i < all_sources.num; i++)
-		obs_source_release(all_sources.array[i]);
-	da_free(all_sources);
-	free_string_darray(&filter_names);
-
-	obs_data_set_bool(response_data, "ok", true);
-	obs_data_set_array(response_data, "sources", sources_arr);
-	obs_data_set_array(response_data, "replays", sources_arr);
-	obs_data_set_array(response_data, "applied", applied_arr);
-	obs_data_set_array(response_data, "unknown", unknown_arr);
-	obs_data_set_int(response_data, "appliedCount", (long long)applied_count);
-	obs_data_set_int(response_data, "unknownCount", (long long)unknown_count);
-	obs_data_array_release(sources_arr);
-	obs_data_array_release(applied_arr);
-	obs_data_array_release(unknown_arr);
-}
-
-static void vendor_req_mark_out(obs_data_t *request_data, obs_data_t *response_data, void *priv_data)
-{
-	UNUSED_PARAMETER(priv_data);
-	if (!response_data)
-		return;
-
-	string_list_t filter_names;
-	da_init(filter_names);
-	bool has_filter = false;
-	if (!extract_target_names(request_data, &filter_names, &has_filter)) {
-		free_string_darray(&filter_names);
-		set_invalid_sources_error(response_data);
-		return;
-	}
-
-	obs_data_array_t *applied_arr = obs_data_array_create();
-	obs_data_array_t *sources_arr = obs_data_array_create();
-	obs_data_array_t *unknown_arr = obs_data_array_create();
-	size_t unknown_count = 0;
-
-	source_list_t targets;
-	da_init(targets);
-	resolve_target_sources((const char *const *)filter_names.array, filter_names.num, has_filter, &targets,
-			       unknown_arr, &unknown_count);
-
-	source_list_t all_sources;
-	da_init(all_sources);
-	obs_enum_sources(enum_replay_sources_cb, &all_sources);
-
-	const char *preferred = (has_filter && filter_names.num == 1) ? filter_names.array[0] : NULL;
-	obs_source_t *ref = find_reference_source(&all_sources, preferred);
-	uint64_t ref_ts = 0;
-	bool got_ts = false;
-	if (ref) {
-		struct replay_source *ref_ctx = obs_obj_get_data(ref);
-		if (ref_ctx && replay_source_get_current_playback_time(ref_ctx, &ref_ts))
-			got_ts = true;
-	}
-
-	size_t applied_count = 0;
-	if (got_ts) {
-		for (size_t i = 0; i < targets.num; i++) {
-			obs_source_t *s = targets.array[i];
-			struct replay_source *ctx = obs_obj_get_data(s);
-			if (ctx && replay_source_set_mark_out(ctx, ref_ts)) {
-				int64_t in_ms = 0, out_ms = 0, dur_ms = 0;
-				replay_source_get_marks_ms(ctx, &in_ms, &out_ms, &dur_ms);
-				obs_data_t *item = obs_data_create();
-				obs_data_set_string(item, "name", obs_source_get_name(s));
-				obs_data_set_int(item, "inMs", (long long)in_ms);
-				obs_data_set_int(item, "outMs", (long long)out_ms);
-				obs_data_set_int(item, "durationMs", (long long)dur_ms);
-				obs_data_array_push_back(sources_arr, item);
-				obs_data_release(item);
-
-				push_name_obj(applied_arr, obs_source_get_name(s));
-				applied_count++;
-			}
-		}
-	}
-
-	for (size_t i = 0; i < targets.num; i++)
-		obs_source_release(targets.array[i]);
-	da_free(targets);
-	for (size_t i = 0; i < all_sources.num; i++)
-		obs_source_release(all_sources.array[i]);
-	da_free(all_sources);
-	free_string_darray(&filter_names);
-
-	obs_data_set_bool(response_data, "ok", true);
-	obs_data_set_array(response_data, "sources", sources_arr);
-	obs_data_set_array(response_data, "replays", sources_arr);
-	obs_data_set_array(response_data, "applied", applied_arr);
-	obs_data_set_array(response_data, "unknown", unknown_arr);
-	obs_data_set_int(response_data, "appliedCount", (long long)applied_count);
-	obs_data_set_int(response_data, "unknownCount", (long long)unknown_count);
-	obs_data_array_release(sources_arr);
-	obs_data_array_release(applied_arr);
-	obs_data_array_release(unknown_arr);
-}
-
-static void vendor_req_mark_reset(obs_data_t *request_data, obs_data_t *response_data, void *priv_data)
-{
-	UNUSED_PARAMETER(priv_data);
-	if (!response_data)
-		return;
-
-	string_list_t filter_names;
-	da_init(filter_names);
-	bool has_filter = false;
-	if (!extract_target_names(request_data, &filter_names, &has_filter)) {
-		free_string_darray(&filter_names);
-		set_invalid_sources_error(response_data);
-		return;
-	}
-
-	obs_data_array_t *applied_arr = obs_data_array_create();
-	obs_data_array_t *sources_arr = obs_data_array_create();
-	obs_data_array_t *unknown_arr = obs_data_array_create();
-	size_t unknown_count = 0;
-
-	source_list_t targets;
-	da_init(targets);
-	resolve_target_sources((const char *const *)filter_names.array, filter_names.num, has_filter, &targets,
-			       unknown_arr, &unknown_count);
-
-	size_t applied_count = 0;
-	for (size_t i = 0; i < targets.num; i++) {
-		obs_source_t *s = targets.array[i];
-		struct replay_source *ctx = obs_obj_get_data(s);
-		if (ctx) {
-			replay_source_mark_reset(ctx);
-			int64_t in_ms = 0, out_ms = 0, dur_ms = 0;
-			replay_source_get_marks_ms(ctx, &in_ms, &out_ms, &dur_ms);
-			obs_data_t *item = obs_data_create();
-			obs_data_set_string(item, "name", obs_source_get_name(s));
-			obs_data_set_int(item, "inMs", (long long)in_ms);
-			obs_data_set_int(item, "outMs", (long long)out_ms);
-			obs_data_set_int(item, "durationMs", (long long)dur_ms);
-			obs_data_array_push_back(sources_arr, item);
-			obs_data_release(item);
-
-			push_name_obj(applied_arr, obs_source_get_name(s));
-			applied_count++;
-		}
-	}
-
-	for (size_t i = 0; i < targets.num; i++)
-		obs_source_release(targets.array[i]);
-	da_free(targets);
-	free_string_darray(&filter_names);
-
-	obs_data_set_bool(response_data, "ok", true);
-	obs_data_set_array(response_data, "sources", sources_arr);
-	obs_data_set_array(response_data, "replays", sources_arr);
-	obs_data_set_array(response_data, "applied", applied_arr);
-	obs_data_set_array(response_data, "unknown", unknown_arr);
-	obs_data_set_int(response_data, "appliedCount", (long long)applied_count);
-	obs_data_set_int(response_data, "unknownCount", (long long)unknown_count);
-	obs_data_array_release(sources_arr);
-	obs_data_array_release(applied_arr);
-	obs_data_array_release(unknown_arr);
-}
-
 
 /* ==================== VENDOR EVENTS ==================== */
 
@@ -1228,8 +857,17 @@ void replay_control_emit_replay_loaded(const char *source_name, int64_t duration
 	obs_data_release(ev);
 }
 
+static void (*g_save_hook)(const char *trigger, const char *path, bool started, bool ok);
+
+void replay_control_set_save_hook(void (*hook)(const char *trigger, const char *path, bool started, bool ok))
+{
+	g_save_hook = hook;
+}
+
 void replay_control_emit_save_started(const char *source_name, const char *path, const char *trigger)
 {
+	if (g_save_hook)
+		g_save_hook(trigger, path, true, true);
 	if (!g_ctrl.vendor)
 		return;
 	obs_data_t *ev = obs_data_create();
@@ -1242,6 +880,8 @@ void replay_control_emit_save_started(const char *source_name, const char *path,
 
 void replay_control_emit_save_finished(const char *source_name, const char *path, bool ok)
 {
+	if (g_save_hook)
+		g_save_hook(NULL, path, false, ok);
 	if (!g_ctrl.vendor)
 		return;
 	obs_data_t *ev = obs_data_create();
@@ -1261,36 +901,8 @@ void replay_control_init(void)
 	if (g_ctrl.initialized)
 		return;
 
-	g_ctrl.load_all_hotkey = obs_hotkey_register_frontend(
-		"ReplaySource.LoadAll", lookup_hotkey_desc("LoadAllReplays", "Replay: load all angles"),
-		load_all_hotkey_cb, NULL);
-	g_ctrl.all_normal_speed_hotkey = obs_hotkey_register_frontend(
-		"ReplaySource.AllNormalSpeed",
-		lookup_hotkey_desc("AllNormalSpeed", "Replay: all angles normal speed (100%)"),
-		all_normal_speed_hotkey_cb, NULL);
-	g_ctrl.all_half_speed_hotkey = obs_hotkey_register_frontend(
-		"ReplaySource.AllHalfSpeed",
-		lookup_hotkey_desc("AllHalfSpeed", "Replay: all angles half speed (50%)"), all_half_speed_hotkey_cb,
-		NULL);
-	g_ctrl.all_quarter_speed_hotkey = obs_hotkey_register_frontend(
-		"ReplaySource.AllQuarterSpeed",
-		lookup_hotkey_desc("AllQuarterSpeed", "Replay: all angles quarter speed (25%)"),
-		all_quarter_speed_hotkey_cb, NULL);
-	g_ctrl.all_restart_hotkey = obs_hotkey_register_frontend(
-		"ReplaySource.AllRestart", lookup_hotkey_desc("AllRestart", "Replay: restart all angles"),
-		all_restart_hotkey_cb, NULL);
-	g_ctrl.all_pause_hotkey = obs_hotkey_register_frontend(
-		"ReplaySource.AllPause", lookup_hotkey_desc("AllPause", "Replay: pause/play all angles"),
-		all_pause_hotkey_cb, NULL);
-	g_ctrl.all_mark_in_hotkey = obs_hotkey_register_frontend(
-		"ReplaySource.AllMarkIn", lookup_hotkey_desc("AllMarkIn", "Replay: mark in (all angles)"),
-		all_mark_in_hotkey_cb, NULL);
-	g_ctrl.all_mark_out_hotkey = obs_hotkey_register_frontend(
-		"ReplaySource.AllMarkOut", lookup_hotkey_desc("AllMarkOut", "Replay: mark out (all angles)"),
-		all_mark_out_hotkey_cb, NULL);
-	g_ctrl.all_mark_reset_hotkey = obs_hotkey_register_frontend(
-		"ReplaySource.AllMarkReset", lookup_hotkey_desc("AllMarkReset", "Replay: reset marks (all angles)"),
-		all_mark_reset_hotkey_cb, NULL);
+	/* Contract actions (trigger, transport, marks, save) are registered by the MulticamReplay vendor.
+	 * Only approach-specific extras stay under ReplaySource. */
 	g_ctrl.slowmo_off_hotkey = obs_hotkey_register_frontend(
 		"ReplaySource.SlowmoBlendOff",
 		lookup_hotkey_desc("SlowmoBlendOffHotkey", "Replay: smooth slow motion off (all angles)"),
@@ -1347,16 +959,8 @@ void replay_control_register_vendor(void)
 	}
 
 	obs_websocket_vendor_register_request(g_ctrl.vendor, "GetReplays", vendor_req_get_replays, NULL);
-	obs_websocket_vendor_register_request(g_ctrl.vendor, "Action", vendor_req_action, NULL);
-	obs_websocket_vendor_register_request(g_ctrl.vendor, "SetSpeed", vendor_req_set_speed, NULL);
 	obs_websocket_vendor_register_request(g_ctrl.vendor, "SetSlowmoBlend", vendor_req_set_slowmo_blend, NULL);
-	obs_websocket_vendor_register_request(g_ctrl.vendor, "LoadAll", vendor_req_load_all, NULL);
-	obs_websocket_vendor_register_request(g_ctrl.vendor, "SaveAll", vendor_req_save_all, NULL);
-	obs_websocket_vendor_register_request(g_ctrl.vendor, "MarkIn", vendor_req_mark_in, NULL);
-	obs_websocket_vendor_register_request(g_ctrl.vendor, "MarkOut", vendor_req_mark_out, NULL);
-	obs_websocket_vendor_register_request(g_ctrl.vendor, "MarkReset", vendor_req_mark_reset, NULL);
 
-	blog(LOG_INFO,
-	     "[Replay Source] Registered obs-websocket vendor '%s' (GetReplays, Action, SetSpeed, SetSlowmoBlend, LoadAll, SaveAll, MarkIn, MarkOut, MarkReset)",
+	blog(LOG_INFO, "[Replay Source] Registered obs-websocket vendor '%s' (GetReplays, SetSlowmoBlend)",
 	     REPLAY_WS_VENDOR_NAME);
 }

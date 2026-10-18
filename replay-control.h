@@ -10,6 +10,7 @@ extern "C" {
 #define REPLAY_WS_VENDOR_NAME "ReplaySource"
 
 struct replay_source;
+struct replay;
 
 struct replay_source_status {
 	const char *name;
@@ -48,6 +49,8 @@ void replay_control_all_mark_reset(void);
 void replay_control_emit_replay_loaded(const char *source_name, int64_t duration_ms);
 void replay_control_emit_save_started(const char *source_name, const char *path, const char *trigger);
 void replay_control_emit_save_finished(const char *source_name, const char *path, bool ok);
+/* Optional hook so the contract layer learns about save jobs. trigger carries the contract job id. */
+void replay_control_set_save_hook(void (*hook)(const char *trigger, const char *path, bool started, bool ok));
 
 /* Per-source hooks implemented in replay-source.c */
 bool replay_source_execute_action(struct replay_source *context, const char *action, bool from_update);
@@ -76,6 +79,33 @@ void replay_source_get_marks_ms(struct replay_source *context, int64_t *in_ms_ou
 				int64_t *dur_ms_out);
 void replay_source_auto_save_loaded(struct replay_source *context, const char *trigger);
 void replay_source_test_set_playback_pos(struct replay_source *context, uint64_t pause_ts, uint64_t start_ts);
+
+/* ---- Channel primitives (MulticamReplay contract, one clip across every replay source) ---- */
+void replay_source_set_channel(struct replay_source *context, bool member, bool loop);
+/* Copies the capture filter's buffer bounds without consuming them. Returns false if the source has no video buffer. */
+bool replay_source_peek_capture(struct replay_source *context, uint64_t *first_ts_out, uint64_t *last_ts_out,
+				uint64_t *last_arrival_ns_out, uint64_t *late_ns_out);
+bool replay_source_install_replay(struct replay_source *context, const struct replay *replay);
+/* Builds a replay from decoded frames (addref'd) and installs it. */
+bool replay_source_install_decoded(struct replay_source *context, struct obs_source_frame **frames, uint64_t frame_count,
+				   struct obs_audio_data *audio, uint64_t audio_count, const struct audio_convert_info *oai,
+				   uint64_t first_ts, uint64_t last_ts, uint64_t duration);
+/* Position on the clip axis (0 = first frame of the loaded replay, marks clamp the caller). Paused seeks emit the
+ * frame once. */
+bool replay_source_seek_ns(struct replay_source *context, uint64_t offset_ns);
+void replay_source_set_playing(struct replay_source *context, bool playing);
+void replay_source_set_backward(struct replay_source *context, bool backward);
+void replay_source_channel_step(struct replay_source *context, int64_t delta_ns);
+bool replay_source_channel_status(struct replay_source *context, bool *playing_out, bool *ended_out, bool *backward_out,
+				  uint64_t *abs_ts_out, float *speed_out, uint64_t *first_ts_out,
+				  uint64_t *duration_ns_out);
+/* Returns an addref'd copy of the loaded replay's audio. Caller owns the array and each packet. */
+bool replay_source_copy_replay_audio(struct replay_source *context, struct obs_audio_data **packets_out,
+				     uint64_t *count_out, struct audio_convert_info *oai_out);
+void replay_source_set_replay_audio(struct replay_source *context, struct obs_audio_data *packets, uint64_t count,
+				    const struct audio_convert_info *oai);
+void replay_source_clear_replays(struct replay_source *context);
+const char *replay_source_directory(struct replay_source *context);
 
 #ifdef __cplusplus
 }

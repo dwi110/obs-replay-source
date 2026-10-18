@@ -124,7 +124,45 @@ if(UNIX AND NOT APPLE)
 endif()
 add_test(NAME replay_blend COMMAND test-blend)
 
+add_executable(test-audio-capture
+	test-audio-capture.c
+	../replay.c
+	../replay-pool.c
+	../replay-convert.c
+	../replay-audio-capture.c)
+target_include_directories(test-audio-capture PRIVATE ${REPLAY_TEST_COMMON_INCLUDES})
+target_link_libraries(test-audio-capture PRIVATE OBS::libobs)
+if(UNIX AND NOT APPLE)
+	target_link_libraries(test-audio-capture PRIVATE m)
+endif()
+add_test(NAME replay_audio_capture COMMAND test-audio-capture)
+
+add_executable(test-decode
+	test-decode.c
+	../replay.c
+	../replay-pool.c
+	../replay-convert.c
+	../replay-decode.c)
+target_include_directories(test-decode PRIVATE ${REPLAY_TEST_COMMON_INCLUDES})
+target_link_libraries(test-decode PRIVATE OBS::libobs)
+if(UNIX AND NOT APPLE)
+	target_link_libraries(test-decode PRIVATE m)
+endif()
+replay_enable_fast_save(test-decode)
+add_test(NAME replay_decode COMMAND test-decode)
+
+
+add_executable(test-library
+	test-library.c
+	../replay-library.c)
+target_include_directories(test-library PRIVATE ${REPLAY_TEST_COMMON_INCLUDES})
+target_link_libraries(test-library PRIVATE OBS::libobs)
+if(UNIX AND NOT APPLE)
+	target_link_libraries(test-library PRIVATE m)
+endif()
+add_test(NAME replay_library COMMAND test-library)
 foreach(t test-save-queue test-control test-tap-hidden test-blend)
-	target_sources(${t} PRIVATE ../replay-save-fast.c)
+	target_sources(${t} PRIVATE ../replay-save-fast.c ../replay-contract.c ../replay-library.c ../replay-decode.c
+				    ../replay-audio-capture.c)
 	replay_enable_fast_save(${t})
 endforeach()

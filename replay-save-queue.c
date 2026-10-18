@@ -1281,11 +1281,6 @@ void replay_save_queue_init(void)
 		g_queue.worker_running = false;
 	}
 
-	const char *hotkey_desc = obs_module_text("SaveAllReplays");
-	if (!hotkey_desc || !*hotkey_desc || strcmp(hotkey_desc, "SaveAllReplays") == 0)
-		hotkey_desc = "Replay: save all loaded replays";
-	g_queue.save_all_hotkey =
-		obs_hotkey_register_frontend("ReplaySource.SaveAll", hotkey_desc, save_all_replays_hotkey, NULL);
 
 	g_queue.initialized = true;
 }
