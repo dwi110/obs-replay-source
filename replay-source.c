@@ -65,6 +65,8 @@ struct replay_source {
 	char *source_name;
 	char *source_audio_name;
 	float speed_percent;
+	/* Last SETTING_SPEED applied; runtime speed (SetSpeed, hotkeys) survives updates that leave it unchanged. */
+	float stored_speed;
 	bool backward;
 	bool backward_start;
 	int slowmo_blend;
@@ -710,7 +712,7 @@ static void replay_source_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, SETTING_END_ACTION, END_ACTION_LOOP);
 	obs_data_set_default_bool(settings, SETTING_BACKWARD, false);
 	obs_data_set_default_int(settings, SETTING_SLOWMO_BLEND, SLOWMO_BLEND_OFF);
-	obs_data_set_default_bool(settings, SETTING_PREVIEW_HALF, false);
+	obs_data_set_default_bool(settings, SETTING_PREVIEW_HALF, true);
 	obs_data_set_default_string(settings, SETTING_FILE_FORMAT, "%CCYY-%MM-%DD %hh.%mm.%ss");
 	obs_data_set_default_bool(settings, SETTING_LOSSLESS, false);
 	obs_data_set_default_int(settings, SETTING_STORAGE_FORMAT, STORAGE_FORMAT_NV12);
@@ -2224,9 +2226,13 @@ static void replay_source_update(void *data, obs_data_t *settings)
 	context->keep_buffer = obs_data_get_bool(settings, SETTING_KEEP_BUFFER);
 	context->auto_release = (int)obs_data_get_int(settings, SETTING_AUTO_RELEASE);
 
-	context->speed_percent = (float)obs_data_get_double(settings, SETTING_SPEED);
-	if (context->speed_percent < SETTING_SPEED_MIN || context->speed_percent > SETTING_SPEED_MAX)
-		context->speed_percent = 100.0f;
+	const float stored_speed = (float)obs_data_get_double(settings, SETTING_SPEED);
+	if (stored_speed != context->stored_speed) {
+		context->stored_speed = stored_speed;
+		context->speed_percent = stored_speed;
+		if (context->speed_percent < SETTING_SPEED_MIN || context->speed_percent > SETTING_SPEED_MAX)
+			context->speed_percent = 100.0f;
+	}
 
 	context->backward_start = obs_data_get_bool(settings, SETTING_BACKWARD);
 	if (context->backward != context->backward_start) {
