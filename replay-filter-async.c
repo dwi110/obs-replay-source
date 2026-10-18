@@ -31,12 +31,12 @@ static inline uint64_t safe_video_frame_time(void)
 
 /* Live delivery lateness (replay_filter_live_snapshot). The reference decays by 1 ms per second so clock drift
  * between camera and PC never accumulates; lateness lasting longer than LIVE_REBASE_NS is taken as a new
- * steady offset (e.g. a camera timecode step below MAX_TS_VAR), not as a delivery delay. */
+ * steady offset (e.g. a camera timecode step below MAX_TS_VAR), not as a delivery delay. Silence itself is not
+ * lateness (NDI sources may send only on change); a value older than LIVE_STALE_NS no longer counts. */
 #define LIVE_REF_DECAY_DIV 1000
 #define LIVE_REBASE_NS 10000000000ULL
 #define LIVE_LATE_NOTICE_NS 100000000LL
-#define LIVE_SILENCE_GRACE_NS 100000000ULL
-#define LIVE_OFFLINE_NS 5000000000ULL
+#define LIVE_STALE_NS 2000000000ULL
 
 static pthread_once_t live_registry_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t live_registry_mutex;
@@ -76,16 +76,13 @@ uint64_t replay_filter_live_snapshot(uint64_t now_ns, struct replay_live_entry *
 		struct replay_filter *filter = live_filters.array[i];
 		pthread_mutex_lock(&filter->mutex);
 		const bool valid = filter->live_ref_valid;
-		const uint64_t last = filter->last_arrival_ns;
+		const uint64_t last = filter->live_last_ns;
 		uint64_t late = filter->live_late_ns > 0 ? (uint64_t)filter->live_late_ns : 0;
 		pthread_mutex_unlock(&filter->mutex);
 		if (!valid)
 			continue;
-		const uint64_t silent = now_ns > last ? now_ns - last : 0;
-		if (silent >= LIVE_OFFLINE_NS)
+		if (now_ns > last && now_ns - last >= LIVE_STALE_NS)
 			late = 0;
-		else if (silent > LIVE_SILENCE_GRACE_NS)
-			late += silent - LIVE_SILENCE_GRACE_NS;
 		if (late > worst)
 			worst = late;
 		if (out && n < max) {
@@ -104,6 +101,7 @@ uint64_t replay_filter_live_snapshot(uint64_t now_ns, struct replay_live_entry *
 static void update_live_lateness_locked(struct replay_filter *filter, int64_t ts_arrival_ns, uint64_t arrival_ns,
 					bool rebased)
 {
+	filter->live_last_ns = arrival_ns;
 	if (filter->live_ref_valid && !rebased) {
 		const int64_t decay = (int64_t)((arrival_ns - filter->live_ref_at_ns) / LIVE_REF_DECAY_DIV);
 		const int64_t ref = filter->live_ref_ns - decay;

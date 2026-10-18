@@ -204,6 +204,40 @@ int main(void)
 	buffered = rf->video_frames.size / sizeof(struct obs_source_frame *);
 	CHECK(buffered == 3, "filter_video should not duplicate capture while tap is active (got %zu)", buffered);
 
+	/* Live delivery lateness: a frame that arrives 300 ms later than its predecessors relative to its timestamp
+	 * reports ~300 ms, an on-time frame clears it, silence beyond 100 ms adds up and a camera silent for 5 s is
+	 * offline (0). */
+	struct replay_live_entry live[4];
+	size_t live_n = 0;
+	uint64_t late = replay_filter_live_snapshot(os_gettime_ns(), live, 4, &live_n);
+	CHECK(live_n == 1 && strcmp(live[0].name, "test_replay_filter") == 0, "expected one live entry, got %zu",
+	      live_n);
+	CHECK(late < 50000000ULL, "on-time frames reported %.1f ms late", (double)late / 1e6);
+
+	os_sleep_ms(300);
+	src_frame->timestamp = base_ts + 4ULL * 16666667ULL;
+	fake_tap_emit_frame(&cam, src_frame);
+	late = replay_filter_live_snapshot(os_gettime_ns(), NULL, 0, NULL);
+	CHECK(late >= 230000000ULL && late < 400000000ULL, "late frame reported %.1f ms, expected ~283 ms",
+	      (double)late / 1e6);
+
+	src_frame->timestamp = os_gettime_ns() + 40000000ULL;
+	fake_tap_emit_frame(&cam, src_frame);
+	late = replay_filter_live_snapshot(os_gettime_ns(), NULL, 0, NULL);
+	CHECK(late < 20000000ULL, "on-time frame after a late one still reports %.1f ms", (double)late / 1e6);
+
+	/* Silence is not lateness (NDI sources may send only on change); a late value older than 2 s is stale. */
+	os_sleep_ms(400);
+	late = replay_filter_live_snapshot(os_gettime_ns(), NULL, 0, NULL);
+	CHECK(late < 20000000ULL, "400 ms silence after an on-time frame reported %.1f ms", (double)late / 1e6);
+	os_sleep_ms(300);
+	src_frame->timestamp += 16666667ULL;
+	fake_tap_emit_frame(&cam, src_frame);
+	late = replay_filter_live_snapshot(os_gettime_ns(), NULL, 0, NULL);
+	CHECK(late >= 500000000ULL, "frame 700 ms after its predecessor reported %.1f ms", (double)late / 1e6);
+	late = replay_filter_live_snapshot(os_gettime_ns() + 3000000000ULL, NULL, 0, NULL);
+	CHECK(late == 0, "late value of a camera silent for 3 s should be stale, got %.1f ms", (double)late / 1e6);
+
 	/* Removing the filter must call frame_tap_remove and stop callbacks */
 	replay_filter_async_info.filter_remove(rf, &cam.source);
 	CHECK(cam.remove_calls == 1 && cam.cb == NULL, "expected frame_tap_remove to unregister callback");
@@ -229,6 +263,9 @@ int main(void)
 
 	proc_handler_destroy(cam.source.procs);
 	pthread_mutex_destroy(&cam.mutex);
+
+	replay_filter_live_snapshot(os_gettime_ns(), live, 4, &live_n);
+	CHECK(live_n == 0, "destroyed filter still listed for live lateness (%zu entries)", live_n);
 
 	printf("test_tap: ALL PASSED\n");
 	return 0;

@@ -172,6 +172,8 @@ static void save_slot_release(struct save_slot *slot)
 #define LIVE_CALM_PROBE_NS 500000000ULL
 #define LIVE_CALM_AFTER_LAG_NS 2000000000ULL
 #define LIVE_CALM_MAX_WAIT_NS 30000000000ULL
+/* Camera delivery lateness that counts as calm (same as the paced save's resume threshold). */
+#define LIVE_CALM_LATE_NS 50000000ULL
 
 static uint64_t live_lag_counter(void)
 {
@@ -182,8 +184,14 @@ static uint64_t live_lag_counter(void)
 	return n;
 }
 
-/* Delays a save start while this OBS is dropping program frames: no new lagged render or skipped output frame for
- * 0.5 s, or for 2 s after one was seen; gives up after 30 s so a permanently overloaded PC still saves. */
+static uint64_t live_late_ns(void)
+{
+	return replay_filter_live_snapshot(os_gettime_ns(), NULL, 0, NULL);
+}
+
+/* Delays a save start while this OBS is dropping program frames or its cameras arrive late: no new lagged render or
+ * skipped output frame and camera lateness at most 50 ms for 0.5 s, or for 2 s after a lag was seen; gives up after
+ * 30 s so a permanently overloaded PC still saves. */
 static uint64_t wait_for_calm_live(void)
 {
 	const uint64_t start_ns = os_gettime_ns();
@@ -198,6 +206,8 @@ static uint64_t wait_for_calm_live(void)
 			last = cur;
 			calm_since_ns = now_ns;
 			needed_ns = LIVE_CALM_AFTER_LAG_NS;
+		} else if (live_late_ns() > LIVE_CALM_LATE_NS) {
+			calm_since_ns = now_ns;
 		}
 		if (now_ns - calm_since_ns >= needed_ns)
 			break;
@@ -775,7 +785,7 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 
 	ensure_parent_dir(job->output_path);
 
-	if (job->save_speed != SAVE_SPEED_REALTIME && replay_save_fast_available()) {
+	if (replay_save_fast_available()) {
 		struct replay_save_fast_input in = {
 			.output_path = job->output_path,
 			.save_container = job->save_container,
@@ -793,6 +803,7 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 			.duration_ns = job->duration_ns,
 			.should_abort = is_shutting_down,
 			.live_lag_counter = live_lag_counter,
+			.live_late_ns = live_late_ns,
 		};
 		struct replay_save_fast_stats stats;
 		note_encoder_start();
@@ -806,10 +817,11 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 			else
 				snprintf(limit, sizeof(limit), "%dx", job->save_speed);
 			blog(LOG_INFO,
-			     "[replay_save_queue] Fast save '%s' with '%s': limit=%s achieved=%.1fx encode_time=%.2fs"
-			     " live_slowdowns=%u",
+			     "[replay_save_queue] Paced save '%s' with '%s': limit=%s achieved=%.1fx encode_time=%.2fs"
+			     " live_slowdowns=%u live_pauses=%u paused=%.2fs live_late_max=%.0fms",
 			     job->output_path, stats.codec, limit, secs > 0.0 ? (double)job->duration_ns / 1e9 / secs : 0.0,
-			     secs, stats.slowdowns);
+			     secs, stats.slowdowns, stats.live_pauses, (double)stats.live_paused_ns / 1e9,
+			     (double)stats.live_late_max_ns / 1e6);
 			job->saved_fast = true;
 			return true;
 		}
@@ -817,8 +829,8 @@ static bool run_save_job(struct replay_save_job *job, bool *aborted_out)
 			*aborted_out = true;
 			return false;
 		}
-		blog(LOG_WARNING, "[replay_save_queue] Fast save of '%s' %s; saving at real time", job->output_path,
-		     r == REPLAY_SAVE_FAST_UNAVAILABLE ? "unavailable" : "failed");
+		blog(LOG_WARNING, "[replay_save_queue] Paced save of '%s' %s; saving through OBS outputs at real time",
+		     job->output_path, r == REPLAY_SAVE_FAST_UNAVAILABLE ? "unavailable" : "failed");
 	}
 
 	const uint32_t width = job->video_frames[0]->width;

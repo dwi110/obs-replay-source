@@ -39,6 +39,10 @@ enum replay_save_fast_result replay_save_fast_run(const struct replay_save_fast_
 #define FAST_STR2(x) #x
 #define FAST_STR(x) FAST_STR2(x)
 #define LIVE_LAG_SLOWDOWN_NS 2000000000ULL
+#define LIVE_LATE_PAUSE_NS 150000000ULL
+#define LIVE_LATE_RESUME_NS 50000000ULL
+#define LIVE_LATE_CHECK_NS 20000000ULL
+#define LIVE_PAUSE_BUDGET_NS 60000000000ULL
 
 bool replay_save_fast_supported(void)
 {
@@ -408,6 +412,44 @@ static bool pace_until(const struct replay_save_fast_input *in, uint64_t target_
 	}
 }
 
+/* Samples the camera delivery lateness at most every LIVE_LATE_CHECK_NS. Above LIVE_LATE_PAUSE_NS the save waits
+ * until the cameras are back below LIVE_LATE_RESUME_NS (live first), within the per-clip pause budget. Returns false
+ * on abort; *paused_out tells the caller to restart pacing from now. */
+static bool live_late_gate(const struct replay_save_fast_input *in, struct replay_save_fast_stats *stats,
+			   uint64_t *next_check_ns, bool *paused_out)
+{
+	*paused_out = false;
+	if (!in->live_late_ns)
+		return true;
+	uint64_t now = os_gettime_ns();
+	if (now < *next_check_ns)
+		return true;
+	*next_check_ns = now + LIVE_LATE_CHECK_NS;
+	uint64_t late = in->live_late_ns();
+	if (late > stats->live_late_max_ns)
+		stats->live_late_max_ns = late;
+	if (late <= LIVE_LATE_PAUSE_NS || stats->live_paused_ns >= LIVE_PAUSE_BUDGET_NS)
+		return true;
+
+	stats->live_pauses++;
+	*paused_out = true;
+	const uint64_t pause_start = now;
+	while (late > LIVE_LATE_RESUME_NS && stats->live_paused_ns + (now - pause_start) < LIVE_PAUSE_BUDGET_NS) {
+		if (in->should_abort && in->should_abort())
+			return false;
+		os_sleep_ms(20);
+		now = os_gettime_ns();
+		late = in->live_late_ns();
+		if (late > stats->live_late_max_ns)
+			stats->live_late_max_ns = late;
+	}
+	stats->live_paused_ns += now - pause_start;
+	if (stats->live_paused_ns >= LIVE_PAUSE_BUDGET_NS)
+		blog(LOG_WARNING, "[replay_save_fast] cameras still late after %.0f s of pauses; finishing at real time",
+		     (double)LIVE_PAUSE_BUDGET_NS / 1e9);
+	return true;
+}
+
 /* Frees FFmpeg/libobs resources; keeps the clip parameters so the next encoder candidate can reuse them. */
 static void fast_ctx_close(struct fast_ctx *f)
 {
@@ -546,23 +588,35 @@ enum replay_save_fast_result replay_save_fast_run(const struct replay_save_fast_
 
 	enum replay_save_fast_result result = REPLAY_SAVE_FAST_FAILED;
 	const uint64_t start_ns = os_gettime_ns();
-	const uint64_t step_fast = in->max_speed > 1 ? interval_ns / (uint64_t)in->max_speed : 0;
+	const uint64_t step_fast = in->max_speed >= 1 ? interval_ns / (uint64_t)in->max_speed : 0;
 	uint64_t lag = in->live_lag_counter ? in->live_lag_counter() : 0;
 	uint64_t slow_until = 0;
 	uint64_t wall = start_ns;
 	uint64_t source_idx = 0;
+	uint64_t next_live_check = 0;
 
 	for (uint64_t idx = 0; idx < frame_count; idx++) {
+		bool paused = false;
+		if (!live_late_gate(in, stats, &next_live_check, &paused)) {
+			result = REPLAY_SAVE_FAST_ABORTED;
+			goto done;
+		}
 		const uint64_t now = os_gettime_ns();
+		if (paused) {
+			wall = now;
+			slow_until = stats->live_paused_ns >= LIVE_PAUSE_BUDGET_NS ? UINT64_MAX
+										 : now + LIVE_LAG_SLOWDOWN_NS;
+		}
 		if (in->live_lag_counter) {
 			const uint64_t cur = in->live_lag_counter();
 			if (cur != lag) {
 				lag = cur;
-				slow_until = now + LIVE_LAG_SLOWDOWN_NS;
+				if (slow_until != UINT64_MAX)
+					slow_until = now + LIVE_LAG_SLOWDOWN_NS;
 				stats->slowdowns++;
 			}
 		}
-		/* Never faster than the limit on average; no catch-up bursts after falling behind. */
+		/* Never faster than the limit on average; no catch-up bursts after falling behind or a pause. */
 		const uint64_t target = wall + (now < slow_until ? interval_ns : step_fast);
 		if (!pace_until(in, target)) {
 			result = REPLAY_SAVE_FAST_ABORTED;

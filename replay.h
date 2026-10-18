@@ -91,18 +91,19 @@ struct replay_filter {
 	int64_t ts_arrival_max_ns;
 	/* Live delivery lateness of the video frames (replay_filter_live_snapshot): live_ref_ns is the earliest recent
 	 * arrival relative to the frame timestamp (max of timestamp - arrival, decaying 1 ms per second to follow clock
-	 * drift), live_late_ns how much later the newest frame arrived, live_ref_at_ns its arrival time. */
+	 * drift), live_late_ns how much later the newest frame arrived (at live_last_ns), live_ref_at_ns when the
+	 * reference was taken and live_late_since_ns when the current stretch of lateness began. */
 	int64_t live_ref_ns;
 	int64_t live_late_ns;
 	uint64_t live_ref_at_ns;
 	uint64_t live_late_since_ns;
+	uint64_t live_last_ns;
 	bool live_ref_valid;
 };
 
 /* Current delivery lateness of one camera feeding a video capture filter in this OBS process: how much later than
- * usual (relative to its timestamp) its newest frame arrived plus how long it has been silent beyond 100 ms. Delays
- * inside the receive runtime (e.g. NDI decode under load) show here before they cost a render frame. Cameras silent
- * for 5 s or more count as offline (0). */
+ * usual (relative to its timestamp) its newest frame arrived. Delays inside the receive runtime (e.g. NDI decode
+ * under load) show here before they cost a render frame. A value older than 2 s counts as 0 (camera silent or gone). */
 #define REPLAY_LIVE_MAX_ENTRIES 32
 struct replay_live_entry {
 	char name[64];

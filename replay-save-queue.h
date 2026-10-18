@@ -68,7 +68,7 @@ size_t replay_save_all_loaded_replays(void);
 size_t replay_save_queue_pending_count(void);
 size_t replay_save_queue_pinned_bytes(void);
 uint64_t replay_save_queue_completed_count(void);
-/* Completed saves written faster than real time by the FFmpeg path. */
+/* Completed saves written by the paced FFmpeg path (all speeds when the FFmpeg libraries are available). */
 uint64_t replay_save_queue_fast_completed_count(void);
 long replay_save_queue_max_concurrent_encoders(void);
 bool replay_save_queue_wait_idle(uint32_t timeout_ms);
