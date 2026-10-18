@@ -89,7 +89,28 @@ struct replay_filter {
 	/* Range of (stored timestamp - arrival) since the last capture log line. */
 	int64_t ts_arrival_min_ns;
 	int64_t ts_arrival_max_ns;
+	/* Live delivery lateness of the video frames (replay_filter_live_snapshot): live_ref_ns is the earliest recent
+	 * arrival relative to the frame timestamp (max of timestamp - arrival, decaying 1 ms per second to follow clock
+	 * drift), live_late_ns how much later the newest frame arrived, live_ref_at_ns its arrival time. */
+	int64_t live_ref_ns;
+	int64_t live_late_ns;
+	uint64_t live_ref_at_ns;
+	uint64_t live_late_since_ns;
+	bool live_ref_valid;
 };
+
+/* Current delivery lateness of one camera feeding a video capture filter in this OBS process: how much later than
+ * usual (relative to its timestamp) its newest frame arrived plus how long it has been silent beyond 100 ms. Delays
+ * inside the receive runtime (e.g. NDI decode under load) show here before they cost a render frame. Cameras silent
+ * for 5 s or more count as offline (0). */
+#define REPLAY_LIVE_MAX_ENTRIES 32
+struct replay_live_entry {
+	char name[64];
+	uint64_t late_ns;
+};
+/* Fills up to max entries (one per video capture filter that received a frame, named after the filter) and returns
+ * the largest lateness over all of them; *count_out (optional) receives the number of entries written. */
+uint64_t replay_filter_live_snapshot(uint64_t now_ns, struct replay_live_entry *out, size_t max, size_t *count_out);
 
 /* Audio packet ownership: every struct obs_audio_data stored by a replay filter, a loaded replay or a
  * pending save points into one refcounted block holding all planes. replay_audio_packet_copy creates a

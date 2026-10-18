@@ -765,6 +765,21 @@ static void vendor_req_get_replays(obs_data_t *request_data, obs_data_t *respons
 	obs_data_set_int(sq, "completed", (long long)replay_save_queue_completed_count());
 	obs_data_set_string(sq, "state", replay_save_queue_state());
 
+	struct replay_live_entry live[REPLAY_LIVE_MAX_ENTRIES];
+	size_t live_count = 0;
+	const uint64_t live_late = replay_filter_live_snapshot(os_gettime_ns(), live, REPLAY_LIVE_MAX_ENTRIES, &live_count);
+	obs_data_set_int(sq, "liveLateMaxMs", (long long)(live_late / 1000000ULL));
+	obs_data_array_t *live_arr = obs_data_array_create();
+	for (size_t i = 0; i < live_count; i++) {
+		obs_data_t *item = obs_data_create();
+		obs_data_set_string(item, "filter", live[i].name);
+		obs_data_set_int(item, "lateMs", (long long)(live[i].late_ns / 1000000ULL));
+		obs_data_array_push_back(live_arr, item);
+		obs_data_release(item);
+	}
+	obs_data_set_array(sq, "liveDelivery", live_arr);
+	obs_data_array_release(live_arr);
+
 	obs_data_set_bool(response_data, "ok", true);
 	obs_data_set_array(response_data, "replays", replays_arr);
 	obs_data_set_obj(response_data, "saveQueue", sq);

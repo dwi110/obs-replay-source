@@ -1,6 +1,7 @@
 #include <obs-module.h>
 #include <util/platform.h>
 #include <util/threading.h>
+#include <util/darray.h>
 #include "media-io/audio-math.h"
 #include "obs-frame-tap.h"
 #include "replay.h"
@@ -26,6 +27,100 @@ static inline uint64_t safe_video_frame_time(void)
 			return t;
 	}
 	return os_gettime_ns();
+}
+
+/* Live delivery lateness (replay_filter_live_snapshot). The reference decays by 1 ms per second so clock drift
+ * between camera and PC never accumulates; lateness lasting longer than LIVE_REBASE_NS is taken as a new
+ * steady offset (e.g. a camera timecode step below MAX_TS_VAR), not as a delivery delay. */
+#define LIVE_REF_DECAY_DIV 1000
+#define LIVE_REBASE_NS 10000000000ULL
+#define LIVE_LATE_NOTICE_NS 100000000LL
+#define LIVE_SILENCE_GRACE_NS 100000000ULL
+#define LIVE_OFFLINE_NS 5000000000ULL
+
+static pthread_once_t live_registry_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t live_registry_mutex;
+static DARRAY(struct replay_filter *) live_filters;
+
+static void live_registry_init(void)
+{
+	pthread_mutex_init(&live_registry_mutex, NULL);
+	da_init(live_filters);
+}
+
+static void live_registry_add(struct replay_filter *filter)
+{
+	pthread_once(&live_registry_once, live_registry_init);
+	pthread_mutex_lock(&live_registry_mutex);
+	da_push_back(live_filters, &filter);
+	pthread_mutex_unlock(&live_registry_mutex);
+}
+
+static void live_registry_remove(struct replay_filter *filter)
+{
+	pthread_once(&live_registry_once, live_registry_init);
+	pthread_mutex_lock(&live_registry_mutex);
+	da_erase_item(live_filters, &filter);
+	if (!live_filters.num)
+		da_free(live_filters);
+	pthread_mutex_unlock(&live_registry_mutex);
+}
+
+uint64_t replay_filter_live_snapshot(uint64_t now_ns, struct replay_live_entry *out, size_t max, size_t *count_out)
+{
+	uint64_t worst = 0;
+	size_t n = 0;
+	pthread_once(&live_registry_once, live_registry_init);
+	pthread_mutex_lock(&live_registry_mutex);
+	for (size_t i = 0; i < live_filters.num; i++) {
+		struct replay_filter *filter = live_filters.array[i];
+		pthread_mutex_lock(&filter->mutex);
+		const bool valid = filter->live_ref_valid;
+		const uint64_t last = filter->last_arrival_ns;
+		uint64_t late = filter->live_late_ns > 0 ? (uint64_t)filter->live_late_ns : 0;
+		pthread_mutex_unlock(&filter->mutex);
+		if (!valid)
+			continue;
+		const uint64_t silent = now_ns > last ? now_ns - last : 0;
+		if (silent >= LIVE_OFFLINE_NS)
+			late = 0;
+		else if (silent > LIVE_SILENCE_GRACE_NS)
+			late += silent - LIVE_SILENCE_GRACE_NS;
+		if (late > worst)
+			worst = late;
+		if (out && n < max) {
+			const char *name = filter->src ? obs_source_get_name(filter->src) : NULL;
+			snprintf(out[n].name, sizeof(out[n].name), "%s", name ? name : "");
+			out[n].late_ns = late;
+			n++;
+		}
+	}
+	pthread_mutex_unlock(&live_registry_mutex);
+	if (count_out)
+		*count_out = n;
+	return worst;
+}
+
+static void update_live_lateness_locked(struct replay_filter *filter, int64_t ts_arrival_ns, uint64_t arrival_ns,
+					bool rebased)
+{
+	if (filter->live_ref_valid && !rebased) {
+		const int64_t decay = (int64_t)((arrival_ns - filter->live_ref_at_ns) / LIVE_REF_DECAY_DIV);
+		const int64_t ref = filter->live_ref_ns - decay;
+		if (ts_arrival_ns < ref) {
+			const int64_t late = ref - ts_arrival_ns;
+			if (late >= LIVE_LATE_NOTICE_NS && filter->live_late_ns < LIVE_LATE_NOTICE_NS)
+				filter->live_late_since_ns = arrival_ns;
+			if (late < LIVE_LATE_NOTICE_NS || arrival_ns - filter->live_late_since_ns < LIVE_REBASE_NS) {
+				filter->live_late_ns = late;
+				return;
+			}
+		}
+	}
+	filter->live_ref_ns = ts_arrival_ns;
+	filter->live_ref_at_ns = arrival_ns;
+	filter->live_late_ns = 0;
+	filter->live_ref_valid = true;
 }
 
 static uint32_t estimate_pool_frames(const struct replay_filter *filter)
@@ -150,6 +245,7 @@ static bool capture_single_frame_locked(struct replay_filter *filter, const stru
 	}
 
 	const uint64_t timestamp = src_frame->timestamp;
+	const int64_t prev_adjust = filter->timing_adjust;
 	uint64_t adjusted_time = timestamp + filter->timing_adjust;
 	if (filter->timing_adjust && uint64_diff(os_time, timestamp) < MAX_TS_VAR) {
 		adjusted_time = timestamp;
@@ -162,6 +258,7 @@ static bool capture_single_frame_locked(struct replay_filter *filter, const stru
 	*last_timestamp = adjusted_time;
 	circlebuf_push_back(&filter->video_frames, &new_frame, sizeof(struct obs_source_frame *));
 	filter->last_arrival_ns = t0;
+	update_live_lateness_locked(filter, (int64_t)(adjusted_time - t0), t0, filter->timing_adjust != prev_adjust);
 
 	const uint64_t elapsed = os_gettime_ns() - t0;
 	record_capture_timing_locked(filter, t0, elapsed, (int64_t)(adjusted_time - t0));
@@ -353,6 +450,7 @@ static void *replay_filter_create(obs_data_t *settings, obs_source_t *source)
 	obs_data_set_default_int(settings, SETTING_REPLAYS, 1);
 
 	replay_filter_update(context, settings);
+	live_registry_add(context);
 
 	return context;
 }
@@ -361,6 +459,7 @@ static void replay_filter_destroy(void *data)
 {
 	struct replay_filter *filter = data;
 
+	live_registry_remove(filter);
 	detach_frame_tap(filter, NULL);
 
 	pthread_mutex_lock(&filter->mutex);
