@@ -1,3 +1,9 @@
+# Operator contract
+
+Shared operator control for both approaches lives in the hub document `docs/BEDIENVERTRAG.md` (vendor `MulticamReplay`). On this branch the contract requests, events and global hotkeys are registered there. The old global names `ReplaySource.LoadAll`, `ReplaySource.SaveAll` and `ReplaySource.All*` are not registered. `ReplaySource` remains only for approach-specific calls: `GetReplays`, `SetSlowmoBlend`, and the three `ReplaySource.SlowmoBlend*` hotkeys. Per-source hotkeys in section 1 are unchanged and are not part of the shared Companion page.
+
+Sections 2 and 3 below describe the pre-contract global API. Do not bind new Companion buttons to those names.
+
 # Replay Source Control & Companion Integration
 
 This fork extends `replay_source` for multi-camera instant-replay workflows controlled from **Bitfocus Companion** via **obs-websocket 5**.
@@ -48,9 +54,10 @@ Each replay source connects to its `rename` signal (`new_name`) and updates all 
 
 ---
 
-## 2. Global Multi-Angle Frontend Hotkeys
+## 2. Global Multi-Angle Frontend Hotkeys (removed on this branch)
 
-Registered once at module load (`obs_hotkey_register_frontend`):
+These names were registered by Preview 12 and earlier. This branch does not register them. Use `MulticamReplay.*` from the hub contract. The descriptions are kept so old logs stay readable.
+
 
 | Hotkey Name | Description (en-US / de-DE) | Behavior |
 |---|---|---|
@@ -70,9 +77,9 @@ Registered once at module load (`obs_hotkey_register_frontend`):
 
 ---
 
-## 3. `obs-websocket` Vendor API (`ReplaySource`)
+## 3. `obs-websocket` Vendor API (`ReplaySource`, pre-contract)
 
-Registered in `obs_module_post_load` under `vendorName`: **`ReplaySource`**. If `obs-websocket` is not installed, the plugin logs one `INFO` message and continues normally.
+On this branch `ReplaySource` registers only `GetReplays` and `SetSlowmoBlend`. The requests below (`LoadAll`, `SaveAll`, `Action`, `SetSpeed`, `MarkIn`) moved to vendor `MulticamReplay`. The field lists remain so old logs and Preview 12 stay readable.
 
 ### Requests
 
@@ -327,7 +334,7 @@ frame-threading packet delay in `ffmpeg_output`.
 
 ## 5. Bitfocus Companion Setup
 
-### Hotkeys ("Hotkey - Trigger by ID")
+New buttons use vendor `MulticamReplay` and the hotkeys in the hub `docs/BEDIENVERTRAG.md`. The steps below are the Preview 12 page.
 Companion lists the names from `GetHotkeyList`, so each angle now appears with its own entry, e.g.
 `ReplaySource.Save.Replay Cam 1`, `ReplaySource.Save.Replay Cam 2`. Companion reads this list when it connects and when
 the OBS profile or scene collection changes; after renaming a replay source (or adding a new one) reconnect the OBS
