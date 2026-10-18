@@ -587,6 +587,7 @@ int main(int argc, char **argv)
 	/* Faster than real time (FFmpeg path): same CFR schedule, held frames in gaps and PCM timeline as real time. */
 	if (replay_save_fast_supported()) {
 		const uint64_t completed_before = replay_save_queue_completed_count();
+		const uint64_t fast_before = replay_save_queue_fast_completed_count();
 		struct obs_source_frame **fast_nv12 =
 			create_clip_video_frames(VIDEO_FORMAT_NV12, 640, 360, frame_count, start_ts, interval_ns);
 		struct obs_source_frame **fast_uyvy =
@@ -635,9 +636,9 @@ int main(int argc, char **argv)
 
 		if (!replay_save_queue_wait_idle(30000) ||
 		    replay_save_queue_completed_count() != completed_before + 3 ||
-		    replay_save_queue_fast_completed_count() != 3) {
+		    replay_save_queue_fast_completed_count() != fast_before + 3) {
 			fprintf(stderr, "[test] Fast saves did not complete through the FFmpeg path (fast=%" PRIu64 ")\n",
-				replay_save_queue_fast_completed_count());
+				replay_save_queue_fast_completed_count() - fast_before);
 			return 1;
 		}
 		if (!validate_with_ffprobe("/tmp/replay-save-queue-test/test_clip - Fast_NV12.mp4", "h264", 60) ||

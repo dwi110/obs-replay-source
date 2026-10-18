@@ -103,10 +103,18 @@ Returns status for all replay sources and the sequential save queue.
   "saveQueue": {
     "pending": 0,
     "completed": 4,
-    "state": "idle"
+    "state": "idle",
+    "liveLateMaxMs": 14,
+    "liveDelivery": [
+      { "filter": "Replay Cam 1", "lateMs": 14 }
+    ]
   }
 }
 ```
+`liveDelivery` lists every video capture filter (async replay filter) in this OBS with `lateMs`: how much later than
+usual, relative to its own timestamp, the camera's newest frame arrived (0 when on time or silent for more than 2 s).
+`liveLateMaxMs` is the largest value. Delays inside the receive runtime (e.g. NDI decode under load) show here before
+they cost a render frame.
 
 #### `Action`
 Runs any existing `execute_action` command (`Load`, `Next`, `Previous`, `First`, `Last`, `Remove`, `Clear`, `Save`, `Restart`, `Pause`, `Faster`, `Slower`, `Faster5Percent`, `Slower5Percent`, `NormalOrFaster`, `NormalOrSlower`, `NormalSpeed`, `HalfSpeed`, `DoubleSpeed`, `TrimFront`, `TrimEnd`, `TrimReset`, `MarkIn`, `MarkOut`, `MarkReset`, `Reverse`, `Backward`, `Forward`, `ForwardOrFaster`, `BackwardOrFaster`, `DisableNextScene`, `EnableNextScene`, `Disable`, `Enable`, `SetNextSceneToCurrent`, `SwitchToNextScene`, `NextFrame`, `PrevFrame`, `NextNFrames`, `PrevNFrames`).
@@ -273,9 +281,14 @@ Each replay is auto-saved at most once (tracked via an internal replay flag). Ma
 
 Saving uses one sequential queue per OBS process. By default every save encodes in real time (a 12-s clip takes about
 12 s); the source setting **Save Speed** (`save_speed`) allows faster saves, see below.
-Two extra rules protect the live output, at the cost of a later file:
-- **Live first:** a save starts only when this OBS has shown no new lagged render frame and no skipped output frame for
-  0.5 s (2 s after a lag was seen); after 30 s of continuous lag it starts anyway.
+Three extra rules protect the live output, at the cost of a later file:
+- **Live first:** a save starts only when this OBS has shown no new lagged render frame and no skipped output frame and
+  its cameras arrive at most 50 ms late (`liveLateMaxMs`) for 0.5 s (2 s after a lag was seen); after 30 s it starts
+  anyway.
+- **Pause for late cameras:** while a clip is encoded, any camera arriving more than 150 ms late pauses the save until
+  all are back below 50 ms; it then continues at real-time pace for 2 s. Pauses end after 60 s in total per clip (the
+  clip then finishes at real-time pace). Reason: on the test PC every save (NVENC or x264, real time or faster) slowed
+  the copies of all NDI cameras and delayed their delivery by up to 2–4.8 s, unseen by render statistics.
 - **One save encoder per PC:** all OBS instances running this plugin share one encoder slot (Windows named mutex
   `Local\ReplaySource.SaveEncoderSlot`, POSIX `flock` on `/tmp/obs-replay-source-save-encoder.lock`). A second instance
   queues until the first finishes its current clip. The OS releases the slot if an OBS process exits or crashes.
@@ -286,16 +299,16 @@ reports `waited_live`/`waited_slot` and `Job end` the `total_time` from dequeue 
 
 **Save Speed** (`save_speed`: `1` real time, default; `2` up to 2×; `4` up to 4×; `-1` as fast as possible). Faster
 saves free the pinned replay frames sooner but load CPU (frame copy/conversion) and the encoder harder; the reachable
-speed depends on the PC. Faster than real time cannot go through OBS outputs, whose audio clock runs in real time, so
-the plugin encodes and muxes directly with libavcodec/libavformat: same encoders and order (HEVC NVENC → H.264 NVENC →
-x264, lossless UtVideo/PCM AVI), same picture settings, same constant-frame-rate schedule with held frames in reception
-gaps, PCM laid onto the clip timeline. Any new lagged/skipped program frame during a fast save drops it to real-time
-pace for 2 s. The log line `Fast save … limit= achieved= live_slowdowns=` reports the result. If the FFmpeg libraries
-are missing (Windows build targets the FFmpeg 8 DLLs `avcodec-62`/`avformat-62`/`avutil-60` of OBS 32, delay-loaded)
-or no encoder opens, the save runs at real time instead. Builds without FFmpeg ≥ 6 (e.g. Ubuntu 22.04) do not offer the
-setting.
+speed depends on the PC. OBS outputs take audio from a wall-clock audio thread and can neither run faster than real time
+nor pause, so all speeds encode and mux directly with libavcodec/libavformat: same encoders and order (HEVC NVENC →
+H.264 NVENC → x264, lossless UtVideo/PCM AVI), same picture settings, same constant-frame-rate schedule with held
+frames in reception gaps, PCM laid onto the clip timeline. Any new lagged/skipped program frame drops a faster save to
+real-time pace for 2 s. The log line `Paced save … limit= achieved= live_slowdowns= live_pauses= paused=
+live_late_max=` reports the result. If the FFmpeg libraries are missing (Windows build targets the FFmpeg 8 DLLs
+`avcodec-62`/`avformat-62`/`avutil-60` of OBS 32, delay-loaded) or no encoder opens, the save runs through OBS outputs
+at real time without the pause rule. Builds without FFmpeg ≥ 6 (e.g. Ubuntu 22.04) do not offer faster speeds.
 
-NVENC HEVC/H.264 uses OBS's raw `ffmpeg_output` with the bundled
+In the OBS-output fallback, NVENC HEVC/H.264 uses OBS's raw `ffmpeg_output` with the bundled
 FFmpeg `hevc_nvenc`/`h264_nvenc` encoders, not OBS's canvas-bound NVENC encoders. The latter crash with the private
 replay `video_t` on OBS 31.1+ (`cuda_surface_init` calls `obs_encoder_video_tex_active` without a core video mix).
 If a backend cannot start, the next plan is tried before feeding the clip: HEVC NVENC → H.264 NVENC → x264;
