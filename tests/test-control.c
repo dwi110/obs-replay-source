@@ -33,6 +33,25 @@ extern void obs_module_unload(void);
 		}                                                              \
 	} while (0)
 
+static void count_update(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(cd);
+	os_atomic_inc_long(data);
+}
+
+/* Video sources apply obs_source_update on the next graphics tick; wait for the "update" signal. */
+static bool update_and_wait(obs_source_t *source, obs_data_t *settings)
+{
+	volatile long updates = 0;
+	signal_handler_t *sh = obs_source_get_signal_handler(source);
+	signal_handler_connect(sh, "update", count_update, (void *)&updates);
+	obs_source_update(source, settings);
+	for (int i = 0; i < 400 && !os_atomic_load_long(&updates); i++)
+		os_sleep_ms(5);
+	signal_handler_disconnect(sh, "update", count_update, (void *)&updates);
+	return os_atomic_load_long(&updates) > 0;
+}
+
 static const char *const g_expected_legacy_hotkeys[] = {
 	"ReplaySource.Replay",
 	"ReplaySource.Next",
@@ -647,6 +666,21 @@ int main(int argc, char **argv)
 	      "expected Replay Cam 2 speed 40.0, got %.2f", st2.speed_percent);
 	obs_data_release(csv_req);
 	obs_data_release(csv_res);
+
+	/* A settings change that leaves the stored speed alone (e.g. toggling preview_half) keeps the runtime speed;
+	 * changing the stored speed applies it. */
+	obs_data_t *keep = obs_source_get_settings(rs2);
+	obs_data_set_bool(keep, SETTING_PREVIEW_HALF, !obs_data_get_bool(keep, SETTING_PREVIEW_HALF));
+	CHECK(update_and_wait(rs2, keep), "settings update not applied");
+	CHECK(replay_source_get_status(ctx2, &st2) && st2.speed_percent == 40.0f,
+	      "unrelated settings change reset runtime speed 40.0 to %.2f", st2.speed_percent);
+	obs_data_set_double(keep, SETTING_SPEED, 75.0);
+	CHECK(update_and_wait(rs2, keep), "speed update not applied");
+	CHECK(replay_source_get_status(ctx2, &st2) && st2.speed_percent == 75.0f,
+	      "changed stored speed not applied: %.2f", st2.speed_percent);
+	obs_data_set_double(keep, SETTING_SPEED, 100.0);
+	CHECK(update_and_wait(rs2, keep), "speed reset update not applied");
+	obs_data_release(keep);
 	/* Reset speed to 100% after Section 3 SetSpeed tests */
 	replay_control_set_all_speed(100.0f);
 

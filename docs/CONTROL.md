@@ -132,7 +132,9 @@ Omit both `source` and `sources` to target **all** replay sources. `sources` acc
 ```
 
 #### `SetSpeed`
-Sets arbitrary playback speed (`0.01`–`400.0`%) on one, several, or all replay sources.
+Sets arbitrary playback speed (`0.01`–`400.0`%) on one, several, or all replay sources. The speed is a runtime value
+(also set by the speed hotkeys): it is not written to the source settings and survives other settings changes (e.g.
+toggling `preview_half` in the properties). Only changing the stored speed property itself overrides it.
 
 - **Request Data**:
 ```json
@@ -378,7 +380,7 @@ Example: button "Saving Cam 1" active while the latest event is `SaveStarted` wi
 ## 7. Half-Resolution Replay Previews (`preview_half`)
 
 ### Setting: `preview_half`
-- **Type**: `bool` (checkbox on the replay source; default `false` / unchecked)
+- **Type**: `bool` (checkbox on the replay source; default `true` / checked; sources saved with an explicit value keep it)
 - **UI Labels**:
   - en-US: `Half-Resolution Replay Previews`
   - de-DE: `Replay-Vorschau in halber Auflösung`
@@ -392,4 +394,4 @@ Example: button "Saving Cam 1" active while the latest event is `SaveStarted` wi
 - **Frame buffer & saves**: Capture buffers in RAM and exported video files (`Save`, `SaveAll`, auto-save) remain completely untouched at their original captured resolution. The half image is a separate NV12 copy.
 - **Same-size replacement**: A new half frame is uploaded immediately. OBS otherwise keeps the previous async texture when the dimensions do not change, which left a cleared clip on screen.
 - **Format prerequisites**: Downscaling requires 8-bit YUV formats convertible to NV12 (NV12, UYVY, YUY2, I420, I422) with source width $\ge 1280\text{ px}$ and both width and height divisible by 4. Unsupported formats (e.g., RGB/RGBA or formats with non-divisible dimensions) remain at original resolution.
-- **Performance**: No guaranteed performance gains are promised until measured on target hardware. Windows platform support carries no performance claims prior to verified smoke tests.
+- **Performance** (7 real cameras, Ryzen 9 5950X / RTX 4070 Ti, OBS 32.2.2, all replays in Multiview at 50 %): render time per frame 9.84 → 6.96 ms, skipped render frames 0.41 → 0.27 %, about one CPU core more for the downscale; GPU, NVDEC and RAM unchanged.
