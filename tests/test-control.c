@@ -139,7 +139,8 @@ struct fake_ws_event_entry {
 struct fake_ws_state {
 	proc_handler_t *ph;
 	int vendor_token;
-	char *vendor_name;
+	char *vendor_names[4];
+	size_t vendor_count;
 	DARRAY(struct fake_ws_req_entry) requests;
 	DARRAY(struct fake_ws_event_entry) events;
 };
@@ -156,10 +157,19 @@ static void fake_ws_vendor_register_proc(void *data, calldata_t *cd)
 {
 	struct fake_ws_state *ws = data;
 	const char *name = calldata_string(cd, "name");
-	bfree(ws->vendor_name);
-	ws->vendor_name = bstrdup(name ? name : "");
+	if (name && ws->vendor_count < 4)
+		ws->vendor_names[ws->vendor_count++] = bstrdup(name);
 	calldata_set_ptr(cd, "vendor", &ws->vendor_token);
 	calldata_set_bool(cd, "success", true);
+}
+
+static bool vendor_seen(const char *name)
+{
+	for (size_t i = 0; i < g_fake_ws.vendor_count; i++) {
+		if (g_fake_ws.vendor_names[i] && strcmp(g_fake_ws.vendor_names[i], name) == 0)
+			return true;
+	}
+	return false;
 }
 
 static void fake_ws_vendor_request_register_proc(void *data, calldata_t *cd)
@@ -424,16 +434,21 @@ int main(int argc, char **argv)
 	struct hotkey_snapshot snap = {0};
 	obs_enum_hotkeys(collect_hotkeys_cb, &snap);
 
-	/* Verify global frontend hotkeys exist exactly once */
+	/* Contract hotkeys moved to the MulticamReplay vendor; only approach-specific extras stay global here. */
 	const char *const expected_global_hotkeys[] = {
-		"ReplaySource.SaveAll",        "ReplaySource.LoadAll",         "ReplaySource.AllNormalSpeed",
-		"ReplaySource.AllHalfSpeed",   "ReplaySource.AllQuarterSpeed", "ReplaySource.AllRestart",
-		"ReplaySource.AllPause",       "ReplaySource.AllMarkIn",       "ReplaySource.AllMarkOut",
-		"ReplaySource.AllMarkReset",
+		"ReplaySource.SlowmoBlendOff", "ReplaySource.SlowmoBlendProgram", "ReplaySource.SlowmoBlendAlways",
 	};
 	for (size_t i = 0; i < sizeof(expected_global_hotkeys) / sizeof(expected_global_hotkeys[0]); i++) {
 		CHECK(count_hotkey_name(&snap, expected_global_hotkeys[i]) == 1,
 		      "expected global hotkey '%s' exactly once", expected_global_hotkeys[i]);
+	}
+	const char *const removed_contract_hotkeys[] = {
+		"ReplaySource.SaveAll", "ReplaySource.LoadAll", "ReplaySource.AllNormalSpeed", "ReplaySource.AllRestart",
+		"ReplaySource.AllMarkIn",
+	};
+	for (size_t i = 0; i < sizeof(removed_contract_hotkeys) / sizeof(removed_contract_hotkeys[0]); i++) {
+		CHECK(count_hotkey_name(&snap, removed_contract_hotkeys[i]) == 0,
+		      "contract hotkey '%s' must no longer be registered under ReplaySource", removed_contract_hotkeys[i]);
 	}
 
 	/* Verify every per-source hotkey exists with <legacy>.<source_name>, is unique, and no bare legacy name remains */
@@ -516,7 +531,7 @@ int main(int argc, char **argv)
 
 	/* rs3 has no camera configured (empty buffer -> should be skipped by LoadAll) */
 	obs_data_t *load_all_res = obs_data_create();
-	CHECK(call_ws_request("LoadAll", NULL, load_all_res), "LoadAll vendor request not registered");
+	replay_control_load_all(NULL, 0, load_all_res);
 	CHECK(obs_data_get_bool(load_all_res, "ok"), "LoadAll response ok != true");
 	CHECK(obs_data_get_int(load_all_res, "loadedCount") == 2, "expected loadedCount == 2, got %lld",
 	      obs_data_get_int(load_all_res, "loadedCount"));
@@ -562,18 +577,15 @@ int main(int argc, char **argv)
 	CHECK(end_diff <= interval_ns, "aligned last frame diff %" PRIu64 " exceeds 1 frame interval %" PRIu64,
 	      end_diff, interval_ns);
 
-	/* Verify ReplayLoaded vendor events were emitted for both loaded sources */
-	CHECK(g_fake_ws.events.num >= 2, "expected at least 2 ReplayLoaded vendor events, got %zu",
-	      g_fake_ws.events.num);
-	CHECK(strcmp(g_fake_ws.events.array[0].type, "ReplayLoaded") == 0, "expected event type ReplayLoaded");
+	/* ReplayLoaded events belong to the MulticamReplay contract, not the per-source load path. */
 
 	/* =====================================================================
-	 * 3. Vendor API: GetReplays, Action (unknown + valid), SetSpeed
+	 * 3. Remaining ReplaySource vendor plus channel speed
 	 * ===================================================================== */
-	CHECK(g_fake_ws.vendor_name && strcmp(g_fake_ws.vendor_name, "ReplaySource") == 0,
-	      "expected vendor 'ReplaySource', got '%s'", g_fake_ws.vendor_name ? g_fake_ws.vendor_name : "(null)");
+	CHECK(vendor_seen("ReplaySource"), "ReplaySource vendor not registered");
+	CHECK(vendor_seen("MulticamReplay"), "MulticamReplay vendor not registered");
 
-	/* GetReplays */
+	/* GetReplays stays on the old vendor (approach extra, not a contract request). */
 	obs_data_t *get_res = obs_data_create();
 	CHECK(call_ws_request("GetReplays", NULL, get_res), "GetReplays request failed");
 	CHECK(obs_data_get_bool(get_res, "ok"), "GetReplays ok != true");
@@ -586,86 +598,22 @@ int main(int argc, char **argv)
 	obs_data_release(sq);
 	obs_data_release(get_res);
 
-	/* Action: unknown action -> ok:false, error */
-	obs_data_t *act_bad_req = obs_data_create();
-	obs_data_t *act_bad_res = obs_data_create();
-	obs_data_set_string(act_bad_req, "action", "BogusNonExistentAction");
-	CHECK(call_ws_request("Action", act_bad_req, act_bad_res), "Action request not registered");
-	CHECK(!obs_data_get_bool(act_bad_res, "ok"), "expected ok == false for unknown action");
-	CHECK(strlen(obs_data_get_string(act_bad_res, "error")) > 0, "expected error message for unknown action");
-	obs_data_release(act_bad_req);
-	obs_data_release(act_bad_res);
-
-	/* Action: valid action ("HalfSpeed") on Replay Cam 1 + one unknown source */
-	obs_data_t *act_ok_req = obs_data_create();
-	obs_data_t *act_ok_res = obs_data_create();
-	obs_data_set_string(act_ok_req, "action", "HalfSpeed");
-	obs_data_array_t *target_sources = obs_data_array_create();
-	obs_data_t *t_cam1 = obs_data_create();
-	obs_data_set_string(t_cam1, "name", "Replay Cam 1");
-	obs_data_array_push_back(target_sources, t_cam1);
-	obs_data_release(t_cam1);
-	obs_data_t *t_missing = obs_data_create();
-	obs_data_set_string(t_missing, "name", "NoSuchReplaySource");
-	obs_data_array_push_back(target_sources, t_missing);
-	obs_data_release(t_missing);
-	obs_data_set_array(act_ok_req, "sources", target_sources);
-	obs_data_array_release(target_sources);
-
-	CHECK(call_ws_request("Action", act_ok_req, act_ok_res), "Action request call failed");
-	CHECK(obs_data_get_bool(act_ok_res, "ok"), "expected ok == true for HalfSpeed action");
-	CHECK(obs_data_get_int(act_ok_res, "appliedCount") == 1, "expected appliedCount == 1");
-	CHECK(obs_data_get_int(act_ok_res, "unknownCount") == 1, "expected unknownCount == 1");
-	obs_data_release(act_ok_req);
-	obs_data_release(act_ok_res);
-
+	/* Contract speed is channel-wide. Per-source speed remains a raw extra. */
+	CHECK(replay_source_execute_action(ctx1, "HalfSpeed", false), "HalfSpeed action failed");
 	CHECK(replay_source_get_status(ctx1, &st1) && st1.speed_percent == 50.0f,
-	      "expected Replay Cam 1 speed 50.0 after HalfSpeed action, got %.2f", st1.speed_percent);
+	      "expected Replay Cam 1 speed 50.0 after HalfSpeed, got %.2f", st1.speed_percent);
 	CHECK(replay_source_get_status(ctx2, &st2) && st2.speed_percent == 100.0f,
 	      "expected Replay Cam 2 speed unchanged at 100.0, got %.2f", st2.speed_percent);
 
-	/* SetSpeed: set all replay sources to 25% */
-	obs_data_t *spd_req = obs_data_create();
-	obs_data_t *spd_res = obs_data_create();
-	obs_data_set_double(spd_req, "speedPercent", 25.0);
-	CHECK(call_ws_request("SetSpeed", spd_req, spd_res), "SetSpeed request call failed");
-	CHECK(obs_data_get_bool(spd_res, "ok"), "expected SetSpeed ok == true");
-	CHECK(obs_data_get_int(spd_res, "appliedCount") == 3, "expected SetSpeed applied to 3 sources");
-	obs_data_release(spd_req);
-	obs_data_release(spd_res);
-
+	replay_control_set_all_speed(25.0f);
 	CHECK(replay_source_get_status(ctx1, &st1) && st1.speed_percent == 25.0f,
 	      "expected Replay Cam 1 speed 25.0, got %.2f", st1.speed_percent);
 	CHECK(replay_source_get_status(ctx2, &st2) && st2.speed_percent == 25.0f,
 	      "expected Replay Cam 2 speed 25.0, got %.2f", st2.speed_percent);
 
-	/* A JSON string array ("sources": ["Replay Cam 1"]) reaches the plugin as an empty obs_data array because
-	 * obs-websocket keeps only object items; that must be rejected instead of silently targeting nothing. */
-	obs_data_t *bad_req = obs_data_create();
-	obs_data_t *bad_res = obs_data_create();
-	obs_data_array_t *dropped_strings = obs_data_array_create();
-	obs_data_set_array(bad_req, "sources", dropped_strings);
-	obs_data_array_release(dropped_strings);
-	obs_data_set_double(bad_req, "speedPercent", 50.0);
-	CHECK(call_ws_request("SetSpeed", bad_req, bad_res), "SetSpeed (empty sources) request call failed");
-	CHECK(!obs_data_get_bool(bad_res, "ok"), "expected SetSpeed with empty sources array to fail");
-	CHECK(replay_source_get_status(ctx1, &st1) && st1.speed_percent == 25.0f,
-	      "speed must stay 25.0 after rejected request, got %.2f", st1.speed_percent);
-	obs_data_release(bad_req);
-	obs_data_release(bad_res);
-
-	/* Comma-separated string targets exactly the listed sources */
-	obs_data_t *csv_req = obs_data_create();
-	obs_data_t *csv_res = obs_data_create();
-	obs_data_set_string(csv_req, "sources", "Replay Cam 1, Replay Cam 2");
-	obs_data_set_double(csv_req, "speedPercent", 40.0);
-	CHECK(call_ws_request("SetSpeed", csv_req, csv_res), "SetSpeed (csv) request call failed");
-	CHECK(obs_data_get_bool(csv_res, "ok") && obs_data_get_int(csv_res, "appliedCount") == 2,
-	      "expected SetSpeed csv applied to 2 sources");
+	replay_source_set_speed(ctx2, 40.0f);
 	CHECK(replay_source_get_status(ctx2, &st2) && st2.speed_percent == 40.0f,
 	      "expected Replay Cam 2 speed 40.0, got %.2f", st2.speed_percent);
-	obs_data_release(csv_req);
-	obs_data_release(csv_res);
 
 	/* A settings change that leaves the stored speed alone (e.g. toggling preview_half) keeps the runtime speed;
 	 * changing the stored speed applies it. */
@@ -721,11 +669,8 @@ int main(int argc, char **argv)
 	CHECK(st1.mark_out_ms == st2.mark_out_ms, "AllMarkOut markOutMs mismatch: %" PRId64 " vs %" PRId64,
 	      st1.mark_out_ms, st2.mark_out_ms);
 
-	/* Vendor Request: MarkReset restores the aligned window, not the full buffer */
-	obs_data_t *rst_res = obs_data_create();
-	CHECK(call_ws_request("MarkReset", NULL, rst_res), "MarkReset request failed");
-	CHECK(obs_data_get_bool(rst_res, "ok"), "MarkReset ok != true");
-	obs_data_release(rst_res);
+	/* MarkReset restores the aligned window, not the full buffer. */
+	replay_control_all_mark_reset();
 
 	CHECK(replay_source_get_status(ctx1, &st1) && replay_source_get_status(ctx2, &st2),
 	      "replay_source_get_status failed after MarkReset");
@@ -741,21 +686,11 @@ int main(int argc, char **argv)
 	CHECK(st1.effective_start_ns == st2.effective_start_ns, "effective_start_ns after clamped In must match");
 	CHECK(st1.mark_in_ms == 0 && st2.mark_in_ms == 0, "clamped In must clamp to aligned start (markInMs == 0)");
 
-	/* Vendor Request: MarkIn returns per-source timing */
+	/* Channel MarkIn uses the reference source playback position. */
 	replay_source_test_set_playback_pos(ctx1, mark_in_ts, cam1_start);
-	obs_data_t *min_req = obs_data_create();
-	obs_data_t *min_res = obs_data_create();
-	obs_data_set_string(min_req, "source", "Replay Cam 1");
-	CHECK(call_ws_request("MarkIn", min_req, min_res), "MarkIn request failed");
-	CHECK(obs_data_get_bool(min_res, "ok"), "MarkIn ok != true");
-	obs_data_array_t *min_srcs = obs_data_get_array(min_res, "sources");
-	CHECK(obs_data_array_count(min_srcs) == 1, "expected 1 source in MarkIn response");
-	obs_data_t *min_item = obs_data_array_item(min_srcs, 0);
-	CHECK(obs_data_get_int(min_item, "inMs") > 0, "MarkIn inMs must be > 0");
-	obs_data_release(min_item);
-	obs_data_array_release(min_srcs);
-	obs_data_release(min_req);
-	obs_data_release(min_res);
+	replay_control_all_mark_in();
+	CHECK(replay_source_get_status(ctx1, &st1) && st1.mark_in_ms > 0, "MarkIn markInMs must be > 0, got %" PRId64,
+	      st1.mark_in_ms);
 
 	/* =====================================================================
 	 * 5. Auto-Save Tests (ON_LOAD, ON_RELEASE, OFF)
@@ -779,7 +714,7 @@ int main(int argc, char **argv)
 	feed_nv12_frames(cam2, 320, 180, 30, as_base_ts + 4ULL * interval_ns, interval_ns);
 
 	obs_data_t *load_as_res = obs_data_create();
-	CHECK(call_ws_request("LoadAll", NULL, load_as_res), "LoadAll with AUTO_SAVE_ON_LOAD failed");
+	replay_control_load_all(NULL, 0, load_as_res);
 	CHECK(obs_data_get_bool(load_as_res, "ok"), "LoadAll ok != true");
 	obs_data_release(load_as_res);
 
@@ -806,31 +741,17 @@ int main(int argc, char **argv)
 	const uint64_t rel_base_ts = as_base_ts + 50ULL * interval_ns;
 	feed_nv12_frames(cam1, 320, 180, 30, rel_base_ts, interval_ns);
 
-	obs_data_t *load_act_req = obs_data_create();
-	obs_data_t *load_act_res = obs_data_create();
-	obs_data_set_string(load_act_req, "action", "Load");
-	obs_data_set_string(load_act_req, "source", "Replay Cam 1");
-	CHECK(call_ws_request("Action", load_act_req, load_act_res), "Action Load failed");
-	obs_data_release(load_act_req);
-	obs_data_release(load_act_res);
+	CHECK(replay_source_execute_action(ctx1, "Load", false), "Load action failed");
 
 	replay_source_test_set_playback_pos(ctx1, rel_base_ts + 5ULL * interval_ns, rel_base_ts);
 	obs_data_t *mark_act_req = obs_data_create();
-	obs_data_t *mark_act_res = obs_data_create();
-	obs_data_set_string(mark_act_req, "action", "MarkIn");
-	obs_data_set_string(mark_act_req, "source", "Replay Cam 1");
-	CHECK(call_ws_request("Action", mark_act_req, mark_act_res), "Action MarkIn failed");
+	CHECK(replay_source_execute_action(ctx1, "MarkIn", false), "MarkIn action failed");
 	obs_data_release(mark_act_req);
-	obs_data_release(mark_act_res);
 
 	clear_fake_events();
 	obs_data_t *clr_act_req = obs_data_create();
-	obs_data_t *clr_act_res = obs_data_create();
-	obs_data_set_string(clr_act_req, "action", "Clear");
-	obs_data_set_string(clr_act_req, "source", "Replay Cam 1");
-	CHECK(call_ws_request("Action", clr_act_req, clr_act_res), "Action Clear failed");
+	CHECK(replay_source_execute_action(ctx1, "Clear", false), "Clear action failed");
 	obs_data_release(clr_act_req);
-	obs_data_release(clr_act_res);
 
 	CHECK(replay_save_queue_wait_idle(5000), "replay_save_queue_wait_idle failed for auto-release");
 	size_t auto_rel_events = 0;
@@ -846,12 +767,8 @@ int main(int argc, char **argv)
 	/* Second Clear of the same replay must not enqueue again */
 	clear_fake_events();
 	obs_data_t *clr2_act_req = obs_data_create();
-	obs_data_t *clr2_act_res = obs_data_create();
-	obs_data_set_string(clr2_act_req, "action", "Clear");
-	obs_data_set_string(clr2_act_req, "source", "Replay Cam 1");
-	CHECK(call_ws_request("Action", clr2_act_req, clr2_act_res), "second Clear call failed");
+	CHECK(replay_source_execute_action(ctx1, "Clear", false), "second Clear action failed");
 	obs_data_release(clr2_act_req);
-	obs_data_release(clr2_act_res);
 	CHECK(replay_save_queue_pending_count() == 0, "second Clear must not enqueue job");
 	CHECK(g_fake_ws.events.num == 0, "second Clear must emit no SaveStarted events");
 
@@ -864,21 +781,13 @@ int main(int argc, char **argv)
 
 	feed_nv12_frames(cam1, 320, 180, 30, rel_base_ts + 100ULL * interval_ns, interval_ns);
 	obs_data_t *load3_req = obs_data_create();
-	obs_data_t *load3_res = obs_data_create();
-	obs_data_set_string(load3_req, "action", "Load");
-	obs_data_set_string(load3_req, "source", "Replay Cam 1");
-	CHECK(call_ws_request("Action", load3_req, load3_res), "Action Load failed for AUTO_SAVE_OFF");
+	CHECK(replay_source_execute_action(ctx1, "Load", false), "Load action failed for AUTO_SAVE_OFF");
 	obs_data_release(load3_req);
-	obs_data_release(load3_res);
 
 	clear_fake_events();
 	obs_data_t *clr3_req = obs_data_create();
-	obs_data_t *clr3_res = obs_data_create();
-	obs_data_set_string(clr3_req, "action", "Clear");
-	obs_data_set_string(clr3_req, "source", "Replay Cam 1");
-	CHECK(call_ws_request("Action", clr3_req, clr3_res), "Action Clear failed for AUTO_SAVE_OFF");
+	CHECK(replay_source_execute_action(ctx1, "Clear", false), "Clear action failed for AUTO_SAVE_OFF");
 	obs_data_release(clr3_req);
-	obs_data_release(clr3_res);
 	CHECK(replay_save_queue_pending_count() == 0, "AUTO_SAVE_OFF Clear must not enqueue job");
 	CHECK(g_fake_ws.events.num == 0, "AUTO_SAVE_OFF Clear must emit no SaveStarted events");
 
@@ -918,10 +827,9 @@ int main(int argc, char **argv)
 	feed_nv12_frames(stall_cams[3], 320, 180, 180, trigger_ts + 1500000000ULL - 180ULL * interval_ns, interval_ns);
 
 	clear_fake_events();
-	obs_data_t *stall_req = obs_data_create();
+	const char *stall_filter[] = {"Replay Cam 4", "Replay Cam 5", "Replay Cam 6", "Replay Cam 7"};
 	obs_data_t *stall_res = obs_data_create();
-	obs_data_set_string(stall_req, "sources", "Replay Cam 4,Replay Cam 5,Replay Cam 6,Replay Cam 7");
-	CHECK(call_ws_request("LoadAll", stall_req, stall_res), "LoadAll (stall test) failed");
+	replay_control_load_all(stall_filter, 4, stall_res);
 	CHECK(obs_data_get_int(stall_res, "loadedCount") == 2 && obs_data_get_int(stall_res, "skippedCount") == 2,
 	      "expected 2 loaded / 2 skipped, got %lld / %lld", obs_data_get_int(stall_res, "loadedCount"),
 	      obs_data_get_int(stall_res, "skippedCount"));
@@ -948,7 +856,6 @@ int main(int argc, char **argv)
 		obs_data_release(sk);
 	}
 	obs_data_array_release(stall_skipped);
-	obs_data_release(stall_req);
 	obs_data_release(stall_res);
 
 	for (int i = 1; i < 3; i++) {
@@ -970,6 +877,476 @@ int main(int argc, char **argv)
 		obs_source_release(stall_cams[i]);
 	}
 
+	/* =====================================================================
+	 * 7. MulticamReplay contract: status, trigger, transport, marks, hotkeys
+	 * ===================================================================== */
+	CHECK(!find_ws_request("LoadAll") && !find_ws_request("Action") && !find_ws_request("SaveAll"),
+	      "contract requests must not stay registered on the old vendor");
+
+	struct hotkey_snapshot contract_keys;
+	memset(&contract_keys, 0, sizeof contract_keys);
+	obs_enum_hotkeys(collect_hotkeys_cb, &contract_keys);
+	const char *const contract_hotkeys[] = {
+		"MulticamReplay.Trigger", "MulticamReplay.Release", "MulticamReplay.TogglePlay",
+		"MulticamReplay.Restart", "MulticamReplay.Speed100", "MulticamReplay.Speed75",
+		"MulticamReplay.Speed50", "MulticamReplay.Speed25", "MulticamReplay.ToggleDirection",
+		"MulticamReplay.StepForward", "MulticamReplay.StepBackward", "MulticamReplay.ToggleLoop",
+		"MulticamReplay.MarkIn", "MulticamReplay.MarkOut", "MulticamReplay.MarkReset",
+		"MulticamReplay.SaveHighlight", "MulticamReplay.SaveScoringPlay", "MulticamReplay.SaveFoul",
+		"MulticamReplay.SaveOther", "MulticamReplay.SaveAllAngles", "MulticamReplay.PlaylistAll",
+		"MulticamReplay.PlaylistTogglePlay", "MulticamReplay.PlaylistNext",
+		"MulticamReplay.PlaylistPrevious", "MulticamReplay.PlaylistStop",
+	};
+	for (size_t i = 0; i < sizeof contract_hotkeys / sizeof contract_hotkeys[0]; i++) {
+		CHECK(count_hotkey_name(&contract_keys, contract_hotkeys[i]) == 1,
+		      "expected contract hotkey '%s' exactly once", contract_hotkeys[i]);
+	}
+	free_hotkey_snapshot(&contract_keys);
+
+	obs_data_t *idle_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, idle_res), "GetStatus not registered");
+	CHECK(obs_data_get_bool(idle_res, "ok") && obs_data_get_int(idle_res, "contract") == 1,
+	      "GetStatus contract field");
+	CHECK(strcmp(obs_data_get_string(idle_res, "implementation"), "raw-nv12") == 0, "implementation must be raw-nv12");
+	CHECK(strcmp(obs_data_get_string(idle_res, "state"), "idle") == 0, "state must be idle before a clip, got '%s'",
+	      obs_data_get_string(idle_res, "state"));
+	CHECK(!obs_data_get_bool(idle_res, "ready"), "ready must be false without a 12 s window");
+	obs_data_release(idle_res);
+
+	obs_data_t *noclip_req = obs_data_create();
+	obs_data_t *noclip_res = obs_data_create();
+	CHECK(call_ws_request("Play", noclip_req, noclip_res), "Play not registered");
+	CHECK(!obs_data_get_bool(noclip_res, "ok") && strcmp(obs_data_get_string(noclip_res, "code"), "NoClipLoaded") == 0,
+	      "Play without a clip must return NoClipLoaded");
+	obs_data_release(noclip_req);
+	obs_data_release(noclip_res);
+	obs_data_t *bad_speed_req = obs_data_create();
+	obs_data_t *bad_speed_res = obs_data_create();
+	obs_data_set_double(bad_speed_req, "speedPercent", 1000.0);
+	CHECK(call_ws_request("SetSpeed", bad_speed_req, bad_speed_res), "SetSpeed not registered");
+	CHECK(!obs_data_get_bool(bad_speed_res, "ok") &&
+		      strcmp(obs_data_get_string(bad_speed_res, "code"), "InvalidParameter") == 0,
+	      "invalid speed without a clip must be InvalidParameter, got '%s'",
+	      obs_data_get_string(bad_speed_res, "code"));
+	obs_data_release(bad_speed_req);
+	obs_data_release(bad_speed_res);
+	obs_data_t *bad_step_req = obs_data_create();
+	obs_data_t *bad_step_res = obs_data_create();
+	obs_data_set_int(bad_step_req, "frames", 0);
+	CHECK(call_ws_request("Step", bad_step_req, bad_step_res) && !obs_data_get_bool(bad_step_res, "ok") &&
+		      strcmp(obs_data_get_string(bad_step_res, "code"), "InvalidParameter") == 0,
+	      "step 0 without a clip must be InvalidParameter");
+	obs_data_release(bad_step_req);
+	obs_data_release(bad_step_res);
+	obs_data_t *bad_dir_req = obs_data_create();
+	obs_data_t *bad_dir_res = obs_data_create();
+	obs_data_set_string(bad_dir_req, "direction", "up");
+	CHECK(call_ws_request("SetDirection", bad_dir_req, bad_dir_res) && !obs_data_get_bool(bad_dir_res, "ok") &&
+		      strcmp(obs_data_get_string(bad_dir_res, "code"), "InvalidParameter") == 0,
+	      "invalid direction without a clip must be InvalidParameter");
+	obs_data_release(bad_dir_req);
+	obs_data_release(bad_dir_res);
+
+
+	clear_fake_events();
+	obs_data_t *bad_look_req = obs_data_create();
+	obs_data_t *bad_look_res = obs_data_create();
+	obs_data_set_int(bad_look_req, "lookbackMs", 500);
+	CHECK(call_ws_request("Trigger", bad_look_req, bad_look_res), "Trigger not registered");
+	CHECK(!obs_data_get_bool(bad_look_res, "ok") &&
+		      strcmp(obs_data_get_string(bad_look_res, "code"), "InvalidParameter") == 0,
+	      "lookbackMs 500 must be InvalidParameter");
+	size_t trigger_failed = 0;
+	for (size_t i = 0; i < g_fake_ws.events.num; i++) {
+		if (strcmp(g_fake_ws.events.array[i].type, "TriggerFailed") == 0)
+			trigger_failed++;
+	}
+	CHECK(trigger_failed == 1, "invalid Trigger must emit TriggerFailed, got %zu", trigger_failed);
+	obs_data_release(bad_look_req);
+	obs_data_release(bad_look_res);
+
+	obs_source_t *cam_a = obs_source_create("dummy_async_cam", "Cam A", NULL, NULL);
+	obs_source_t *rs_a = obs_source_create(REPLAY_SOURCE_ID, "Raw A", NULL, NULL);
+	CHECK(cam_a && rs_a, "failed to create contract camera");
+	obs_data_t *sa = obs_source_get_settings(rs_a);
+	obs_data_set_string(sa, SETTING_SOURCE, "Cam A");
+	obs_data_set_int(sa, SETTING_DURATION, 5000);
+	obs_source_update(rs_a, sa);
+	obs_source_load(rs_a);
+	obs_data_release(sa);
+	obs_scene_t *scene_a = obs_scene_create("Replay Cam A");
+	CHECK(scene_a && obs_scene_add(scene_a, rs_a), "failed to create replay scene");
+
+	const uint64_t contract_interval = 1000000000ULL / 60ULL;
+	uint64_t contract_now = os_gettime_ns();
+	feed_nv12_frames(cam_a, 320, 180, 90, contract_now - 90ULL * contract_interval, contract_interval);
+
+	clear_fake_events();
+	obs_data_t *trig_req = obs_data_create();
+	obs_data_t *trig_res = obs_data_create();
+	obs_data_set_int(trig_req, "lookbackMs", 1000);
+	obs_data_set_string(trig_req, "label", "Ereignis");
+	CHECK(call_ws_request("Trigger", trig_req, trig_res), "Trigger call failed");
+	CHECK(obs_data_get_bool(trig_res, "ok"), "Trigger failed: %s", obs_data_get_string(trig_res, "message"));
+	const char *clip_id = obs_data_get_string(trig_res, "clipId");
+	CHECK(clip_id && clip_id[0], "Trigger must return a clipId");
+	obs_data_release(trig_req);
+	obs_data_release(trig_res);
+
+	size_t clip_loaded = 0;
+	for (size_t i = 0; i < g_fake_ws.events.num; i++) {
+		if (strcmp(g_fake_ws.events.array[i].type, "ClipLoaded") == 0)
+			clip_loaded++;
+	}
+	CHECK(clip_loaded == 1, "Trigger must emit one ClipLoaded, got %zu", clip_loaded);
+
+	obs_data_t *st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after trigger failed");
+	obs_data_t *clip = obs_data_get_obj(st_res, "clip");
+	CHECK(clip, "GetStatus clip missing after trigger");
+	CHECK(strcmp(obs_data_get_string(st_res, "state"), "playing") == 0, "trigger must start playback, got '%s'",
+	      obs_data_get_string(st_res, "state"));
+	CHECK(obs_data_get_int(clip, "durationMs") == 1000, "clip durationMs %lld, expected 1000",
+	      obs_data_get_int(clip, "durationMs"));
+	CHECK(obs_data_get_bool(clip, "loop"), "trigger must enable loop");
+	CHECK(strcmp(obs_data_get_string(clip, "direction"), "forward") == 0, "trigger must restore forward");
+	CHECK(strcmp(obs_data_get_string(clip, "origin"), "trigger") == 0, "origin must be trigger");
+	CHECK(strcmp(obs_data_get_string(clip, "label"), "Ereignis") == 0, "label not kept");
+	CHECK(obs_data_get_int(clip, "speedPercent") == 100, "default speed must stay 100");
+	obs_data_release(clip);
+	obs_data_release(st_res);
+
+	obs_data_t *spd_req = obs_data_create();
+	obs_data_t *spd_res = obs_data_create();
+	obs_data_set_double(spd_req, "speedPercent", 50.0);
+	CHECK(call_ws_request("SetSpeed", spd_req, spd_res) && obs_data_get_bool(spd_res, "ok"), "SetSpeed 50 failed");
+	obs_data_release(spd_req);
+	obs_data_release(spd_res);
+	obs_data_set_double(spd_req = obs_data_create(), "speedPercent", 1.0);
+	spd_res = obs_data_create();
+	CHECK(call_ws_request("SetSpeed", spd_req, spd_res), "SetSpeed call failed");
+	CHECK(!obs_data_get_bool(spd_res, "ok") && strcmp(obs_data_get_string(spd_res, "code"), "InvalidParameter") == 0,
+	      "speed 1 must be rejected");
+	obs_data_release(spd_req);
+	obs_data_release(spd_res);
+
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after rejected speed failed");
+	clip = obs_data_get_obj(st_res, "clip");
+	CHECK(clip && obs_data_get_int(clip, "speedPercent") == 50, "rejected SetSpeed changed speed to %lld",
+	      clip ? obs_data_get_int(clip, "speedPercent") : -1);
+	obs_data_release(clip);
+	obs_data_release(st_res);
+
+	obs_data_t *mark_req = obs_data_create();
+	obs_data_t *mark_res = obs_data_create();
+	obs_data_set_int(mark_req, "positionMs", 1000);
+	CHECK(call_ws_request("MarkIn", mark_req, mark_res), "MarkIn call failed");
+	CHECK(!obs_data_get_bool(mark_res, "ok") && strcmp(obs_data_get_string(mark_res, "code"), "InvalidParameter") == 0,
+	      "MarkIn at mark out must be rejected");
+	obs_data_release(mark_req);
+	obs_data_release(mark_res);
+
+	obs_data_t *angle_req = obs_data_create();
+	obs_data_t *angle_res = obs_data_create();
+	obs_data_set_string(angle_req, "angle", "Cam A");
+	CHECK(call_ws_request("SetSaveAngle", angle_req, angle_res) && obs_data_get_bool(angle_res, "ok"),
+	      "SetSaveAngle failed: %s", obs_data_get_string(angle_res, "message"));
+	obs_data_release(angle_req);
+	obs_data_release(angle_res);
+
+	obs_data_t *bad_tag_req = obs_data_create();
+	obs_data_t *bad_tag_res = obs_data_create();
+	obs_data_set_string(bad_tag_req, "tags", "Not A Tag");
+	CHECK(call_ws_request("Save", bad_tag_req, bad_tag_res), "Save not registered");
+	CHECK(!obs_data_get_bool(bad_tag_res, "ok") &&
+		      strcmp(obs_data_get_string(bad_tag_res, "code"), "InvalidParameter") == 0,
+	      "invalid tags must be rejected");
+	obs_data_release(bad_tag_req);
+	obs_data_release(bad_tag_res);
+
+	obs_data_t *reset_game_req = obs_data_create();
+	obs_data_t *reset_game_res = obs_data_create();
+	obs_data_set_string(reset_game_req, "gameId", "game_default");
+	CHECK(call_ws_request("SetActiveGame", reset_game_req, reset_game_res) && obs_data_get_bool(reset_game_res, "ok"),
+	      "could not select game_default");
+	obs_data_release(reset_game_req);
+	obs_data_release(reset_game_res);
+	obs_data_t *save_game_req = obs_data_create();
+	obs_data_t *save_game_res = obs_data_create();
+	obs_data_set_string(save_game_req, "name", "Vertragslauf");
+	CHECK(call_ws_request("CreateGame", save_game_req, save_game_res) && obs_data_get_bool(save_game_res, "ok"),
+	      "CreateGame before save failed");
+	char save_game[64];
+	snprintf(save_game, sizeof save_game, "%s", obs_data_get_string(save_game_res, "gameId"));
+	CHECK(strncmp(save_game, "game-", 5) == 0, "save game id missing");
+	obs_data_release(save_game_req);
+	obs_data_release(save_game_res);
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after early CreateGame failed");
+	CHECK(strcmp(obs_data_get_string(st_res, "activeGameId"), "game_default") == 0,
+	      "CreateGame activated '%s'", obs_data_get_string(st_res, "activeGameId"));
+	obs_data_release(st_res);
+
+
+	obs_data_t *save_req = obs_data_create();
+	obs_data_t *save_res = obs_data_create();
+	obs_data_set_string(save_req, "gameId", save_game);
+	obs_data_set_string(save_req, "tags", "highlight");
+	CHECK(call_ws_request("Save", save_req, save_res), "Save call failed");
+	CHECK(obs_data_get_bool(save_res, "ok"), "Save failed: %s", obs_data_get_string(save_res, "message"));
+	const char *library_id = obs_data_get_string(save_res, "libraryId");
+	CHECK(library_id && library_id[0] && obs_data_get_string(save_res, "jobId")[0],
+	      "Save must return jobId and libraryId");
+	char saved_library_id[64];
+	snprintf(saved_library_id, sizeof saved_library_id, "%s", library_id);
+	obs_data_release(save_req);
+	obs_data_release(save_res);
+
+	obs_data_t *lib_res = obs_data_create();
+	CHECK(call_ws_request("GetLibrary", NULL, lib_res) && obs_data_get_bool(lib_res, "ok"), "GetLibrary failed");
+	obs_data_array_t *entries = obs_data_get_array(lib_res, "entries");
+	bool found_entry = false;
+	for (size_t i = 0; entries && i < obs_data_array_count(entries); i++) {
+		obs_data_t *entry = obs_data_array_item(entries, i);
+		if (strcmp(obs_data_get_string(entry, "libraryId"), saved_library_id) == 0 &&
+		    strcmp(obs_data_get_string(entry, "angle"), "Cam A") == 0 &&
+		    strcmp(obs_data_get_string(entry, "tags"), "highlight") == 0)
+			found_entry = true;
+		obs_data_release(entry);
+	}
+	CHECK(found_entry, "saved library entry missing");
+	obs_data_array_release(entries);
+	obs_data_release(lib_res);
+
+	obs_data_t *game_req = obs_data_create();
+	obs_data_t *game_res = obs_data_create();
+	obs_data_set_string(game_req, "gameId", "missing-game");
+	CHECK(call_ws_request("SetActiveGame", game_req, game_res), "SetActiveGame not registered");
+	CHECK(!obs_data_get_bool(game_res, "ok") && strcmp(obs_data_get_string(game_res, "code"), "GameNotFound") == 0,
+	      "unknown game must be GameNotFound");
+	obs_data_release(game_req);
+	obs_data_release(game_res);
+
+
+	CHECK(replay_save_queue_wait_idle(20000), "contract save did not finish");
+	lib_res = obs_data_create();
+	CHECK(call_ws_request("GetLibrary", NULL, lib_res) && obs_data_get_bool(lib_res, "ok"), "GetLibrary after save failed");
+	entries = obs_data_get_array(lib_res, "entries");
+	bool save_ready = false;
+	for (size_t i = 0; entries && i < obs_data_array_count(entries); i++) {
+		obs_data_t *entry = obs_data_array_item(entries, i);
+		if (strcmp(obs_data_get_string(entry, "libraryId"), saved_library_id) == 0 &&
+		    strcmp(obs_data_get_string(entry, "state"), "ready") == 0 &&
+		    obs_data_get_string(entry, "file")[0])
+			save_ready = true;
+		obs_data_release(entry);
+	}
+	CHECK(save_ready, "saved entry did not become ready");
+	obs_data_array_release(entries);
+	obs_data_release(lib_res);
+
+	obs_data_t *merge_req = obs_data_create();
+	obs_data_t *merge_res = obs_data_create();
+	obs_data_set_string(merge_req, "gameId", save_game);
+	obs_data_set_string(merge_req, "tags", "foul");
+	CHECK(call_ws_request("Save", merge_req, merge_res) && obs_data_get_bool(merge_res, "ok"), "tag merge save failed");
+	CHECK(strcmp(obs_data_get_string(merge_res, "libraryId"), saved_library_id) == 0,
+	      "same angle and range must keep libraryId '%s', got '%s'", saved_library_id,
+	      obs_data_get_string(merge_res, "libraryId"));
+	obs_data_release(merge_req);
+	obs_data_release(merge_res);
+
+	obs_data_t *tags_req = obs_data_create();
+	obs_data_t *tags_res = obs_data_create();
+	obs_data_set_string(tags_req, "libraryId", saved_library_id);
+	obs_data_set_string(tags_req, "tags", "highlight,scoring_play");
+	CHECK(call_ws_request("SetTags", tags_req, tags_res) && obs_data_get_bool(tags_res, "ok"), "SetTags failed");
+	obs_data_release(tags_req);
+	obs_data_release(tags_res);
+
+	obs_data_t *create_req = obs_data_create();
+	obs_data_t *create_res = obs_data_create();
+	obs_data_set_string(create_req, "name", "Vertragsspiel");
+	CHECK(call_ws_request("CreateGame", create_req, create_res) && obs_data_get_bool(create_res, "ok"),
+	      "CreateGame failed");
+	const char *new_game = obs_data_get_string(create_res, "gameId");
+	CHECK(new_game && strncmp(new_game, "game-", 5) == 0, "CreateGame must return a gameId");
+	char created_game[64];
+	snprintf(created_game, sizeof created_game, "%s", new_game);
+	obs_data_release(create_req);
+	obs_data_release(create_res);
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after CreateGame failed");
+	CHECK(strcmp(obs_data_get_string(st_res, "activeGameId"), "game_default") == 0,
+	      "CreateGame must not activate the game, got '%s'", obs_data_get_string(st_res, "activeGameId"));
+	obs_data_release(st_res);
+
+	obs_data_t *all_req = obs_data_create();
+	obs_data_t *all_res = obs_data_create();
+	obs_data_set_string(all_req, "tags", "other");
+	obs_data_set_string(all_req, "gameId", save_game);
+	CHECK(call_ws_request("SaveAllAngles", all_req, all_res) && obs_data_get_bool(all_res, "ok"),
+	      "SaveAllAngles failed: %s", obs_data_get_string(all_res, "message"));
+	obs_data_array_t *jobs = obs_data_get_array(all_res, "jobs");
+	CHECK(obs_data_array_count(jobs) == 1, "SaveAllAngles expected 1 job, got %zu", obs_data_array_count(jobs));
+	obs_data_t *job0 = obs_data_array_item(jobs, 0);
+	CHECK(strcmp(obs_data_get_string(job0, "libraryId"), saved_library_id) == 0, "SaveAllAngles did not merge");
+	obs_data_release(job0);
+	obs_data_array_release(jobs);
+	obs_data_release(all_req);
+	obs_data_release(all_res);
+
+	obs_data_t *active_req = obs_data_create();
+	obs_data_t *active_res = obs_data_create();
+	obs_data_set_string(active_req, "gameId", created_game);
+	CHECK(call_ws_request("SetActiveGame", active_req, active_res) && obs_data_get_bool(active_res, "ok"),
+	      "SetActiveGame failed");
+	obs_data_release(active_req);
+	obs_data_release(active_res);
+
+	obs_data_t *audio_req = obs_data_create();
+	obs_data_t *audio_res = obs_data_create();
+	obs_data_set_string(audio_req, "mode", "stereo");
+	CHECK(call_ws_request("SetReplayAudio", audio_req, audio_res), "SetReplayAudio not registered");
+	CHECK(!obs_data_get_bool(audio_res, "ok") && strcmp(obs_data_get_string(audio_res, "code"), "InvalidParameter") == 0,
+	      "invalid audio mode must be rejected");
+	obs_data_release(audio_req);
+	obs_data_release(audio_res);
+	audio_req = obs_data_create();
+	audio_res = obs_data_create();
+	obs_data_set_string(audio_req, "mode", "source");
+	obs_data_set_string(audio_req, "sourceName", "Missing Audio");
+	CHECK(call_ws_request("SetReplayAudio", audio_req, audio_res) && !obs_data_get_bool(audio_res, "ok"),
+	      "missing audio source must be rejected");
+	obs_data_release(audio_req);
+	obs_data_release(audio_res);
+	audio_req = obs_data_create();
+	audio_res = obs_data_create();
+	obs_data_set_string(audio_req, "mode", "angle");
+	obs_data_set_string(audio_req, "angle", "Cam A");
+	CHECK(call_ws_request("SetReplayAudio", audio_req, audio_res) && obs_data_get_bool(audio_res, "ok"),
+	      "angle audio mode failed");
+	obs_data_release(audio_req);
+	obs_data_release(audio_res);
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after audio failed");
+	obs_data_t *audio = obs_data_get_obj(st_res, "audio");
+	clip = obs_data_get_obj(st_res, "clip");
+	CHECK(audio && strcmp(obs_data_get_string(audio, "mode"), "angle") == 0, "audio.mode must be angle");
+	CHECK(clip && strcmp(obs_data_get_string(clip, "audioMode"), "off") == 0,
+	      "SetReplayAudio must not change the loaded clip");
+	obs_data_release(audio);
+	obs_data_release(clip);
+	obs_data_release(st_res);
+	audio_req = obs_data_create();
+	audio_res = obs_data_create();
+	obs_data_set_string(audio_req, "mode", "off");
+	CHECK(call_ws_request("SetReplayAudio", audio_req, audio_res) && obs_data_get_bool(audio_res, "ok"),
+	      "audio off failed");
+	obs_data_release(audio_req);
+	obs_data_release(audio_res);
+
+	obs_data_t *stop_req = obs_data_create();
+	obs_data_t *stop_res = obs_data_create();
+	obs_data_set_string(stop_req, "action", "stop");
+	CHECK(call_ws_request("PlaylistControl", stop_req, stop_res), "PlaylistControl not registered");
+	CHECK(!obs_data_get_bool(stop_res, "ok") && strcmp(obs_data_get_string(stop_res, "code"), "NoActivePlaylist") == 0,
+	      "stop without a playlist must be NoActivePlaylist");
+	obs_data_release(stop_req);
+	obs_data_release(stop_res);
+
+	obs_data_t *missing_req = obs_data_create();
+	obs_data_t *missing_res = obs_data_create();
+	obs_data_set_string(missing_req, "libraryId", "lib-missing");
+	CHECK(call_ws_request("LoadLibraryEntry", missing_req, missing_res), "LoadLibraryEntry not registered");
+	CHECK(!obs_data_get_bool(missing_res, "ok") &&
+		      strcmp(obs_data_get_string(missing_res, "code"), "EntryNotFound") == 0,
+	      "missing library entry must be EntryNotFound");
+	obs_data_release(missing_req);
+	obs_data_release(missing_res);
+
+	obs_data_t *load_req = obs_data_create();
+	obs_data_t *load_res = obs_data_create();
+	obs_data_set_string(load_req, "libraryId", saved_library_id);
+	CHECK(call_ws_request("LoadLibraryEntry", load_req, load_res) && obs_data_get_bool(load_res, "ok"),
+	      "LoadLibraryEntry failed: %s", obs_data_get_string(load_res, "message"));
+	CHECK(obs_data_get_string(load_res, "jobId")[0], "LoadLibraryEntry must return a jobId");
+	obs_data_release(load_req);
+	obs_data_release(load_res);
+	bool library_playing = false;
+	for (int attempt = 0; attempt < 50 && !library_playing; attempt++) {
+		st_res = obs_data_create();
+		CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus during library load failed");
+		clip = obs_data_get_obj(st_res, "clip");
+		library_playing = clip && strcmp(obs_data_get_string(clip, "origin"), "library") == 0 &&
+				  !obs_data_get_bool(clip, "loop") &&
+				  strcmp(obs_data_get_string(st_res, "state"), "playing") == 0;
+		obs_data_release(clip);
+		obs_data_release(st_res);
+		if (!library_playing)
+			os_sleep_ms(100);
+	}
+	CHECK(library_playing, "library entry did not start playing with loop off");
+
+	obs_data_t *play_req = obs_data_create();
+	obs_data_t *play_res = obs_data_create();
+	obs_data_set_string(play_req, "gameId", save_game);
+	obs_data_set_string(play_req, "tags", "highlight");
+	CHECK(call_ws_request("PlayPlaylist", play_req, play_res) && obs_data_get_bool(play_res, "ok"),
+	      "PlayPlaylist failed: %s", obs_data_get_string(play_res, "message"));
+	obs_data_release(play_req);
+	obs_data_release(play_res);
+	bool playlist_playing = false;
+	for (int attempt = 0; attempt < 50 && !playlist_playing; attempt++) {
+		st_res = obs_data_create();
+		CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus during playlist failed");
+		clip = obs_data_get_obj(st_res, "clip");
+		obs_data_t *playlist = obs_data_get_obj(st_res, "playlist");
+		playlist_playing = clip && strcmp(obs_data_get_string(clip, "origin"), "playlist") == 0 && playlist &&
+				   strcmp(obs_data_get_string(playlist, "state"), "playing") == 0;
+		obs_data_release(clip);
+		obs_data_release(playlist);
+		obs_data_release(st_res);
+		if (!playlist_playing)
+			os_sleep_ms(100);
+	}
+	CHECK(playlist_playing, "playlist did not start");
+	stop_req = obs_data_create();
+	stop_res = obs_data_create();
+	obs_data_set_string(stop_req, "action", "stop");
+	CHECK(call_ws_request("PlaylistControl", stop_req, stop_res) && obs_data_get_bool(stop_res, "ok"),
+	      "playlist stop failed");
+	obs_data_release(stop_req);
+	obs_data_release(stop_res);
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after playlist stop failed");
+	obs_data_t *playlist = obs_data_get_obj(st_res, "playlist");
+	CHECK(playlist && strcmp(obs_data_get_string(playlist, "state"), "idle") == 0, "playlist stop must set idle");
+	obs_data_release(playlist);
+	obs_data_release(st_res);
+
+
+	clear_fake_events();
+	obs_data_t *rel_res = obs_data_create();
+	CHECK(call_ws_request("Release", NULL, rel_res) && obs_data_get_bool(rel_res, "ok"), "Release failed");
+	obs_data_release(rel_res);
+	size_t released = 0;
+	for (size_t i = 0; i < g_fake_ws.events.num; i++) {
+		if (strcmp(g_fake_ws.events.array[i].type, "ClipReleased") == 0)
+			released++;
+	}
+	CHECK(released == 1, "Release must emit ClipReleased, got %zu", released);
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after release failed");
+	CHECK(strcmp(obs_data_get_string(st_res, "state"), "idle") == 0, "state after release is '%s'",
+	      obs_data_get_string(st_res, "state"));
+	obs_data_release(st_res);
+
+	obs_source_release(obs_scene_get_source(scene_a));
+	obs_source_release(rs_a);
+	obs_source_release(cam_a);
+
 	/* Cleanup */
 	obs_source_release(rs1);
 	obs_source_release(rs2);
@@ -984,7 +1361,8 @@ int main(int argc, char **argv)
 	da_free(g_fake_ws.requests);
 	clear_fake_events();
 	da_free(g_fake_ws.events);
-	bfree(g_fake_ws.vendor_name);
+	for (size_t i = 0; i < g_fake_ws.vendor_count; i++)
+		bfree(g_fake_ws.vendor_names[i]);
 	proc_handler_destroy(g_fake_ws.ph);
 
 	obs_shutdown();

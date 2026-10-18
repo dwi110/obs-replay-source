@@ -28,8 +28,14 @@ target_sources(${PROJECT_NAME} PRIVATE
 	replay-save-queue.h
 	replay-save-fast.c
 	replay-save-fast.h
+	replay-decode.c
+	replay-decode.h
 	replay-control.c
 	replay-control.h
+	replay-contract.c
+	replay-contract.h
+	replay-library.c
+	replay-library.h
 	obs-websocket-api.h
 	replay.h
 	replay-pool.c
@@ -38,6 +44,8 @@ target_sources(${PROJECT_NAME} PRIVATE
 	replay-convert.h
 	replay-blend.c
 	replay-blend.h
+	replay-audio-capture.c
+	replay-audio-capture.h
 	version.h)
 
 if(BUILD_OUT_OF_TREE)

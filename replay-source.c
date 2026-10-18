@@ -181,6 +181,11 @@ struct replay_source {
 	int auto_release;
 	int auto_save;
 	bool destroying;
+	/* Holds the clip of the instance-wide replay channel (MulticamReplay contract): plays regardless of program
+	 * visibility, never auto-releases or switches scenes, and at the end loops (channel_loop) or holds the last frame
+	 * instead of the per-source end action. */
+	bool channel_member;
+	bool channel_loop;
 };
 
 static void replace_text(struct dstr *str, size_t pos, size_t len, const char *new_text)
@@ -546,7 +551,7 @@ static void replay_update_position(struct replay_source *context, bool lock)
 	context->presentation_weight = 0;
 	context->audio_frame_position = 0;
 	context->start_timestamp = obs_get_video_frame_time();
-	context->backward = context->backward_start;
+	context->backward = context->channel_member ? false : context->backward_start;
 	if (!context->backward && context->current_replay.trim_front != 0) {
 		context->start_timestamp -= (uint64_t)(context->current_replay.trim_front * 100.0 / context->speed_percent);
 	} else if (context->backward && context->current_replay.trim_end != 0) {
@@ -568,7 +573,7 @@ static void replay_update_position(struct replay_source *context, bool lock)
 			context->current_replay.first_frame_timestamp + (uint64_t)context->current_replay.trim_front;
 		context->video_frame_position = find_closest_frame(context, desired_ts, false);
 	}
-	if (context->active || context->visibility_action == VISIBILITY_ACTION_CONTINUE) {
+	if (context->active || context->visibility_action == VISIBILITY_ACTION_CONTINUE || context->channel_member) {
 		if (!context->play && !context->stepped) {
 			context->play = true;
 			obs_source_signal(context->source, "media_play");
@@ -736,13 +741,17 @@ static void replay_source_show(void *data)
 static void replay_source_hide(void *data)
 {
 	struct replay_source *context = data;
-	if (context->auto_release != AUTO_RELEASE_NEVER)
+	if (context->auto_release != AUTO_RELEASE_NEVER && !context->channel_member)
 		replay_auto_release(context, true);
 }
 
 static void replay_source_active(void *data)
 {
 	struct replay_source *context = data;
+	if (context->channel_member) {
+		context->active = true;
+		return;
+	}
 	if (context->visibility_action == VISIBILITY_ACTION_PAUSE || context->visibility_action == VISIBILITY_ACTION_CONTINUE) {
 		if (!context->play && !context->end) {
 			context->play = true;
@@ -763,6 +772,10 @@ static void replay_source_active(void *data)
 static void replay_source_deactive(void *data)
 {
 	struct replay_source *context = data;
+	if (context->channel_member) {
+		context->active = false;
+		return;
+	}
 	if (context->visibility_action == VISIBILITY_ACTION_PAUSE) {
 		if (context->play) {
 			context->play = false;
@@ -1111,7 +1124,7 @@ static bool replay_retrieve_internal(struct replay_source *context, bool emit_ev
 		replay_update_position(context, true);
 	}
 	replay_purge_replays(context);
-	if (context->load_switch_scene_name) {
+	if (context->load_switch_scene_name && !context->channel_member) {
 		s = obs_get_source_by_name(context->load_switch_scene_name);
 		if (s) {
 			pthread_t thread;
@@ -2725,7 +2738,7 @@ static void replay_restore_full_frame(struct replay_source *c, uint64_t ts)
 {
 	if (!c->current_replay.video_frame_count || !c->current_replay.video_frames || c->disabled)
 		return;
-	if (c->end && (c->end_action == END_ACTION_HIDE || c->end_action == END_ACTION_HIDE_ALL))
+	if (c->end && !c->channel_member && (c->end_action == END_ACTION_HIDE || c->end_action == END_ACTION_HIDE_ALL))
 		return;
 	uint64_t pos = c->video_frame_position;
 	if (pos >= c->current_replay.video_frame_count)
@@ -2796,6 +2809,16 @@ void replay_source_end_action(struct replay_source *context)
 		context->play = false;
 		context->end = true;
 		obs_source_media_ended(context->source);
+		return;
+	}
+	if (context->channel_member) {
+		if (context->channel_loop) {
+			context->restart = true;
+		} else {
+			context->play = false;
+			context->end = true;
+			obs_source_media_ended(context->source);
+		}
 		return;
 	}
 	bool finish = false;
@@ -2933,7 +2956,8 @@ static void replay_source_tick(void *data, float seconds)
 		obs_source_media_ended(context->source);
 	}
 	if (!context->play) {
-		if (context->end && (context->end_action == END_ACTION_HIDE || context->end_action == END_ACTION_HIDE_ALL)) {
+		if (context->end && !context->channel_member &&
+		    (context->end_action == END_ACTION_HIDE || context->end_action == END_ACTION_HIDE_ALL)) {
 			obs_source_output_video(context->source, NULL);
 			if (context->auto_release != AUTO_RELEASE_NEVER && context->replays.size) {
 				replay_auto_release(context, false);
@@ -4129,4 +4153,335 @@ void replay_source_set_blend_output_hook(obs_source_t *source, replay_blend_outp
 		c->blend_worker = replay_blend_worker_create(c->source);
 	replay_blend_worker_set_output_hook(c->blend_worker, cb, param);
 	pthread_mutex_unlock(&c->video_mutex);
+}
+
+/* ---- Channel primitives (MulticamReplay contract) ---- */
+
+void replay_source_set_channel(struct replay_source *context, bool member, bool loop)
+{
+	if (!context)
+		return;
+	context->channel_member = member;
+	context->channel_loop = loop;
+}
+
+bool replay_source_peek_capture(struct replay_source *context, uint64_t *first_ts_out, uint64_t *last_ts_out,
+				uint64_t *last_arrival_ns_out, uint64_t *late_ns_out)
+{
+	if (!context || !context->source_name || !*context->source_name)
+		return false;
+	obs_source_t *s = obs_get_source_by_name(context->source_name);
+	if (!s)
+		return false;
+	context->source_filter = NULL;
+	obs_source_enum_filters(s, EnumFilter, context);
+	obs_source_release(s);
+	struct replay_filter *vf = context->source_filter ? obs_obj_get_data(context->source_filter) : NULL;
+	if (!vf || vf->video_frames.size == 0)
+		return false;
+
+	pthread_mutex_lock(&vf->mutex);
+	struct obs_source_frame *front = NULL;
+	struct obs_source_frame *back = NULL;
+	circlebuf_peek_front(&vf->video_frames, &front, sizeof(front));
+	circlebuf_peek_back(&vf->video_frames, &back, sizeof(back));
+	const uint64_t first = front ? front->timestamp : 0;
+	const uint64_t last = back ? back->timestamp : 0;
+	const uint64_t arrival = vf->last_arrival_ns;
+	const uint64_t late = (vf->live_ref_valid && vf->live_late_ns > 0) ? (uint64_t)vf->live_late_ns : 0;
+	pthread_mutex_unlock(&vf->mutex);
+
+	if (first_ts_out)
+		*first_ts_out = first;
+	if (last_ts_out)
+		*last_ts_out = last;
+	if (last_arrival_ns_out)
+		*last_arrival_ns_out = arrival;
+	if (late_ns_out)
+		*late_ns_out = late;
+	return first != 0 || last != 0;
+}
+
+bool replay_source_install_replay(struct replay_source *context, const struct replay *replay)
+{
+	if (!context || !replay)
+		return false;
+
+	pthread_mutex_lock(&context->video_mutex);
+	pthread_mutex_lock(&context->replay_mutex);
+	while (context->replays.size) {
+		struct replay old;
+		circlebuf_pop_front(&context->replays, &old, sizeof old);
+		replay_free_replay(&old, context);
+	}
+	circlebuf_push_back(&context->replays, replay, sizeof *replay);
+	context->replay_position = 0;
+	pthread_mutex_unlock(&context->replay_mutex);
+	replay_update_position(context, false);
+	pthread_mutex_unlock(&context->video_mutex);
+	return true;
+}
+
+bool replay_source_install_decoded(struct replay_source *context, struct obs_source_frame **frames, uint64_t frame_count,
+				   struct obs_audio_data *audio, uint64_t audio_count, const struct audio_convert_info *oai,
+				   uint64_t first_ts, uint64_t last_ts, uint64_t duration)
+{
+	if (!context || !frames || frame_count == 0)
+		return false;
+	struct replay replay;
+	memset(&replay, 0, sizeof replay);
+	replay.video_frames = bzalloc((size_t)frame_count * sizeof(struct obs_source_frame *));
+	for (uint64_t i = 0; i < frame_count; i++) {
+		replay.video_frames[i] = frames[i];
+		replay_frame_addref(frames[i]);
+	}
+	replay.video_frame_count = frame_count;
+	replay.first_frame_timestamp = first_ts;
+	replay.last_frame_timestamp = last_ts;
+	replay.duration = duration;
+	if (oai)
+		replay.oai = *oai;
+	if (audio && audio_count > 0) {
+		replay.audio_frames = bzalloc((size_t)audio_count * sizeof(struct obs_audio_data));
+		for (uint64_t i = 0; i < audio_count; i++) {
+			replay.audio_frames[i] = audio[i];
+			replay_audio_packet_addref(&replay.audio_frames[i]);
+		}
+		replay.audio_frame_count = audio_count;
+	}
+	return replay_source_install_replay(context, &replay);
+}
+
+bool replay_source_seek_ns(struct replay_source *context, uint64_t offset_ns)
+{
+	if (!context)
+		return false;
+
+	pthread_mutex_lock(&context->video_mutex);
+	if (context->current_replay.video_frame_count == 0 || !context->current_replay.video_frames) {
+		pthread_mutex_unlock(&context->video_mutex);
+		return false;
+	}
+	if (offset_ns > context->current_replay.duration)
+		offset_ns = context->current_replay.duration;
+	const uint64_t target = context->current_replay.first_frame_timestamp + offset_ns;
+	const uint64_t idx = find_closest_frame(context, target, true);
+	context->video_frame_position = idx;
+	if (context->blend_worker)
+		replay_blend_worker_flush(context->blend_worker);
+	context->previous_frame_timestamp = 0;
+	context->end = false;
+
+	const uint64_t now = obs_get_video_frame_time();
+	const uint64_t ref = (context->pause_timestamp && !context->play) ? context->pause_timestamp : now;
+	const uint64_t scaled = (uint64_t)((double)offset_ns * 100.0 / context->speed_percent);
+	if (context->backward) {
+		const uint64_t back = context->current_replay.duration > offset_ns
+					      ? context->current_replay.duration - offset_ns
+					      : 0;
+		context->start_timestamp = ref - (uint64_t)((double)back * 100.0 / context->speed_percent);
+	} else {
+		context->start_timestamp = ref - scaled;
+	}
+
+	pthread_mutex_lock(&context->audio_mutex);
+	context->audio_frame_position = 0;
+	if (context->current_replay.audio_frames) {
+		for (uint64_t i = 0; i < context->current_replay.audio_frame_count; i++) {
+			if (context->current_replay.audio_frames[i].timestamp >= target) {
+				context->audio_frame_position = i;
+				break;
+			}
+			context->audio_frame_position = i;
+		}
+	}
+	pthread_mutex_unlock(&context->audio_mutex);
+
+	if (!context->play)
+		context->stepped = true;
+	pthread_mutex_unlock(&context->video_mutex);
+	return true;
+}
+
+void replay_source_set_playing(struct replay_source *context, bool playing)
+{
+	if (!context)
+		return;
+	pthread_mutex_lock(&context->video_mutex);
+	if (playing && context->end) {
+		context->restart = true;
+		context->play = true;
+		context->end = false;
+		context->stepped = false;
+		obs_source_signal(context->source, "media_restart");
+	} else if (playing != context->play) {
+		replay_play_pause(context, true);
+		context->stepped = false;
+	}
+	pthread_mutex_unlock(&context->video_mutex);
+}
+
+void replay_source_set_backward(struct replay_source *context, bool backward)
+{
+	if (!context)
+		return;
+	pthread_mutex_lock(&context->video_mutex);
+	if (context->backward != backward &&
+	    (context->current_replay.video_frame_count || context->current_replay.audio_frame_count)) {
+		const uint64_t now = obs_get_video_frame_time();
+		if (context->pause_timestamp && !context->play) {
+			context->start_timestamp += now - context->pause_timestamp;
+			context->pause_timestamp = 0;
+			replay_reverse(context, now);
+			context->pause_timestamp = now;
+		} else {
+			replay_reverse(context, now);
+		}
+	}
+	pthread_mutex_unlock(&context->video_mutex);
+}
+
+void replay_source_channel_step(struct replay_source *context, int64_t delta_ns)
+{
+	if (!context)
+		return;
+	pthread_mutex_lock(&context->video_mutex);
+	if (context->current_replay.video_frame_count == 0) {
+		pthread_mutex_unlock(&context->video_mutex);
+		return;
+	}
+	uint64_t abs_ts = context->current_replay.first_frame_timestamp;
+	if (context->current_replay.video_frames && context->video_frame_position < context->current_replay.video_frame_count)
+		abs_ts = context->current_replay.video_frames[context->video_frame_position]->timestamp;
+	pthread_mutex_unlock(&context->video_mutex);
+
+	int64_t next = (int64_t)(abs_ts - context->current_replay.first_frame_timestamp) + delta_ns;
+	if (next < 0)
+		next = 0;
+	if ((uint64_t)next > context->current_replay.duration)
+		next = (int64_t)context->current_replay.duration;
+	replay_source_seek_ns(context, (uint64_t)next);
+	replay_source_set_playing(context, false);
+}
+
+bool replay_source_channel_status(struct replay_source *context, bool *playing_out, bool *ended_out,
+				  bool *backward_out, uint64_t *abs_ts_out, float *speed_out, uint64_t *first_ts_out,
+				  uint64_t *duration_ns_out)
+{
+	if (!context)
+		return false;
+	pthread_mutex_lock(&context->video_mutex);
+	const bool loaded = context->current_replay.video_frame_count > 0 || context->current_replay.audio_frame_count > 0;
+	if (playing_out)
+		*playing_out = context->play;
+	if (ended_out)
+		*ended_out = context->end;
+	if (backward_out)
+		*backward_out = context->backward;
+	if (speed_out)
+		*speed_out = context->speed_percent;
+	if (first_ts_out)
+		*first_ts_out = loaded ? context->current_replay.first_frame_timestamp : 0;
+	if (duration_ns_out)
+		*duration_ns_out = loaded ? context->current_replay.duration : 0;
+	uint64_t abs_ts = 0;
+	if (loaded) {
+		const uint64_t timestamp = context->pause_timestamp == 0 ? obs_get_video_frame_time() : context->pause_timestamp;
+		int64_t duration = (int64_t)(timestamp - context->start_timestamp);
+		if (context->speed_percent != 100.0f)
+			duration = (int64_t)(duration * context->speed_percent / 100.0);
+		if (context->backward)
+			duration = (int64_t)context->current_replay.duration - duration;
+		abs_ts = context->current_replay.first_frame_timestamp;
+		if (duration > 0 && (uint64_t)duration < context->current_replay.duration)
+			abs_ts += (uint64_t)duration;
+		else if (duration > 0)
+			abs_ts = context->current_replay.last_frame_timestamp;
+	}
+	pthread_mutex_unlock(&context->video_mutex);
+	if (abs_ts_out)
+		*abs_ts_out = abs_ts;
+	return loaded;
+}
+
+bool replay_source_copy_replay_audio(struct replay_source *context, struct obs_audio_data **packets_out,
+				     uint64_t *count_out, struct audio_convert_info *oai_out)
+{
+	if (packets_out)
+		*packets_out = NULL;
+	if (count_out)
+		*count_out = 0;
+	if (!context)
+		return false;
+	pthread_mutex_lock(&context->audio_mutex);
+	const uint64_t count = context->current_replay.audio_frame_count;
+	struct obs_audio_data *copy = NULL;
+	if (count > 0 && context->current_replay.audio_frames) {
+		copy = bzalloc((size_t)count * sizeof(struct obs_audio_data));
+		for (uint64_t i = 0; i < count; i++) {
+			copy[i] = context->current_replay.audio_frames[i];
+			replay_audio_packet_addref(&copy[i]);
+		}
+	}
+	if (oai_out)
+		*oai_out = context->current_replay.oai;
+	pthread_mutex_unlock(&context->audio_mutex);
+	if (packets_out)
+		*packets_out = copy;
+	if (count_out)
+		*count_out = count;
+	return copy != NULL;
+}
+
+void replay_source_set_replay_audio(struct replay_source *context, struct obs_audio_data *packets, uint64_t count,
+				    const struct audio_convert_info *oai)
+{
+	if (!context)
+		return;
+	pthread_mutex_lock(&context->audio_mutex);
+	if (context->current_replay.audio_frames) {
+		for (uint64_t i = 0; i < context->current_replay.audio_frame_count; i++)
+			free_audio_packet(&context->current_replay.audio_frames[i]);
+		bfree(context->current_replay.audio_frames);
+	}
+	context->current_replay.audio_frames = packets;
+	context->current_replay.audio_frame_count = count;
+	if (oai)
+		context->current_replay.oai = *oai;
+	context->audio_frame_position = 0;
+	pthread_mutex_lock(&context->replay_mutex);
+	const size_t n = context->replays.size / sizeof(struct replay);
+	if (n > 0 && context->replay_position >= 0 && (size_t)context->replay_position < n) {
+		struct replay *r = circlebuf_data(&context->replays, (size_t)context->replay_position * sizeof(struct replay));
+		if (r) {
+			r->audio_frames = packets;
+			r->audio_frame_count = count;
+			if (oai)
+				r->oai = *oai;
+		}
+	}
+	pthread_mutex_unlock(&context->replay_mutex);
+	pthread_mutex_unlock(&context->audio_mutex);
+}
+
+void replay_source_clear_replays(struct replay_source *context)
+{
+	if (!context)
+		return;
+	pthread_mutex_lock(&context->video_mutex);
+	pthread_mutex_lock(&context->replay_mutex);
+	while (context->replays.size) {
+		struct replay old;
+		circlebuf_pop_front(&context->replays, &old, sizeof old);
+		replay_free_replay(&old, context);
+	}
+	context->replay_position = 0;
+	pthread_mutex_unlock(&context->replay_mutex);
+	replay_update_position(context, false);
+	pthread_mutex_unlock(&context->video_mutex);
+}
+
+const char *replay_source_directory(struct replay_source *context)
+{
+	return (context && context->directory) ? context->directory : "";
 }
