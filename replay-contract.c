@@ -196,13 +196,40 @@ static struct job *add_job_locked(const char *type, const char *library_id, cons
 	return job;
 }
 
+static void copy_abs_path(char *dst, size_t dst_size, const char *path)
+{
+	char abs[1024];
+	if (dst_size == 0)
+		return;
+	dst[0] = '\0';
+	if (path && os_get_abs_path(path, abs, sizeof abs) && abs[0])
+		strncpy(dst, abs, dst_size - 1);
+	else if (path)
+		strncpy(dst, path, dst_size - 1);
+	dst[dst_size - 1] = '\0';
+}
+
 static struct job *find_job_by_path_locked(const char *path)
 {
+	char abs[1024];
+	const char *want = path;
 	if (!path || !*path)
 		return NULL;
+	if (os_get_abs_path(path, abs, sizeof abs) && abs[0])
+		want = abs;
 	for (size_t i = g.job_count; i > 0; i--)
-		if (strcmp(g.jobs[i - 1].path, path) == 0)
+		if (strcmp(g.jobs[i - 1].path, path) == 0 || strcmp(g.jobs[i - 1].path, want) == 0)
 			return &g.jobs[i - 1];
+	return NULL;
+}
+
+static struct job *find_job_locked(const char *job_id)
+{
+	if (!job_id || !*job_id)
+		return NULL;
+	for (size_t i = 0; i < g.job_count; i++)
+		if (strcmp(g.jobs[i].job_id, job_id) == 0)
+			return &g.jobs[i];
 	return NULL;
 }
 
@@ -786,13 +813,13 @@ static bool require_clip(obs_data_t *response)
 
 static void handle_speed(obs_data_t *request, obs_data_t *response)
 {
-	if (!require_clip(response))
-		return;
-	const double speed = obs_data_get_double(request, "speedPercent");
+	const double speed = request ? obs_data_get_double(request, "speedPercent") : 0.0;
 	if (speed < SPEED_MIN || speed > SPEED_MAX) {
 		respond_error(response, "InvalidParameter", "speedPercent must be between 5 and 400");
 		return;
 	}
+	if (!require_clip(response))
+		return;
 	float value = (float)speed;
 	pthread_mutex_lock(&g.mutex);
 	g.speed = value;
@@ -824,13 +851,13 @@ static void handle_toggle_direction(obs_data_t *response)
 
 static void handle_step(obs_data_t *request, obs_data_t *response)
 {
-	if (!require_clip(response))
-		return;
-	const long long frames = obs_data_get_int(request, "frames");
+	const long long frames = request ? obs_data_get_int(request, "frames") : 0;
 	if (frames == 0 || frames < -600 || frames > 600) {
 		respond_error(response, "InvalidParameter", "frames must be between -600 and 600, not 0");
 		return;
 	}
+	if (!require_clip(response))
+		return;
 	int64_t delta = (int64_t)frames * (int64_t)clock_frame_ns();
 	for_each_member(do_step, &delta);
 	respond_ok(response);
@@ -1020,7 +1047,7 @@ static void save_hook(const char *trigger, const char *path, bool started, bool 
 				break;
 			}
 		if (job && path)
-			strncpy(job->path, path, sizeof job->path - 1);
+			copy_abs_path(job->path, sizeof job->path, path);
 	} else if (!started) {
 		job = find_job_by_path_locked(path);
 	}
@@ -1087,13 +1114,13 @@ static bool enqueue_save_locked(struct member *member, const char *tags, const c
 
 static void handle_save(obs_data_t *request, obs_data_t *response, bool all_angles)
 {
-	if (!require_clip(response))
-		return;
 	char tags[256];
 	if (!normalize_tags(request ? obs_data_get_string(request, "tags") : "", tags, sizeof tags)) {
 		respond_error(response, "InvalidParameter", "tags must match [a-z0-9_]{1,32}");
 		return;
 	}
+	if (!require_clip(response))
+		return;
 	const char *requested_game = request ? obs_data_get_string(request, "gameId") : "";
 	const char *game_id = (requested_game && *requested_game) ? requested_game : replay_library_active_game();
 	if (!replay_library_has_game(game_id)) {
@@ -1272,24 +1299,33 @@ struct load_task {
 	char library_id[40];
 	char file[1024];
 	char angle[64];
+	char job_id[32];
 	bool for_playlist;
 };
 
-static void install_decoded_locked(struct replay_decoded_clip *clip, const char *angle, bool loop)
+static void install_decoded_locked(struct replay_decoded_clip *clip, bool loop, struct dstr *angle_list)
 {
 	struct discovered angles[MAX_MEMBERS];
 	const size_t count = discover_angles(angles, MAX_MEMBERS);
 	for (size_t i = 0; i < count && g.member_count < MAX_MEMBERS; i++) {
 		struct replay_source *ctx = obs_obj_get_data(angles[i].source);
 		replay_source_set_channel(ctx, true, loop);
-		replay_source_install_decoded(ctx, clip->video_frames, clip->video_frame_count, clip->audio_frames,
-					      clip->audio_frame_count, &clip->oai, clip->first_frame_timestamp,
-					      clip->last_frame_timestamp, clip->duration);
+		if (!replay_source_install_decoded(ctx, clip->video_frames, clip->video_frame_count, clip->audio_frames,
+						   clip->audio_frame_count, &clip->oai, clip->first_frame_timestamp,
+						   clip->last_frame_timestamp, clip->duration)) {
+			replay_source_set_channel(ctx, false, false);
+			continue;
+		}
 		obs_source_t *ref = obs_source_get_ref(angles[i].source);
-		if (ref) {
-			struct member *m = &g.members[g.member_count++];
-			m->source = ref;
-			strncpy(m->angle, angle, sizeof m->angle - 1);
+		if (!ref)
+			continue;
+		struct member *m = &g.members[g.member_count++];
+		m->source = ref;
+		strncpy(m->angle, angles[i].angle, sizeof m->angle - 1);
+		if (angle_list) {
+			if (angle_list->len)
+				dstr_cat(angle_list, ",");
+			dstr_cat(angle_list, angles[i].angle);
 		}
 	}
 	release_discovered(angles, count);
@@ -1311,16 +1347,36 @@ static void *load_thread(void *param)
 
 	pthread_mutex_lock(&g.mutex);
 	g.load_thread_active = false;
+	g.loading = false;
 	if (!ok || g.load_abort || g.shutting_down) {
+		struct job *job = find_job_locked(task->job_id);
+		if (job) {
+			strncpy(job->state, "failed", sizeof job->state - 1);
+			strncpy(job->error, err[0] ? err : "load failed", sizeof job->error - 1);
+		}
+		if (!g.load_abort && err[0])
+			strncpy(g.error, err, sizeof g.error - 1);
+		if (task->for_playlist)
+			strcpy(g.playlist_state, "error");
+		const bool playlist = task->for_playlist;
 		pthread_mutex_unlock(&g.mutex);
 		replay_decoded_clip_free(&clip);
-		if (!g.load_abort)
-			emit_simple("TriggerFailed", "code", "Internal", "message", err, NULL, NULL, NULL, NULL, NULL, NULL);
+		if (playlist)
+			emit_simple("PlaylistChanged", "state", "error", "index", "-1", "count", "0", "libraryId", "", NULL,
+				    NULL);
 		bfree(task);
 		return NULL;
 	}
 	release_members_locked();
-	install_decoded_locked(&clip, task->angle, false);
+	struct dstr angle_list;
+	dstr_init(&angle_list);
+	install_decoded_locked(&clip, false, &angle_list);
+	for (size_t i = 0; i < g.member_count; i++) {
+		struct replay_source *ctx = obs_obj_get_data(g.members[i].source);
+		replay_source_set_backward(ctx, false);
+		replay_source_restart_playback(ctx);
+		replay_source_set_playing(ctx, true);
+	}
 	snprintf(g.clip_id, sizeof g.clip_id, "c%" PRIu64, ++g.clip_seq);
 	strncpy(g.clip_library_id, task->library_id, sizeof g.clip_library_id - 1);
 	strcpy(g.origin, task->for_playlist ? "playlist" : "library");
@@ -1329,26 +1385,44 @@ static void *load_thread(void *param)
 	g.duration_ns = clip.duration;
 	g.loop = false;
 	g.loaded = g.member_count > 0;
-	g.loading = false;
+	struct job *job = find_job_locked(task->job_id);
+	if (job) {
+		strncpy(job->state, g.loaded ? "completed" : "failed", sizeof job->state - 1);
+		job->progress = 1.0;
+	}
 	char id_copy[32];
 	strncpy(id_copy, g.clip_id, sizeof id_copy - 1);
 	id_copy[sizeof id_copy - 1] = '\0';
 	char duration_text[32];
 	snprintf(duration_text, sizeof duration_text, "%" PRIu64, (uint64_t)(g.duration_ns / 1000000ULL));
-	if (task->for_playlist) {
-		strcpy(g.playlist_state, "playing");
+	const bool playlist = task->for_playlist;
+	const bool loaded = g.loaded;
+	if (playlist) {
+		strcpy(g.playlist_state, loaded ? "playing" : "error");
 		strncpy(g.playlist_library_id, task->library_id, sizeof g.playlist_library_id - 1);
 	}
+	char playlist_index[16];
+	char playlist_count[16];
+	snprintf(playlist_index, sizeof playlist_index, "%d", g.playlist_index);
+	snprintf(playlist_count, sizeof playlist_count, "%zu", g.playlist_count);
+	char library_id[40];
+	strncpy(library_id, task->library_id, sizeof library_id - 1);
+	library_id[sizeof library_id - 1] = '\0';
 	pthread_mutex_unlock(&g.mutex);
 
-	emit_simple("ClipLoaded", "clipId", id_copy, "origin", task->for_playlist ? "playlist" : "library", "durationMs",
-		    duration_text, "angles", task->angle, "libraryId", task->library_id);
+	emit_simple("ClipLoaded", "clipId", id_copy, "origin", playlist ? "playlist" : "library", "durationMs",
+		    duration_text, "angles", angle_list.array ? angle_list.array : "", "libraryId", library_id);
+	if (playlist)
+		emit_simple("PlaylistChanged", "state", loaded ? "playing" : "error", "index", playlist_index, "count",
+			    playlist_count, "libraryId", library_id, NULL, NULL);
+	dstr_free(&angle_list);
 	replay_decoded_clip_free(&clip);
 	bfree(task);
 	return NULL;
 }
 
-static bool start_load_locked(const struct replay_library_entry *entry, bool for_playlist, obs_data_t *response)
+static bool start_load_locked(const struct replay_library_entry *entry, bool for_playlist, const char *job_id,
+			      obs_data_t *response)
 {
 	if (!replay_decode_supported()) {
 		respond_error(response, "Internal", "FFmpeg decode is not available");
@@ -1358,7 +1432,11 @@ static bool start_load_locked(const struct replay_library_entry *entry, bool for
 	strncpy(task->library_id, entry->library_id, sizeof task->library_id - 1);
 	strncpy(task->file, entry->file, sizeof task->file - 1);
 	strncpy(task->angle, entry->angle, sizeof task->angle - 1);
+	strncpy(task->job_id, job_id ? job_id : "", sizeof task->job_id - 1);
 	task->for_playlist = for_playlist;
+	struct job *job = find_job_locked(job_id);
+	if (job)
+		strncpy(job->state, "running", sizeof job->state - 1);
 	g.load_abort = false;
 	g.loading = true;
 	if (pthread_create(&g.load_thread, NULL, load_thread, task) != 0) {
@@ -1388,7 +1466,7 @@ static void handle_load_entry(obs_data_t *request, obs_data_t *response)
 	if (g.loaded)
 		release_clip_locked(true);
 	struct job *job = add_job_locked("load", entry.library_id, entry.angle, entry.tags);
-	const bool started = start_load_locked(&entry, false, response);
+	const bool started = start_load_locked(&entry, false, job->job_id, response);
 	char job_id[32];
 	strncpy(job_id, job->job_id, sizeof job_id - 1);
 	job_id[sizeof job_id - 1] = '\0';
@@ -1427,7 +1505,8 @@ static bool load_playlist_index_locked(obs_data_t *response)
 	strncpy(g.playlist_library_id, entry.library_id, sizeof g.playlist_library_id - 1);
 	strcpy(g.playlist_state, "loading");
 	emit_playlist_locked();
-	return start_load_locked(&entry, true, response);
+	struct job *job = add_job_locked("load", entry.library_id, entry.angle, entry.tags);
+	return start_load_locked(&entry, true, job->job_id, response);
 }
 
 static void handle_play_playlist(obs_data_t *request, obs_data_t *response)

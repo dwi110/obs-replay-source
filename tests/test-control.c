@@ -920,6 +920,33 @@ int main(int argc, char **argv)
 	      "Play without a clip must return NoClipLoaded");
 	obs_data_release(noclip_req);
 	obs_data_release(noclip_res);
+	obs_data_t *bad_speed_req = obs_data_create();
+	obs_data_t *bad_speed_res = obs_data_create();
+	obs_data_set_double(bad_speed_req, "speedPercent", 1000.0);
+	CHECK(call_ws_request("SetSpeed", bad_speed_req, bad_speed_res), "SetSpeed not registered");
+	CHECK(!obs_data_get_bool(bad_speed_res, "ok") &&
+		      strcmp(obs_data_get_string(bad_speed_res, "code"), "InvalidParameter") == 0,
+	      "invalid speed without a clip must be InvalidParameter, got '%s'",
+	      obs_data_get_string(bad_speed_res, "code"));
+	obs_data_release(bad_speed_req);
+	obs_data_release(bad_speed_res);
+	obs_data_t *bad_step_req = obs_data_create();
+	obs_data_t *bad_step_res = obs_data_create();
+	obs_data_set_int(bad_step_req, "frames", 0);
+	CHECK(call_ws_request("Step", bad_step_req, bad_step_res) && !obs_data_get_bool(bad_step_res, "ok") &&
+		      strcmp(obs_data_get_string(bad_step_res, "code"), "InvalidParameter") == 0,
+	      "step 0 without a clip must be InvalidParameter");
+	obs_data_release(bad_step_req);
+	obs_data_release(bad_step_res);
+	obs_data_t *bad_dir_req = obs_data_create();
+	obs_data_t *bad_dir_res = obs_data_create();
+	obs_data_set_string(bad_dir_req, "direction", "up");
+	CHECK(call_ws_request("SetDirection", bad_dir_req, bad_dir_res) && !obs_data_get_bool(bad_dir_res, "ok") &&
+		      strcmp(obs_data_get_string(bad_dir_res, "code"), "InvalidParameter") == 0,
+	      "invalid direction without a clip must be InvalidParameter");
+	obs_data_release(bad_dir_req);
+	obs_data_release(bad_dir_res);
+
 
 	clear_fake_events();
 	obs_data_t *bad_look_req = obs_data_create();
@@ -1038,8 +1065,33 @@ int main(int argc, char **argv)
 	obs_data_release(bad_tag_req);
 	obs_data_release(bad_tag_res);
 
+	obs_data_t *reset_game_req = obs_data_create();
+	obs_data_t *reset_game_res = obs_data_create();
+	obs_data_set_string(reset_game_req, "gameId", "game_default");
+	CHECK(call_ws_request("SetActiveGame", reset_game_req, reset_game_res) && obs_data_get_bool(reset_game_res, "ok"),
+	      "could not select game_default");
+	obs_data_release(reset_game_req);
+	obs_data_release(reset_game_res);
+	obs_data_t *save_game_req = obs_data_create();
+	obs_data_t *save_game_res = obs_data_create();
+	obs_data_set_string(save_game_req, "name", "Vertragslauf");
+	CHECK(call_ws_request("CreateGame", save_game_req, save_game_res) && obs_data_get_bool(save_game_res, "ok"),
+	      "CreateGame before save failed");
+	char save_game[64];
+	snprintf(save_game, sizeof save_game, "%s", obs_data_get_string(save_game_res, "gameId"));
+	CHECK(strncmp(save_game, "game-", 5) == 0, "save game id missing");
+	obs_data_release(save_game_req);
+	obs_data_release(save_game_res);
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after early CreateGame failed");
+	CHECK(strcmp(obs_data_get_string(st_res, "activeGameId"), "game_default") == 0,
+	      "CreateGame activated '%s'", obs_data_get_string(st_res, "activeGameId"));
+	obs_data_release(st_res);
+
+
 	obs_data_t *save_req = obs_data_create();
 	obs_data_t *save_res = obs_data_create();
+	obs_data_set_string(save_req, "gameId", save_game);
 	obs_data_set_string(save_req, "tags", "highlight");
 	CHECK(call_ws_request("Save", save_req, save_res), "Save call failed");
 	CHECK(obs_data_get_bool(save_res, "ok"), "Save failed: %s", obs_data_get_string(save_res, "message"));
@@ -1075,6 +1127,204 @@ int main(int argc, char **argv)
 	      "unknown game must be GameNotFound");
 	obs_data_release(game_req);
 	obs_data_release(game_res);
+
+
+	CHECK(replay_save_queue_wait_idle(20000), "contract save did not finish");
+	lib_res = obs_data_create();
+	CHECK(call_ws_request("GetLibrary", NULL, lib_res) && obs_data_get_bool(lib_res, "ok"), "GetLibrary after save failed");
+	entries = obs_data_get_array(lib_res, "entries");
+	bool save_ready = false;
+	for (size_t i = 0; entries && i < obs_data_array_count(entries); i++) {
+		obs_data_t *entry = obs_data_array_item(entries, i);
+		if (strcmp(obs_data_get_string(entry, "libraryId"), saved_library_id) == 0 &&
+		    strcmp(obs_data_get_string(entry, "state"), "ready") == 0 &&
+		    obs_data_get_string(entry, "file")[0])
+			save_ready = true;
+		obs_data_release(entry);
+	}
+	CHECK(save_ready, "saved entry did not become ready");
+	obs_data_array_release(entries);
+	obs_data_release(lib_res);
+
+	obs_data_t *merge_req = obs_data_create();
+	obs_data_t *merge_res = obs_data_create();
+	obs_data_set_string(merge_req, "gameId", save_game);
+	obs_data_set_string(merge_req, "tags", "foul");
+	CHECK(call_ws_request("Save", merge_req, merge_res) && obs_data_get_bool(merge_res, "ok"), "tag merge save failed");
+	CHECK(strcmp(obs_data_get_string(merge_res, "libraryId"), saved_library_id) == 0,
+	      "same angle and range must keep libraryId '%s', got '%s'", saved_library_id,
+	      obs_data_get_string(merge_res, "libraryId"));
+	obs_data_release(merge_req);
+	obs_data_release(merge_res);
+
+	obs_data_t *tags_req = obs_data_create();
+	obs_data_t *tags_res = obs_data_create();
+	obs_data_set_string(tags_req, "libraryId", saved_library_id);
+	obs_data_set_string(tags_req, "tags", "highlight,scoring_play");
+	CHECK(call_ws_request("SetTags", tags_req, tags_res) && obs_data_get_bool(tags_res, "ok"), "SetTags failed");
+	obs_data_release(tags_req);
+	obs_data_release(tags_res);
+
+	obs_data_t *create_req = obs_data_create();
+	obs_data_t *create_res = obs_data_create();
+	obs_data_set_string(create_req, "name", "Vertragsspiel");
+	CHECK(call_ws_request("CreateGame", create_req, create_res) && obs_data_get_bool(create_res, "ok"),
+	      "CreateGame failed");
+	const char *new_game = obs_data_get_string(create_res, "gameId");
+	CHECK(new_game && strncmp(new_game, "game-", 5) == 0, "CreateGame must return a gameId");
+	char created_game[64];
+	snprintf(created_game, sizeof created_game, "%s", new_game);
+	obs_data_release(create_req);
+	obs_data_release(create_res);
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after CreateGame failed");
+	CHECK(strcmp(obs_data_get_string(st_res, "activeGameId"), "game_default") == 0,
+	      "CreateGame must not activate the game, got '%s'", obs_data_get_string(st_res, "activeGameId"));
+	obs_data_release(st_res);
+
+	obs_data_t *all_req = obs_data_create();
+	obs_data_t *all_res = obs_data_create();
+	obs_data_set_string(all_req, "tags", "other");
+	obs_data_set_string(all_req, "gameId", save_game);
+	CHECK(call_ws_request("SaveAllAngles", all_req, all_res) && obs_data_get_bool(all_res, "ok"),
+	      "SaveAllAngles failed: %s", obs_data_get_string(all_res, "message"));
+	obs_data_array_t *jobs = obs_data_get_array(all_res, "jobs");
+	CHECK(obs_data_array_count(jobs) == 1, "SaveAllAngles expected 1 job, got %zu", obs_data_array_count(jobs));
+	obs_data_t *job0 = obs_data_array_item(jobs, 0);
+	CHECK(strcmp(obs_data_get_string(job0, "libraryId"), saved_library_id) == 0, "SaveAllAngles did not merge");
+	obs_data_release(job0);
+	obs_data_array_release(jobs);
+	obs_data_release(all_req);
+	obs_data_release(all_res);
+
+	obs_data_t *active_req = obs_data_create();
+	obs_data_t *active_res = obs_data_create();
+	obs_data_set_string(active_req, "gameId", created_game);
+	CHECK(call_ws_request("SetActiveGame", active_req, active_res) && obs_data_get_bool(active_res, "ok"),
+	      "SetActiveGame failed");
+	obs_data_release(active_req);
+	obs_data_release(active_res);
+
+	obs_data_t *audio_req = obs_data_create();
+	obs_data_t *audio_res = obs_data_create();
+	obs_data_set_string(audio_req, "mode", "stereo");
+	CHECK(call_ws_request("SetReplayAudio", audio_req, audio_res), "SetReplayAudio not registered");
+	CHECK(!obs_data_get_bool(audio_res, "ok") && strcmp(obs_data_get_string(audio_res, "code"), "InvalidParameter") == 0,
+	      "invalid audio mode must be rejected");
+	obs_data_release(audio_req);
+	obs_data_release(audio_res);
+	audio_req = obs_data_create();
+	audio_res = obs_data_create();
+	obs_data_set_string(audio_req, "mode", "source");
+	obs_data_set_string(audio_req, "sourceName", "Missing Audio");
+	CHECK(call_ws_request("SetReplayAudio", audio_req, audio_res) && !obs_data_get_bool(audio_res, "ok"),
+	      "missing audio source must be rejected");
+	obs_data_release(audio_req);
+	obs_data_release(audio_res);
+	audio_req = obs_data_create();
+	audio_res = obs_data_create();
+	obs_data_set_string(audio_req, "mode", "angle");
+	obs_data_set_string(audio_req, "angle", "Cam A");
+	CHECK(call_ws_request("SetReplayAudio", audio_req, audio_res) && obs_data_get_bool(audio_res, "ok"),
+	      "angle audio mode failed");
+	obs_data_release(audio_req);
+	obs_data_release(audio_res);
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after audio failed");
+	obs_data_t *audio = obs_data_get_obj(st_res, "audio");
+	clip = obs_data_get_obj(st_res, "clip");
+	CHECK(audio && strcmp(obs_data_get_string(audio, "mode"), "angle") == 0, "audio.mode must be angle");
+	CHECK(clip && strcmp(obs_data_get_string(clip, "audioMode"), "off") == 0,
+	      "SetReplayAudio must not change the loaded clip");
+	obs_data_release(audio);
+	obs_data_release(clip);
+	obs_data_release(st_res);
+	audio_req = obs_data_create();
+	audio_res = obs_data_create();
+	obs_data_set_string(audio_req, "mode", "off");
+	CHECK(call_ws_request("SetReplayAudio", audio_req, audio_res) && obs_data_get_bool(audio_res, "ok"),
+	      "audio off failed");
+	obs_data_release(audio_req);
+	obs_data_release(audio_res);
+
+	obs_data_t *stop_req = obs_data_create();
+	obs_data_t *stop_res = obs_data_create();
+	obs_data_set_string(stop_req, "action", "stop");
+	CHECK(call_ws_request("PlaylistControl", stop_req, stop_res), "PlaylistControl not registered");
+	CHECK(!obs_data_get_bool(stop_res, "ok") && strcmp(obs_data_get_string(stop_res, "code"), "NoActivePlaylist") == 0,
+	      "stop without a playlist must be NoActivePlaylist");
+	obs_data_release(stop_req);
+	obs_data_release(stop_res);
+
+	obs_data_t *missing_req = obs_data_create();
+	obs_data_t *missing_res = obs_data_create();
+	obs_data_set_string(missing_req, "libraryId", "lib-missing");
+	CHECK(call_ws_request("LoadLibraryEntry", missing_req, missing_res), "LoadLibraryEntry not registered");
+	CHECK(!obs_data_get_bool(missing_res, "ok") &&
+		      strcmp(obs_data_get_string(missing_res, "code"), "EntryNotFound") == 0,
+	      "missing library entry must be EntryNotFound");
+	obs_data_release(missing_req);
+	obs_data_release(missing_res);
+
+	obs_data_t *load_req = obs_data_create();
+	obs_data_t *load_res = obs_data_create();
+	obs_data_set_string(load_req, "libraryId", saved_library_id);
+	CHECK(call_ws_request("LoadLibraryEntry", load_req, load_res) && obs_data_get_bool(load_res, "ok"),
+	      "LoadLibraryEntry failed: %s", obs_data_get_string(load_res, "message"));
+	CHECK(obs_data_get_string(load_res, "jobId")[0], "LoadLibraryEntry must return a jobId");
+	obs_data_release(load_req);
+	obs_data_release(load_res);
+	bool library_playing = false;
+	for (int attempt = 0; attempt < 50 && !library_playing; attempt++) {
+		st_res = obs_data_create();
+		CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus during library load failed");
+		clip = obs_data_get_obj(st_res, "clip");
+		library_playing = clip && strcmp(obs_data_get_string(clip, "origin"), "library") == 0 &&
+				  !obs_data_get_bool(clip, "loop") &&
+				  strcmp(obs_data_get_string(st_res, "state"), "playing") == 0;
+		obs_data_release(clip);
+		obs_data_release(st_res);
+		if (!library_playing)
+			os_sleep_ms(100);
+	}
+	CHECK(library_playing, "library entry did not start playing with loop off");
+
+	obs_data_t *play_req = obs_data_create();
+	obs_data_t *play_res = obs_data_create();
+	obs_data_set_string(play_req, "gameId", save_game);
+	obs_data_set_string(play_req, "tags", "highlight");
+	CHECK(call_ws_request("PlayPlaylist", play_req, play_res) && obs_data_get_bool(play_res, "ok"),
+	      "PlayPlaylist failed: %s", obs_data_get_string(play_res, "message"));
+	obs_data_release(play_req);
+	obs_data_release(play_res);
+	bool playlist_playing = false;
+	for (int attempt = 0; attempt < 50 && !playlist_playing; attempt++) {
+		st_res = obs_data_create();
+		CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus during playlist failed");
+		clip = obs_data_get_obj(st_res, "clip");
+		obs_data_t *playlist = obs_data_get_obj(st_res, "playlist");
+		playlist_playing = clip && strcmp(obs_data_get_string(clip, "origin"), "playlist") == 0 && playlist &&
+				   strcmp(obs_data_get_string(playlist, "state"), "playing") == 0;
+		obs_data_release(clip);
+		obs_data_release(playlist);
+		obs_data_release(st_res);
+		if (!playlist_playing)
+			os_sleep_ms(100);
+	}
+	CHECK(playlist_playing, "playlist did not start");
+	stop_req = obs_data_create();
+	stop_res = obs_data_create();
+	obs_data_set_string(stop_req, "action", "stop");
+	CHECK(call_ws_request("PlaylistControl", stop_req, stop_res) && obs_data_get_bool(stop_res, "ok"),
+	      "playlist stop failed");
+	obs_data_release(stop_req);
+	obs_data_release(stop_res);
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after playlist stop failed");
+	obs_data_t *playlist = obs_data_get_obj(st_res, "playlist");
+	CHECK(playlist && strcmp(obs_data_get_string(playlist, "state"), "idle") == 0, "playlist stop must set idle");
+	obs_data_release(playlist);
+	obs_data_release(st_res);
 
 
 	clear_fake_events();
