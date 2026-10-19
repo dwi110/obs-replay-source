@@ -421,9 +421,9 @@ static void fill_status(obs_data_t *response)
 		obs_data_set_string(clip, "audioMode", g.clip_audio_mode);
 		obs_data_set_obj(response, "clip", clip);
 		obs_data_release(clip);
-	} else {
-		obs_data_set_obj(response, "clip", NULL);
 	}
+	/* No clip: leave the key out. obs_data cannot hold JSON null, and obs_data_set_obj(NULL) reaches
+	 * obs-websocket clients as an empty object. */
 
 	obs_data_array_t *angle_array = obs_data_array_create();
 	uint64_t late_max = 0;

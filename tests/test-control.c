@@ -1341,6 +1341,10 @@ int main(int argc, char **argv)
 	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after release failed");
 	CHECK(strcmp(obs_data_get_string(st_res, "state"), "idle") == 0, "state after release is '%s'",
 	      obs_data_get_string(st_res, "state"));
+	/* Clients read the JSON: an idle status must not carry "clip" (an empty object there is not null). */
+	const char *idle_json = obs_data_get_json(st_res);
+	CHECK(idle_json && !strstr(idle_json, "\"clip\""), "idle GetStatus must omit clip, got %s",
+	      idle_json ? idle_json : "(null)");
 	obs_data_release(st_res);
 
 	obs_source_release(obs_scene_get_source(scene_a));
