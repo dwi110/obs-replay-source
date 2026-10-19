@@ -9,6 +9,16 @@ stays just under the duration and a 12 s `Trigger` with `duration` 12000 skips a
 13000. RAM per angle grows by one second of frames (1080p60 NV12 ≈ 0.19 GB, 2160p60 ≈ 0.75 GB). A per-source `Load`
 still keeps only the configured duration; the multi-angle `Trigger` uses the whole buffer and cuts the common window.
 
+**Trigger window.** Every receiving angle's newest frame is a candidate window end; the one that leaves the most
+angles with full `lookbackMs` history wins, the newest on a tie (`5a3af59`). An angle that stopped delivering under
+2 s ago is therefore skipped as `history` instead of pulling the window back past the other angles' history (the
+3 h Windows soak on 2026-10-19 had one trigger that kept only such an angle and skipped six). With audio mode `angle`
+a receiving audio angle must be in the chosen window.
+
+**Library loads.** `LoadLibraryEntry` and playlist entries decode on a worker thread. `Release`, `Trigger`,
+`PlaylistControl` `stop`, a newer load and shutdown cancel a load in flight: its result is dropped (job `failed`,
+error `cancelled`), the current clip and playlist state stay. Shutdown waits for running loads (`20d98a5`).
+
 Sections 2 and 3 below describe the pre-contract global API. Do not bind new Companion buttons to those names.
 
 # Replay Source Control & Companion Integration
