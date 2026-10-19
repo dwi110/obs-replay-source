@@ -4387,7 +4387,20 @@ bool replay_source_channel_status(struct replay_source *context, bool *playing_o
 	if (duration_ns_out)
 		*duration_ns_out = loaded ? context->current_replay.duration : 0;
 	uint64_t abs_ts = 0;
-	if (loaded) {
+	if (loaded && context->restart) {
+		/* Restart is applied on the next render. Until then (e.g. no replay scene shown) report where playback
+		 * restarts: Mark In forward, Mark Out backward. */
+		const struct replay *r = &context->current_replay;
+		if (context->backward) {
+			abs_ts = r->last_frame_timestamp;
+			if (r->trim_end > 0 && (uint64_t)r->trim_end < r->duration)
+				abs_ts -= (uint64_t)r->trim_end;
+		} else {
+			abs_ts = r->first_frame_timestamp;
+			if (r->trim_front > 0 && (uint64_t)r->trim_front < r->duration)
+				abs_ts += (uint64_t)r->trim_front;
+		}
+	} else if (loaded) {
 		const uint64_t timestamp = context->pause_timestamp == 0 ? obs_get_video_frame_time() : context->pause_timestamp;
 		int64_t duration = (int64_t)(timestamp - context->start_timestamp);
 		if (context->speed_percent != 100.0f)

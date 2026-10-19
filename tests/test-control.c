@@ -1038,6 +1038,26 @@ int main(int argc, char **argv)
 	obs_data_release(clip);
 	obs_data_release(st_res);
 
+	/* Restart while no replay source renders (live scene in program): the transport position must already be
+	 * Mark In, not the old position until the next render. */
+	obs_data_t *seek_req = obs_data_create();
+	obs_data_t *seek_res = obs_data_create();
+	obs_data_set_int(seek_req, "positionMs", 600);
+	CHECK(call_ws_request("Seek", seek_req, seek_res) && obs_data_get_bool(seek_res, "ok"), "Seek 600 failed");
+	obs_data_release(seek_req);
+	obs_data_release(seek_res);
+	obs_data_t *rst_res = obs_data_create();
+	CHECK(call_ws_request("Restart", NULL, rst_res) && obs_data_get_bool(rst_res, "ok"), "Restart failed");
+	obs_data_release(rst_res);
+	st_res = obs_data_create();
+	CHECK(call_ws_request("GetStatus", NULL, st_res), "GetStatus after Restart failed");
+	clip = obs_data_get_obj(st_res, "clip");
+	CHECK(clip && obs_data_get_int(clip, "playheadMs") <= obs_data_get_int(clip, "markInMs") + 50,
+	      "Restart must report Mark In while hidden, playhead %lld markIn %lld",
+	      clip ? obs_data_get_int(clip, "playheadMs") : -1, clip ? obs_data_get_int(clip, "markInMs") : -1);
+	obs_data_release(clip);
+	obs_data_release(st_res);
+
 	obs_data_t *mark_req = obs_data_create();
 	obs_data_t *mark_res = obs_data_create();
 	obs_data_set_int(mark_req, "positionMs", 1000);
