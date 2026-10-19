@@ -1372,14 +1372,17 @@ int main(int argc, char **argv)
 	obs_source_release(cam_a);
 
 	/* Capture slack: with Duration 1000 ms every filter keeps 2 s. Two angles delivering 300 ms apart still share
-	 * a 1 s window, so a full-duration Trigger takes both; a single-source Load stays at the 1 s duration. All
-	 * timestamps stay within MAX_TS_VAR of now, otherwise the filter rebases them as a clock jump. */
-	const char *slack_names[2][3] = {{"Slack Cam X", "Slack Raw X", "Replay Slack X"},
-					 {"Slack Cam Y", "Slack Raw Y", "Replay Slack Y"}};
-	obs_source_t *slack_cams[2];
-	obs_source_t *slack_rs[2];
-	obs_scene_t *slack_scenes[2];
-	for (int i = 0; i < 2; i++) {
+	 * a 1 s window, so a full-duration Trigger takes both; a single-source Load stays at the 1 s duration. A third
+	 * angle still receiving (not stale) but 1.2 s behind must be skipped as history, not pull the window back past
+	 * the history of the healthy angles. All timestamps stay within MAX_TS_VAR of now, otherwise the filter rebases
+	 * them as a clock jump. */
+	const char *slack_names[3][3] = {{"Slack Cam X", "Slack Raw X", "Replay Slack X"},
+					 {"Slack Cam Y", "Slack Raw Y", "Replay Slack Y"},
+					 {"Slack Cam Z", "Slack Raw Z", "Replay Slack Z"}};
+	obs_source_t *slack_cams[3];
+	obs_source_t *slack_rs[3];
+	obs_scene_t *slack_scenes[3];
+	for (int i = 0; i < 3; i++) {
 		slack_cams[i] = obs_source_create("dummy_async_cam", slack_names[i][0], NULL, NULL);
 		slack_rs[i] = obs_source_create(REPLAY_SOURCE_ID, slack_names[i][1], NULL, NULL);
 		CHECK(slack_cams[i] && slack_rs[i], "failed to create slack sources");
@@ -1396,6 +1399,8 @@ int main(int argc, char **argv)
 	feed_nv12_frames(slack_cams[0], 320, 180, 99, slack_now - 99ULL * contract_interval, contract_interval);
 	feed_nv12_frames(slack_cams[1], 320, 180, 99, slack_now - 300000000ULL - 99ULL * contract_interval,
 			 contract_interval);
+	feed_nv12_frames(slack_cams[2], 320, 180, 30, slack_now - 1200000000ULL - 30ULL * contract_interval,
+			 contract_interval);
 
 	trig_req = obs_data_create();
 	trig_res = obs_data_create();
@@ -1404,7 +1409,12 @@ int main(int argc, char **argv)
 	      "full-duration Trigger over offset angles failed: %s", obs_data_get_string(trig_res, "message"));
 	obs_data_array_t *slack_skipped = obs_data_get_array(trig_res, "skipped");
 	const size_t slack_skipped_count = slack_skipped ? obs_data_array_count(slack_skipped) : 99;
-	CHECK(slack_skipped_count == 0, "both offset angles must cover the 1 s window, %zu skipped", slack_skipped_count);
+	obs_data_t *slack_skip0 = slack_skipped_count == 1 ? obs_data_array_item(slack_skipped, 0) : NULL;
+	CHECK(slack_skip0 && strcmp(obs_data_get_string(slack_skip0, "angle"), "Slack Z") == 0 &&
+		      strcmp(obs_data_get_string(slack_skip0, "reason"), "history") == 0,
+	      "only the lagging angle may be skipped (as history), %zu skipped, first %s", slack_skipped_count,
+	      slack_skip0 ? obs_data_get_string(slack_skip0, "angle") : "-");
+	obs_data_release(slack_skip0);
 	obs_data_array_release(slack_skipped);
 	obs_data_release(trig_req);
 	obs_data_release(trig_res);
@@ -1419,7 +1429,7 @@ int main(int argc, char **argv)
 	CHECK(slack_st.duration_ms >= 950 && slack_st.duration_ms <= 1000,
 	      "single-source Load must keep the configured 1000 ms, got %lld", (long long)slack_st.duration_ms);
 
-	for (int i = 0; i < 2; i++) {
+	for (int i = 0; i < 3; i++) {
 		obs_source_release(obs_scene_get_source(slack_scenes[i]));
 		obs_source_release(slack_rs[i]);
 		obs_source_release(slack_cams[i]);

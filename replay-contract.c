@@ -574,30 +574,62 @@ static void handle_trigger(obs_data_t *request, obs_data_t *response)
 		return;
 	}
 
+	/* Window end: the candidate end that keeps the most fresh angles fully covered, newest on a tie. Taking the
+	 * oldest end of all fresh angles let one angle that stopped delivering 1-2 s ago (not yet stale) pull the
+	 * window back past the history of every healthy angle and evict them all. */
+	bool fresh[MAX_MEMBERS];
 	size_t fresh_count = 0;
-	uint64_t end = UINT64_MAX;
 	for (size_t i = 0; i < angle_count; i++) {
-		const bool fresh = angles[i].has_buffer && angles[i].arrival_ns > 0 && now - angles[i].arrival_ns <= STALE_NS;
-		if (fresh) {
+		fresh[i] = angles[i].has_buffer && angles[i].arrival_ns > 0 && now - angles[i].arrival_ns <= STALE_NS;
+		if (fresh[i])
 			fresh_count++;
-			if (angles[i].last_ts < end)
-				end = angles[i].last_ts;
+	}
+	/* Audio mode "angle": a fresh audio angle must be part of the chosen window. */
+	size_t audio_idx = SIZE_MAX;
+	if (strcmp(g.audio_mode, "angle") == 0) {
+		for (size_t i = 0; i < angle_count; i++)
+			if (fresh[i] && strcmp(angles[i].angle, g.audio_angle) == 0)
+				audio_idx = i;
+	}
+	size_t best_count = 0;
+	uint64_t best_end = 0;
+	for (size_t j = 0; j < angle_count; j++) {
+		const uint64_t cand = angles[j].last_ts;
+		if (!fresh[j] || cand <= lookback_ns)
+			continue;
+		if (audio_idx != SIZE_MAX &&
+		    (angles[audio_idx].last_ts < cand || angles[audio_idx].first_ts > cand - lookback_ns))
+			continue;
+		size_t count = 0;
+		for (size_t i = 0; i < angle_count; i++) {
+			if (fresh[i] && angles[i].last_ts >= cand && angles[i].first_ts <= cand - lookback_ns)
+				count++;
+		}
+		if (count > best_count || (count == best_count && count > 0 && cand > best_end)) {
+			best_count = count;
+			best_end = cand;
 		}
 	}
-	const uint64_t start = end > lookback_ns ? end - lookback_ns : 0;
+	/* Youngest point all chosen angles have; at least best_end, so coverage still holds. */
+	uint64_t end = UINT64_MAX;
+	for (size_t i = 0; best_count > 0 && i < angle_count; i++) {
+		if (fresh[i] && angles[i].last_ts >= best_end && angles[i].first_ts <= best_end - lookback_ns &&
+		    angles[i].last_ts < end)
+			end = angles[i].last_ts;
+	}
+	const uint64_t start = best_count > 0 ? end - lookback_ns : 0;
 
 	struct discovered included[MAX_MEMBERS];
 	size_t included_count = 0;
 	obs_data_array_t *skipped = obs_data_array_create();
 	for (size_t i = 0; i < angle_count; i++) {
-		const bool fresh = angles[i].has_buffer && angles[i].arrival_ns > 0 && now - angles[i].arrival_ns <= STALE_NS;
-		const bool covers = fresh && start > 0 && angles[i].first_ts <= start;
+		const bool covers = fresh[i] && start > 0 && angles[i].last_ts >= end && angles[i].first_ts <= start;
 		if (covers) {
 			included[included_count++] = angles[i];
 		} else {
 			obs_data_t *entry = obs_data_create();
 			obs_data_set_string(entry, "angle", angles[i].angle);
-			obs_data_set_string(entry, "reason", fresh ? "history" : "stalled");
+			obs_data_set_string(entry, "reason", fresh[i] ? "history" : "stalled");
 			obs_data_array_push_back(skipped, entry);
 			obs_data_release(entry);
 		}
