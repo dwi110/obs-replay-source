@@ -217,6 +217,26 @@ void replay_filter_check(void *data);
 #define MAX_TS_VAR 2000000000ULL
 #endif
 
+/* Capture filters keep this much history beyond the configured duration. Cameras deliver slightly offset, so the
+ * window common to all angles is shorter than each buffer; with the slack a full-duration multi-angle Trigger still
+ * covers every angle. A single-source load takes only the configured duration (replay_capture_keep_from). */
+#define REPLAY_CAPTURE_SLACK_NS 1000000000ULL
+
+static inline uint64_t replay_capture_duration_ns(uint64_t configured_ns)
+{
+	return configured_ns ? configured_ns + REPLAY_CAPTURE_SLACK_NS : 0;
+}
+
+/* Oldest timestamp a single-source load keeps when the newest buffered one is newest_ts and the filter buffers
+ * capture_ns (configured duration plus slack). 0 keeps everything. */
+static inline uint64_t replay_capture_keep_from(uint64_t newest_ts, uint64_t capture_ns)
+{
+	if (capture_ns <= REPLAY_CAPTURE_SLACK_NS)
+		return 0;
+	const uint64_t keep_ns = capture_ns - REPLAY_CAPTURE_SLACK_NS;
+	return newest_ts > keep_ns ? newest_ts - keep_ns : 0;
+}
+
 #ifdef __cplusplus
 }
 #endif

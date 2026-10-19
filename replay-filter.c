@@ -172,7 +172,8 @@ static void replay_filter_update(void *data, obs_data_t *settings)
 
 	obs_remove_main_render_callback(replay_filter_offscreen_render, filter);
 
-	uint64_t new_duration = (uint64_t)obs_data_get_int(settings, SETTING_DURATION) * MSEC_TO_NSEC;
+	uint64_t new_duration =
+		replay_capture_duration_ns((uint64_t)obs_data_get_int(settings, SETTING_DURATION) * MSEC_TO_NSEC);
 
 	pthread_mutex_lock(&filter->mutex);
 	if (new_duration < filter->duration) {

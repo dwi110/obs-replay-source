@@ -1351,6 +1351,60 @@ int main(int argc, char **argv)
 	obs_source_release(rs_a);
 	obs_source_release(cam_a);
 
+	/* Capture slack: with Duration 1000 ms every filter keeps 2 s. Two angles delivering 300 ms apart still share
+	 * a 1 s window, so a full-duration Trigger takes both; a single-source Load stays at the 1 s duration. All
+	 * timestamps stay within MAX_TS_VAR of now, otherwise the filter rebases them as a clock jump. */
+	const char *slack_names[2][3] = {{"Slack Cam X", "Slack Raw X", "Replay Slack X"},
+					 {"Slack Cam Y", "Slack Raw Y", "Replay Slack Y"}};
+	obs_source_t *slack_cams[2];
+	obs_source_t *slack_rs[2];
+	obs_scene_t *slack_scenes[2];
+	for (int i = 0; i < 2; i++) {
+		slack_cams[i] = obs_source_create("dummy_async_cam", slack_names[i][0], NULL, NULL);
+		slack_rs[i] = obs_source_create(REPLAY_SOURCE_ID, slack_names[i][1], NULL, NULL);
+		CHECK(slack_cams[i] && slack_rs[i], "failed to create slack sources");
+		obs_data_t *ss = obs_source_get_settings(slack_rs[i]);
+		obs_data_set_string(ss, SETTING_SOURCE, slack_names[i][0]);
+		obs_data_set_int(ss, SETTING_DURATION, 1000);
+		obs_source_update(slack_rs[i], ss);
+		obs_source_load(slack_rs[i]);
+		obs_data_release(ss);
+		slack_scenes[i] = obs_scene_create(slack_names[i][2]);
+		CHECK(slack_scenes[i] && obs_scene_add(slack_scenes[i], slack_rs[i]), "failed to create slack scene");
+	}
+	const uint64_t slack_now = os_gettime_ns();
+	feed_nv12_frames(slack_cams[0], 320, 180, 99, slack_now - 99ULL * contract_interval, contract_interval);
+	feed_nv12_frames(slack_cams[1], 320, 180, 99, slack_now - 300000000ULL - 99ULL * contract_interval,
+			 contract_interval);
+
+	trig_req = obs_data_create();
+	trig_res = obs_data_create();
+	obs_data_set_int(trig_req, "lookbackMs", 1000);
+	CHECK(call_ws_request("Trigger", trig_req, trig_res) && obs_data_get_bool(trig_res, "ok"),
+	      "full-duration Trigger over offset angles failed: %s", obs_data_get_string(trig_res, "message"));
+	obs_data_array_t *slack_skipped = obs_data_get_array(trig_res, "skipped");
+	const size_t slack_skipped_count = slack_skipped ? obs_data_array_count(slack_skipped) : 99;
+	CHECK(slack_skipped_count == 0, "both offset angles must cover the 1 s window, %zu skipped", slack_skipped_count);
+	obs_data_array_release(slack_skipped);
+	obs_data_release(trig_req);
+	obs_data_release(trig_res);
+	rel_res = obs_data_create();
+	CHECK(call_ws_request("Release", NULL, rel_res) && obs_data_get_bool(rel_res, "ok"), "slack Release failed");
+	obs_data_release(rel_res);
+
+	struct replay_source *slack_ctx = obs_obj_get_data(slack_rs[0]);
+	CHECK(replay_source_execute_action(slack_ctx, "Load", false), "single-source Load failed");
+	struct replay_source_status slack_st;
+	CHECK(replay_source_get_status(slack_ctx, &slack_st), "slack status failed");
+	CHECK(slack_st.duration_ms >= 950 && slack_st.duration_ms <= 1000,
+	      "single-source Load must keep the configured 1000 ms, got %lld", (long long)slack_st.duration_ms);
+
+	for (int i = 0; i < 2; i++) {
+		obs_source_release(obs_scene_get_source(slack_scenes[i]));
+		obs_source_release(slack_rs[i]);
+		obs_source_release(slack_cams[i]);
+	}
+
 	/* Cleanup */
 	obs_source_release(rs1);
 	obs_source_release(rs2);

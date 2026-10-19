@@ -394,7 +394,8 @@ static void replay_filter_update(void *data, obs_data_t *settings)
 {
 	struct replay_filter *filter = data;
 
-	const uint64_t new_duration = (uint64_t)obs_data_get_int(settings, SETTING_DURATION) * MSEC_TO_NSEC;
+	const uint64_t new_duration =
+		replay_capture_duration_ns((uint64_t)obs_data_get_int(settings, SETTING_DURATION) * MSEC_TO_NSEC);
 	const int new_storage = (int)obs_data_get_int(settings, SETTING_STORAGE_FORMAT);
 	const int new_downscale = (int)obs_data_get_int(settings, SETTING_DOWNSCALE);
 	const int new_reserve = (int)obs_data_get_int(settings, SETTING_RESERVE_MODE);

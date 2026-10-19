@@ -2,6 +2,13 @@
 
 Shared operator control for both approaches lives in the hub document `docs/BEDIENVERTRAG.md` (vendor `MulticamReplay`). On this branch the contract requests, events and global hotkeys are registered there. The old global names `ReplaySource.LoadAll`, `ReplaySource.SaveAll` and `ReplaySource.All*` are not registered. `ReplaySource` remains only for approach-specific calls: `GetReplays`, `SetSlowmoBlend`, and the three `ReplaySource.SlowmoBlend*` hotkeys. Per-source hotkeys in section 1 are unchanged and are not part of the shared Companion page.
 
+**Buffer duration and capture slack.** Every capture filter keeps the configured `duration` plus 1 s
+(`REPLAY_CAPTURE_SLACK_NS`). Cameras deliver slightly offset, so without the slack the window common to all angles
+stays just under the duration and a 12 s `Trigger` with `duration` 12000 skips angles or returns `NotReady` (measured
+2026-10-18 with seven NDI cameras: 11 s fit, 12 s did not). A 12 s `Trigger` therefore needs `duration` 12000, not
+13000. RAM per angle grows by one second of frames (1080p60 NV12 ≈ 0.19 GB, 2160p60 ≈ 0.75 GB). A per-source `Load`
+still keeps only the configured duration; the multi-angle `Trigger` uses the whole buffer and cuts the common window.
+
 Sections 2 and 3 below describe the pre-contract global API. Do not bind new Companion buttons to those names.
 
 # Replay Source Control & Companion Integration

@@ -1007,32 +1007,38 @@ static bool replay_retrieve_internal(struct replay_source *context, bool emit_ev
 	new_replay.has_align = false;
 	new_replay.auto_saved = false;
 	new_replay.last_arrival_ns = 0;
+	/* A single-source load (emit_event) keeps only the configured duration; the filter buffers
+	 * REPLAY_CAPTURE_SLACK_NS more for multi-angle alignment, which aligns the full buffer itself. */
+	uint64_t keep_from = 0;
 	if (vf) {
 		struct obs_source_frame *frame;
 		pthread_mutex_lock(&vf->mutex);
-		if (vf->video_frames.size) {
-			circlebuf_peek_front(&vf->video_frames, &frame, sizeof(struct obs_source_frame *));
-			new_replay.first_frame_timestamp = frame->timestamp;
-			new_replay.last_frame_timestamp = frame->timestamp;
+		const uint64_t buffered = vf->video_frames.size / sizeof(struct obs_source_frame *);
+		if (emit_event && buffered) {
+			circlebuf_peek_back(&vf->video_frames, &frame, sizeof(struct obs_source_frame *));
+			keep_from = replay_capture_keep_from(frame->timestamp, vf->duration);
 		}
-		new_replay.video_frame_count = vf->video_frames.size / sizeof(struct obs_source_frame *);
-		new_replay.video_frames = bzalloc((size_t)new_replay.video_frame_count * sizeof(struct obs_source_frame *));
-		if (context->keep_buffer) {
-			for (uint64_t i = 0; i < new_replay.video_frame_count; i++) {
+		new_replay.video_frame_count = 0;
+		new_replay.video_frames = bzalloc((size_t)buffered * sizeof(struct obs_source_frame *));
+		for (uint64_t i = 0; i < buffered; i++) {
+			if (context->keep_buffer) {
 				memcpy(&frame,
-				       circlebuf_data(&vf->video_frames,
-						      (size_t)i * sizeof(struct obs_source_frame *)),
+				       circlebuf_data(&vf->video_frames, (size_t)i * sizeof(struct obs_source_frame *)),
 				       sizeof(struct obs_source_frame *));
+				if (frame->timestamp < keep_from)
+					continue;
 				replay_frame_addref(frame);
-				new_replay.last_frame_timestamp = frame->timestamp;
-				*(new_replay.video_frames + i) = frame;
-			}
-		} else {
-			for (uint64_t i = 0; i < new_replay.video_frame_count; i++) {
+			} else {
 				circlebuf_pop_front(&vf->video_frames, &frame, sizeof(struct obs_source_frame *));
-				new_replay.last_frame_timestamp = frame->timestamp;
-				*(new_replay.video_frames + i) = frame;
+				if (frame->timestamp < keep_from) {
+					replay_frame_release(frame);
+					continue;
+				}
 			}
+			if (new_replay.video_frame_count == 0)
+				new_replay.first_frame_timestamp = frame->timestamp;
+			new_replay.last_frame_timestamp = frame->timestamp;
+			new_replay.video_frames[new_replay.video_frame_count++] = frame;
 		}
 		new_replay.last_arrival_ns = vf->last_arrival_ns;
 		pthread_mutex_unlock(&vf->mutex);
@@ -1043,41 +1049,37 @@ static bool replay_retrieve_internal(struct replay_source *context, bool emit_ev
 	if (af) {
 		pthread_mutex_lock(&af->mutex);
 		struct obs_audio_data audio;
-		if (!vf && af->audio_frames.size) {
-			circlebuf_peek_front(&af->audio_frames, &audio, sizeof(struct obs_audio_data));
-			new_replay.first_frame_timestamp = audio.timestamp;
-			new_replay.last_frame_timestamp = audio.timestamp;
+		const uint64_t buffered = af->audio_frames.size / sizeof(struct obs_audio_data);
+		if (emit_event && !vf && buffered) {
+			circlebuf_peek_back(&af->audio_frames, &audio, sizeof(struct obs_audio_data));
+			keep_from = replay_capture_keep_from(audio.timestamp, af->duration);
 		}
 		new_replay.oai = af->oai;
 		if (!vf)
 			new_replay.last_arrival_ns = af->last_arrival_ns;
-		new_replay.audio_frame_count = af->audio_frames.size / sizeof(struct obs_audio_data);
-		new_replay.audio_frames = bzalloc((size_t)new_replay.audio_frame_count * sizeof(struct obs_audio_data));
-		if (context->keep_buffer) {
-			for (uint64_t i = 0; i < new_replay.audio_frame_count; i++) {
-				memcpy(&audio,
-				       circlebuf_data(&af->audio_frames, (size_t)i * sizeof(struct obs_audio_data)),
+		new_replay.audio_frame_count = 0;
+		new_replay.audio_frames = bzalloc((size_t)buffered * sizeof(struct obs_audio_data));
+		for (uint64_t i = 0; i < buffered; i++) {
+			if (context->keep_buffer) {
+				memcpy(&audio, circlebuf_data(&af->audio_frames, (size_t)i * sizeof(struct obs_audio_data)),
 				       sizeof(struct obs_audio_data));
-				if (!vf) {
-					new_replay.last_frame_timestamp = audio.timestamp;
-				}
-				memcpy(&new_replay.audio_frames[i], &audio, sizeof(struct obs_audio_data));
-				replay_audio_packet_addref(&new_replay.audio_frames[i]);
-			}
-		} else {
-			for (uint64_t i = 0; i < new_replay.audio_frame_count; i++) {
+				if (audio.timestamp < keep_from)
+					continue;
+				replay_audio_packet_addref(&audio);
+			} else {
 				circlebuf_pop_front(&af->audio_frames, &audio, sizeof(struct obs_audio_data));
-				if (!vf) {
-					new_replay.last_frame_timestamp = audio.timestamp;
-				}
-				memcpy(&new_replay.audio_frames[i], &audio, sizeof(struct obs_audio_data));
-				for (size_t j = 0; j < MAX_AV_PLANES; j++) {
-					if (!audio.data[j])
-						break;
-
-					new_replay.audio_frames[i].data[j] = audio.data[j];
+				if (audio.timestamp < keep_from) {
+					free_audio_packet(&audio);
+					continue;
 				}
 			}
+			if (!vf) {
+				if (new_replay.audio_frame_count == 0)
+					new_replay.first_frame_timestamp = audio.timestamp;
+				new_replay.last_frame_timestamp = audio.timestamp;
+			}
+			memcpy(&new_replay.audio_frames[new_replay.audio_frame_count++], &audio,
+			       sizeof(struct obs_audio_data));
 		}
 		pthread_mutex_unlock(&af->mutex);
 	} else {
