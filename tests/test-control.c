@@ -243,6 +243,39 @@ static bool call_ws_request(const char *type, obs_data_t *req, obs_data_t *res)
 	return true;
 }
 
+static size_t count_fake_events(const char *type)
+{
+	size_t n = 0;
+	for (size_t i = 0; i < g_fake_ws.events.num; i++)
+		if (strcmp(g_fake_ws.events.array[i].type, type) == 0)
+			n++;
+	return n;
+}
+
+static bool playlist_state_is(const char *state)
+{
+	obs_data_t *st = obs_data_create();
+	bool ok = call_ws_request("GetStatus", NULL, st);
+	obs_data_t *pl = obs_data_get_obj(st, "playlist");
+	ok = ok && pl && strcmp(obs_data_get_string(pl, "state"), state) == 0;
+	obs_data_release(pl);
+	obs_data_release(st);
+	return ok;
+}
+
+/* PlayPlaylist and confirm its first entry is still loading (decode runs on a worker thread). */
+static bool play_playlist_loading(const char *game)
+{
+	obs_data_t *req = obs_data_create();
+	obs_data_t *res = obs_data_create();
+	obs_data_set_string(req, "gameId", game);
+	obs_data_set_string(req, "tags", "highlight");
+	const bool ok = call_ws_request("PlayPlaylist", req, res) && obs_data_get_bool(res, "ok");
+	obs_data_release(req);
+	obs_data_release(res);
+	return ok && playlist_state_is("loading");
+}
+
 /* Hotkey enumeration helpers */
 struct hotkey_snapshot {
 	DARRAY(char *) names;
@@ -1346,7 +1379,23 @@ int main(int argc, char **argv)
 	obs_data_release(playlist);
 	obs_data_release(st_res);
 
+	/* Stop while the entry is still loading: the finished load must not publish a clip or restart the playlist. */
+	CHECK(play_playlist_loading(save_game), "PlayPlaylist must start in loading");
+	clear_fake_events();
+	stop_req = obs_data_create();
+	stop_res = obs_data_create();
+	obs_data_set_string(stop_req, "action", "stop");
+	CHECK(call_ws_request("PlaylistControl", stop_req, stop_res) && obs_data_get_bool(stop_res, "ok"),
+	      "playlist stop during load failed");
+	obs_data_release(stop_req);
+	obs_data_release(stop_res);
+	os_sleep_ms(1500);
+	CHECK(count_fake_events("ClipLoaded") == 0, "load stopped by PlaylistStop published %zu clips",
+	      count_fake_events("ClipLoaded"));
+	CHECK(playlist_state_is("idle"), "playlist must stay idle after stop during load");
 
+	/* Release while the entry is still loading: playlist idle, not a late error from the cancelled load. */
+	CHECK(play_playlist_loading(save_game), "PlayPlaylist before Release must start in loading");
 	clear_fake_events();
 	obs_data_t *rel_res = obs_data_create();
 	CHECK(call_ws_request("Release", NULL, rel_res) && obs_data_get_bool(rel_res, "ok"), "Release failed");
@@ -1366,6 +1415,10 @@ int main(int argc, char **argv)
 	CHECK(idle_json && !strstr(idle_json, "\"clip\""), "idle GetStatus must omit clip, got %s",
 	      idle_json ? idle_json : "(null)");
 	obs_data_release(st_res);
+	os_sleep_ms(1500);
+	CHECK(count_fake_events("ClipLoaded") == 0, "load cancelled by Release published %zu clips",
+	      count_fake_events("ClipLoaded"));
+	CHECK(playlist_state_is("idle"), "playlist must stay idle after Release during load, not error");
 
 	obs_source_release(obs_scene_get_source(scene_a));
 	obs_source_release(rs_a);

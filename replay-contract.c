@@ -90,9 +90,10 @@ struct contract {
 	size_t playlist_count;
 	bool playlist_advance_guard;
 
-	volatile bool load_abort;
-	pthread_t load_thread;
-	bool load_thread_active;
+	/* Each load gets the generation at start; Release, Trigger, playlist stop, a newer load and shutdown bump it.
+	 * A finished load publishes only if its generation is still current. */
+	volatile long load_gen;
+	volatile long load_threads;
 
 	obs_hotkey_id hotkeys[26];
 	size_t hotkey_count;
@@ -165,6 +166,13 @@ static void release_members_locked(void)
 		obs_source_release(g.members[i].source);
 	}
 	g.member_count = 0;
+}
+
+/* Invalidate any load in flight: its decode aborts and its result is dropped, the current clip stays. */
+static void cancel_load_locked(void)
+{
+	os_atomic_inc_long(&g.load_gen);
+	g.loading = false;
 }
 
 static void stop_playlist_locked(void)
@@ -498,7 +506,7 @@ static void release_clip_locked(bool emit)
 	strncpy(released, g.clip_id, sizeof released - 1);
 	released[sizeof released - 1] = '\0';
 	const bool was_loaded = g.loaded;
-	g.load_abort = true;
+	cancel_load_locked();
 	release_members_locked();
 	g.loaded = false;
 	g.loading = false;
@@ -1354,6 +1362,7 @@ struct load_task {
 	char angle[64];
 	char job_id[32];
 	bool for_playlist;
+	long gen;
 };
 
 static void install_decoded_locked(struct replay_decoded_clip *clip, bool loop, struct dstr *angle_list)
@@ -1386,8 +1395,8 @@ static void install_decoded_locked(struct replay_decoded_clip *clip, bool loop, 
 
 static bool load_should_abort(void *param)
 {
-	UNUSED_PARAMETER(param);
-	return os_atomic_load_bool(&g.load_abort);
+	const struct load_task *task = param;
+	return os_atomic_load_long(&g.load_gen) != task->gen;
 }
 
 static void *load_thread(void *param)
@@ -1396,28 +1405,31 @@ static void *load_thread(void *param)
 	struct replay_decoded_clip clip;
 	memset(&clip, 0, sizeof clip);
 	char err[256] = "";
-	const bool ok = replay_decode_file(task->file, os_gettime_ns(), &clip, load_should_abort, NULL, err, sizeof err);
+	const bool ok = replay_decode_file(task->file, os_gettime_ns(), &clip, load_should_abort, task, err, sizeof err);
 
 	pthread_mutex_lock(&g.mutex);
-	g.load_thread_active = false;
-	g.loading = false;
-	if (!ok || g.load_abort || g.shutting_down) {
+	/* A cancelled or superseded load must not touch the clip, the playlist or g.loading (a newer load owns it). */
+	const bool current = os_atomic_load_long(&g.load_gen) == task->gen && !g.shutting_down;
+	if (current)
+		g.loading = false;
+	if (!ok || !current) {
 		struct job *job = find_job_locked(task->job_id);
 		if (job) {
 			strncpy(job->state, "failed", sizeof job->state - 1);
-			strncpy(job->error, err[0] ? err : "load failed", sizeof job->error - 1);
+			strncpy(job->error, !current ? "cancelled" : err[0] ? err : "load failed", sizeof job->error - 1);
 		}
-		if (!g.load_abort && err[0])
+		if (current && err[0])
 			strncpy(g.error, err, sizeof g.error - 1);
-		if (task->for_playlist)
+		const bool playlist_error = current && task->for_playlist;
+		if (playlist_error)
 			strcpy(g.playlist_state, "error");
-		const bool playlist = task->for_playlist;
 		pthread_mutex_unlock(&g.mutex);
 		replay_decoded_clip_free(&clip);
-		if (playlist)
+		if (playlist_error)
 			emit_simple("PlaylistChanged", "state", "error", "index", "-1", "count", "0", "libraryId", "", NULL,
 				    NULL);
 		bfree(task);
+		os_atomic_dec_long(&g.load_threads);
 		return NULL;
 	}
 	release_members_locked();
@@ -1471,6 +1483,7 @@ static void *load_thread(void *param)
 	dstr_free(&angle_list);
 	replay_decoded_clip_free(&clip);
 	bfree(task);
+	os_atomic_dec_long(&g.load_threads);
 	return NULL;
 }
 
@@ -1490,16 +1503,19 @@ static bool start_load_locked(const struct replay_library_entry *entry, bool for
 	struct job *job = find_job_locked(job_id);
 	if (job)
 		strncpy(job->state, "running", sizeof job->state - 1);
-	g.load_abort = false;
+	/* A newer load supersedes one still in flight. */
+	task->gen = os_atomic_inc_long(&g.load_gen);
 	g.loading = true;
-	if (pthread_create(&g.load_thread, NULL, load_thread, task) != 0) {
+	os_atomic_inc_long(&g.load_threads);
+	pthread_t thread;
+	if (pthread_create(&thread, NULL, load_thread, task) != 0) {
+		os_atomic_dec_long(&g.load_threads);
 		g.loading = false;
 		bfree(task);
 		respond_error(response, "Internal", "could not start the load");
 		return false;
 	}
-	g.load_thread_active = true;
-	pthread_detach(g.load_thread);
+	pthread_detach(thread);
 	return true;
 }
 
@@ -1594,6 +1610,9 @@ static void handle_playlist_control(obs_data_t *request, obs_data_t *response)
 		return;
 	}
 	if (strcmp(action, "stop") == 0) {
+		/* An entry still loading must not start playing after Stop. */
+		if (g.loading)
+			cancel_load_locked();
 		stop_playlist_locked();
 		emit_playlist_locked();
 	} else if (strcmp(action, "pause") == 0) {
@@ -2025,10 +2044,16 @@ void replay_contract_shutdown(void)
 		return;
 	pthread_mutex_lock(&g.mutex);
 	g.shutting_down = true;
-	g.load_abort = true;
+	os_atomic_inc_long(&g.load_gen);
 	release_members_locked();
 	stop_playlist_locked();
 	pthread_mutex_unlock(&g.mutex);
+	/* Detached load threads lock g.mutex when they finish; the decode aborts on the generation change. */
+	for (int i = 0; i < 2000 && os_atomic_load_long(&g.load_threads) > 0; i++)
+		os_sleep_ms(5);
+	const bool loads_drained = os_atomic_load_long(&g.load_threads) == 0;
+	if (!loads_drained)
+		blog(LOG_WARNING, "[MulticamReplay] library load still running at shutdown; keeping its lock");
 
 	obs_remove_tick_callback(playlist_tick, NULL);
 	obs_frontend_remove_event_callback(frontend_event, NULL);
@@ -2039,7 +2064,8 @@ void replay_contract_shutdown(void)
 		if (g.hotkeys[i] != OBS_INVALID_HOTKEY_ID)
 			obs_hotkey_unregister(g.hotkeys[i]);
 	g.hotkey_count = 0;
-	pthread_mutex_destroy(&g.mutex);
+	if (loads_drained)
+		pthread_mutex_destroy(&g.mutex);
 	g.initialized = false;
 }
 
