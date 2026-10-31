@@ -36,6 +36,6 @@ void obs_module_post_load(void)
 void obs_module_unload(void)
 {
 	replay_contract_shutdown();
-	replay_control_shutdown();
 	replay_save_queue_shutdown();
+	replay_control_shutdown();
 }

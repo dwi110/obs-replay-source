@@ -22,6 +22,8 @@
 extern bool obs_module_load(void);
 extern void obs_module_post_load(void);
 extern void obs_module_unload(void);
+extern struct obs_source_info replay_filter_info;
+extern void replay_filter_raw_video(void *data, struct video_data *frame);
 
 #define CHECK(cond, ...)                                                       \
 	do {                                                                   \
@@ -371,8 +373,169 @@ static void feed_nv12_frames(obs_source_t *cam, uint32_t width, uint32_t height,
 	video_frame_free((struct video_frame *)&frame);
 }
 
+struct sync_filter_shutdown {
+	struct replay_filter *filter;
+	volatile long entered;
+	volatile long captured;
+	volatile long destroyed;
+	volatile long stop_timed_out;
+};
+
+/* Keep a real video_output callback in flight until close has started. Its subsequent production raw
+ * capture must still be able to take the filter mutex while close joins the video thread. */
+static void capture_during_close(void *data, struct video_data *frame)
+{
+	struct sync_filter_shutdown *state = data;
+	os_atomic_set_long(&state->entered, 1);
+	for (int i = 0; i < 600 && !video_output_stopped(state->filter->video_output); i++)
+		os_sleep_ms(5);
+	if (!video_output_stopped(state->filter->video_output)) {
+		os_atomic_set_long(&state->stop_timed_out, 1);
+		return;
+	}
+	replay_filter_raw_video(state->filter, frame);
+	os_atomic_set_long(&state->captured, 1);
+}
+
+static void *destroy_sync_filter(void *data)
+{
+	struct sync_filter_shutdown *state = data;
+	obs_enter_graphics();
+	replay_filter_info.destroy(state->filter);
+	obs_leave_graphics();
+	os_atomic_set_long(&state->destroyed, 1);
+	return NULL;
+}
+
+static int check_sync_filter_shutdown(void)
+{
+	for (int cycle = 0; cycle < 3; cycle++) {
+		/* Build the valid filter-owned output/resources directly so the test controls exactly when its
+		 * callback runs, without depending on graphics render timing or a synthetic lock-only stub. */
+		struct sync_filter_shutdown *state = bzalloc(sizeof(*state));
+		struct replay_filter *filter = bzalloc(sizeof(*filter));
+		state->filter = filter;
+		pthread_mutex_init(&filter->mutex, NULL);
+		filter->known_width = 64;
+		filter->known_height = 32;
+		filter->duration = SEC_TO_NSEC;
+		filter->ovi.fps_num = 60;
+		filter->ovi.fps_den = 1;
+		obs_enter_graphics();
+		filter->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+		filter->stagesurface = gs_stagesurface_create(64, 32, GS_BGRA);
+		obs_leave_graphics();
+		CHECK(filter->texrender && filter->stagesurface, "failed to create synchronous filter resources");
+		struct video_output_info vi = {
+			.name = "sync-filter-shutdown",
+			.format = VIDEO_FORMAT_BGRA,
+			.fps_num = 60,
+			.fps_den = 1,
+			.width = 64,
+			.height = 32,
+			.cache_size = 2,
+			.colorspace = VIDEO_CS_709,
+			.range = VIDEO_RANGE_FULL,
+		};
+		CHECK(video_output_open(&filter->video_output, &vi) == VIDEO_OUTPUT_SUCCESS,
+		      "failed to open synchronous filter output");
+		CHECK(video_output_connect(filter->video_output, NULL, capture_during_close, state),
+		      "failed to connect synchronous filter capture");
+		struct video_frame frame;
+		CHECK(video_output_lock_frame(filter->video_output, &frame, 1, os_gettime_ns()),
+		      "failed to queue synchronous capture");
+		memset(frame.data[0], 0x50, (size_t)frame.linesize[0] * vi.height);
+		video_output_unlock_frame(filter->video_output);
+		for (int i = 0; i < 600 && !os_atomic_load_long(&state->entered); i++)
+			os_sleep_ms(5);
+		CHECK(os_atomic_load_long(&state->entered), "synchronous capture callback did not start");
+		pthread_t thread;
+		CHECK(pthread_create(&thread, NULL, destroy_sync_filter, state) == 0, "failed to start filter destruction");
+		for (int i = 0; i < 600 && !os_atomic_load_long(&state->destroyed); i++)
+			os_sleep_ms(5);
+		CHECK(os_atomic_load_long(&state->destroyed),
+		      "synchronous filter destruction deadlocked with an in-flight raw capture (cycle %d)", cycle);
+		pthread_join(thread, NULL);
+		CHECK(!os_atomic_load_long(&state->stop_timed_out) && os_atomic_load_long(&state->captured),
+		      "filter destruction must drain the real raw capture callback before freeing its state");
+		bfree(state);
+	}
+	return 0;
+}
+
+static struct {
+	volatile long entered;
+	volatile long release;
+	volatile long removing;
+	volatile long removed;
+	volatile long calls;
+} save_hook_state;
+
+static void blocking_save_hook(const char *trigger, const char *path, bool started, bool ok)
+{
+	UNUSED_PARAMETER(trigger);
+	UNUSED_PARAMETER(path);
+	UNUSED_PARAMETER(started);
+	UNUSED_PARAMETER(ok);
+	os_atomic_inc_long(&save_hook_state.calls);
+	os_atomic_set_long(&save_hook_state.entered, 1);
+	while (!os_atomic_load_long(&save_hook_state.release))
+		os_sleep_ms(1);
+}
+
+static void *emit_blocked_save(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	replay_control_emit_save_started("hook-lifetime", "/tmp/hook-lifetime.mkv", "contract:hook-lifetime");
+	return NULL;
+}
+
+static void *remove_blocked_save_hook(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	os_atomic_set_long(&save_hook_state.removing, 1);
+	replay_control_set_save_hook(NULL);
+	os_atomic_set_long(&save_hook_state.removed, 1);
+	return NULL;
+}
+
+static int check_save_hook_shutdown(void)
+{
+	memset(&save_hook_state, 0, sizeof save_hook_state);
+	replay_control_init();
+	replay_control_set_save_hook(blocking_save_hook);
+	pthread_t emitter, remover;
+	CHECK(pthread_create(&emitter, NULL, emit_blocked_save, NULL) == 0, "save-hook emitter creation failed");
+	for (int i = 0; i < 1000 && !os_atomic_load_long(&save_hook_state.entered); i++)
+		os_sleep_ms(1);
+	CHECK(os_atomic_load_long(&save_hook_state.entered), "save hook did not enter");
+	CHECK(pthread_create(&remover, NULL, remove_blocked_save_hook, NULL) == 0,
+	      "save-hook removal thread creation failed");
+	for (int i = 0; i < 1000 && !os_atomic_load_long(&save_hook_state.removing); i++)
+		os_sleep_ms(1);
+	CHECK(os_atomic_load_long(&save_hook_state.removing), "save-hook removal did not start");
+	os_sleep_ms(100);
+	const bool removed_while_active = os_atomic_load_long(&save_hook_state.removed) != 0;
+	os_atomic_set_long(&save_hook_state.release, 1);
+	pthread_join(emitter, NULL);
+	pthread_join(remover, NULL);
+	CHECK(!removed_while_active, "save-hook removal returned while its callback still owned contract state");
+	CHECK(os_atomic_load_long(&save_hook_state.removed), "save-hook removal did not finish after callback");
+	replay_control_emit_save_finished("hook-lifetime", "/tmp/hook-lifetime.mkv", true);
+	CHECK(os_atomic_load_long(&save_hook_state.calls) == 1, "detached save hook received another event");
+	replay_control_shutdown();
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
+	if (argc > 1 && strcmp(argv[1], "--save-hook-shutdown") == 0) {
+		CHECK(obs_startup("en-US", NULL, NULL), "obs_startup failed");
+		CHECK(check_save_hook_shutdown() == 0, "save-hook lifetime regression failed");
+		printf("[test-control] SAVE HOOK SHUTDOWN PASSED!\n");
+		obs_shutdown();
+		return 0;
+	}
 	if (!getenv("DISPLAY") && !getenv("WAYLAND_DISPLAY")) {
 		printf("[test-control] No DISPLAY set, re-executing under xvfb-run -a...\n");
 		char **new_argv = calloc((size_t)argc + 3, sizeof(char *));
@@ -389,6 +552,8 @@ int main(int argc, char **argv)
 	obs_set_nix_platform(OBS_NIX_PLATFORM_X11_EGL);
 
 	CHECK(obs_startup("en-US", NULL, NULL), "obs_startup failed");
+	if (argc <= 1)
+		CHECK(check_save_hook_shutdown() == 0, "save-hook lifetime regression failed");
 	obs_add_data_path("/usr/share/obs/libobs/");
 
 	struct obs_video_info ovi = {
@@ -418,6 +583,13 @@ int main(int argc, char **argv)
 		.speakers = SPEAKERS_STEREO,
 	};
 	CHECK(obs_reset_audio(&oai), "obs_reset_audio failed");
+
+	CHECK(check_sync_filter_shutdown() == 0, "synchronous filter shutdown regression failed");
+	if (argc > 1 && strcmp(argv[1], "--sync-filter-shutdown") == 0) {
+		obs_shutdown();
+		printf("[test-control] SYNCHRONOUS FILTER SHUTDOWN PASSED!\n");
+		return 0;
+	}
 
 	obs_register_source(&dummy_cam_info);
 

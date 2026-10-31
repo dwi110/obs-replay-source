@@ -49,7 +49,8 @@ void replay_control_all_mark_reset(void);
 void replay_control_emit_replay_loaded(const char *source_name, int64_t duration_ms);
 void replay_control_emit_save_started(const char *source_name, const char *path, const char *trigger);
 void replay_control_emit_save_finished(const char *source_name, const char *path, bool ok);
-/* Optional hook so the contract layer learns about save jobs. trigger carries the contract job id. */
+/* Optional contract job hook. Replacement/removal waits for in-flight callbacks.
+ * Callbacks must not change their own registration. trigger carries the contract job id. */
 void replay_control_set_save_hook(void (*hook)(const char *trigger, const char *path, bool started, bool ok));
 
 /* Per-source hooks implemented in replay-source.c */

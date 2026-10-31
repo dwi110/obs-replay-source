@@ -4,6 +4,7 @@
 #include <util/darray.h>
 #include <util/dstr.h>
 #include <util/platform.h>
+#include <util/threading.h>
 
 #include "replay-control.h"
 #include "replay-save-queue.h"
@@ -857,17 +858,28 @@ void replay_control_emit_replay_loaded(const char *source_name, int64_t duration
 	obs_data_release(ev);
 }
 
+static pthread_mutex_t g_save_hook_mutex;
 static void (*g_save_hook)(const char *trigger, const char *path, bool started, bool ok);
 
 void replay_control_set_save_hook(void (*hook)(const char *trigger, const char *path, bool started, bool ok))
 {
+	pthread_mutex_lock(&g_save_hook_mutex);
 	g_save_hook = hook;
+	pthread_mutex_unlock(&g_save_hook_mutex);
+}
+
+static void emit_save_hook(const char *trigger, const char *path, bool started, bool ok)
+{
+	/* Unregistration must wait before the contract destroys its mutex and library state. */
+	pthread_mutex_lock(&g_save_hook_mutex);
+	if (g_save_hook)
+		g_save_hook(trigger, path, started, ok);
+	pthread_mutex_unlock(&g_save_hook_mutex);
 }
 
 void replay_control_emit_save_started(const char *source_name, const char *path, const char *trigger)
 {
-	if (g_save_hook)
-		g_save_hook(trigger, path, true, true);
+	emit_save_hook(trigger, path, true, true);
 	if (!g_ctrl.vendor)
 		return;
 	obs_data_t *ev = obs_data_create();
@@ -880,8 +892,7 @@ void replay_control_emit_save_started(const char *source_name, const char *path,
 
 void replay_control_emit_save_finished(const char *source_name, const char *path, bool ok)
 {
-	if (g_save_hook)
-		g_save_hook(NULL, path, false, ok);
+	emit_save_hook(NULL, path, false, ok);
 	if (!g_ctrl.vendor)
 		return;
 	obs_data_t *ev = obs_data_create();
@@ -900,6 +911,9 @@ void replay_control_init(void)
 {
 	if (g_ctrl.initialized)
 		return;
+
+	pthread_mutex_init(&g_save_hook_mutex, NULL);
+	g_save_hook = NULL;
 
 	/* Contract actions (trigger, transport, marks, save) are registered by the MulticamReplay vendor.
 	 * Only approach-specific extras stay under ReplaySource. */
@@ -930,6 +944,9 @@ static void unregister_hotkey_slot(obs_hotkey_id *slot)
 
 void replay_control_shutdown(void)
 {
+	if (!g_ctrl.initialized)
+		return;
+	replay_control_set_save_hook(NULL);
 	unregister_hotkey_slot(&g_ctrl.load_all_hotkey);
 	unregister_hotkey_slot(&g_ctrl.all_normal_speed_hotkey);
 	unregister_hotkey_slot(&g_ctrl.all_half_speed_hotkey);
@@ -945,6 +962,7 @@ void replay_control_shutdown(void)
 
 	g_ctrl.vendor = NULL;
 	_ph = NULL;
+	pthread_mutex_destroy(&g_save_hook_mutex);
 	g_ctrl.initialized = false;
 }
 

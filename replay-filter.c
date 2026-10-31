@@ -221,9 +221,11 @@ static void replay_filter_destroy(void *data)
 	struct replay_filter *filter = data;
 
 	obs_remove_main_render_callback(replay_filter_offscreen_render, filter);
-	pthread_mutex_lock(&filter->mutex);
+	/* close joins the video thread, whose raw callback takes filter->mutex. Drain it before locking
+	 * or releasing its frames/pool, otherwise removal can deadlock with an in-flight capture. */
 	video_output_close(filter->video_output);
 	filter->video_output = NULL;
+	pthread_mutex_lock(&filter->mutex);
 
 	gs_stagesurface_unmap(filter->stagesurface);
 	gs_stagesurface_destroy(filter->stagesurface);
