@@ -4273,9 +4273,12 @@ bool replay_source_seek_ns(struct replay_source *context, uint64_t offset_ns)
 		replay_blend_worker_flush(context->blend_worker);
 	context->previous_frame_timestamp = 0;
 	context->end = false;
+	/* An explicit seek replaces a restart even when no replay scene has rendered yet. */
+	context->restart = false;
 
 	const uint64_t now = obs_get_video_frame_time();
 	const uint64_t ref = (context->pause_timestamp && !context->play) ? context->pause_timestamp : now;
+	context->pause_timestamp = context->play ? 0 : ref;
 	const uint64_t scaled = (uint64_t)((double)offset_ns * 100.0 / context->speed_percent);
 	if (context->backward) {
 		const uint64_t back = context->current_replay.duration > offset_ns

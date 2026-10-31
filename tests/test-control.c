@@ -23,6 +23,7 @@ extern bool obs_module_load(void);
 extern void obs_module_post_load(void);
 extern void obs_module_unload(void);
 extern struct obs_source_info replay_filter_info;
+extern struct obs_source_info replay_source_info;
 extern void replay_filter_raw_video(void *data, struct video_data *frame);
 
 #define CHECK(cond, ...)                                                       \
@@ -243,6 +244,159 @@ static bool call_ws_request(const char *type, obs_data_t *req, obs_data_t *res)
 		return false;
 	entry->callback(req, res, entry->priv_data);
 	return true;
+}
+
+static bool transport_request(const char *type, const char *key, int64_t value)
+{
+	obs_data_t *req = obs_data_create();
+	obs_data_t *res = obs_data_create();
+	if (key) {
+		if (strcmp(key, "speedPercent") == 0)
+			obs_data_set_double(req, key, (double)value);
+		else
+			obs_data_set_int(req, key, value);
+	}
+	const bool ok = call_ws_request(type, req, res) && obs_data_get_bool(res, "ok");
+	obs_data_release(req);
+	obs_data_release(res);
+	return ok;
+}
+
+static int check_seek_position(obs_source_t *source, uint64_t base, uint64_t offset, bool playing, bool backward)
+{
+	obs_data_t *res = obs_data_create();
+	const bool ok = call_ws_request("GetStatus", NULL, res) && obs_data_get_bool(res, "ok");
+	obs_data_t *clip = obs_data_get_obj(res, "clip");
+	const int64_t position = clip ? obs_data_get_int(clip, "playheadMs") : -1;
+	const bool state_ok = strcmp(obs_data_get_string(res, "state"), playing ? "playing" : "paused") == 0;
+	const bool direction_ok = clip && strcmp(obs_data_get_string(clip, "direction"),
+						backward ? "backward" : "forward") == 0;
+	obs_data_release(clip);
+	obs_data_release(res);
+	CHECK(ok && state_ok && direction_ok && llabs(position - (int64_t)(offset / 1000000ULL)) <= 1,
+	      "consumer seek status: position %" PRId64 ", expected %" PRIu64 " ns, playing %d backward %d",
+	      position, offset, playing, backward);
+
+	bool actual_playing = false, ended = true;
+	uint64_t actual = 0;
+	CHECK(replay_source_channel_status(obs_obj_get_data(source), &actual_playing, &ended, NULL, &actual, NULL,
+					  NULL, NULL),
+	      "seek timeline missing");
+	const uint64_t expected = base + offset;
+	const uint64_t diff = actual > expected ? actual - expected : expected - actual;
+	/* Speed scaling uses double; require sub-microsecond timeline accuracy, not exact nanoseconds. */
+	CHECK(diff < 1000 && actual_playing == playing && !ended,
+	      "seek timeline %" PRIu64 ", expected %" PRIu64 ", playing %d ended %d",
+	      actual, expected, actual_playing, ended);
+	return 0;
+}
+
+struct hidden_seek_test {
+	obs_source_t *source;
+	uint64_t base;
+	uint64_t started;
+	bool advancing;
+	int result;
+};
+
+/* Run consumer requests between graphics ticks: no render may consume a pending restart for us. */
+static int check_hidden_seek(struct hidden_seek_test *test)
+{
+	obs_source_t *source = test->source;
+	struct replay_source *ctx = obs_obj_get_data(source);
+	CHECK(!obs_source_showing(source) && !obs_source_active(source), "seek fixture must remain hidden and off program");
+	if (test->advancing) {
+		const uint64_t elapsed = obs_get_video_frame_time() - test->started;
+		CHECK(elapsed > 0 && elapsed < 800000000ULL, "seek playback clock did not advance within clip: %" PRIu64,
+		      elapsed);
+		const uint64_t offset = 600000000ULL - elapsed / 2;
+		CHECK(check_seek_position(source, test->base, offset, true, true) == 0,
+		      "hidden reverse playback did not advance from the seek");
+		replay_source_info.video_tick(ctx, 0.0f);
+		CHECK(check_seek_position(source, test->base, offset, true, true) == 0,
+		      "next playback tick replaced the seek");
+		CHECK(transport_request("Pause", NULL, 0), "Pause after seek playback failed");
+		CHECK(check_seek_position(source, test->base, offset, false, true) == 0,
+		      "Pause lost seek playback time");
+		/* Restore the channel singleton state used by the surrounding contract tests. */
+		CHECK(transport_request("MarkReset", NULL, 0), "seek test MarkReset failed");
+		obs_data_t *req = obs_data_create();
+		obs_data_t *res = obs_data_create();
+		obs_data_set_string(req, "direction", "forward");
+		const bool ok = call_ws_request("SetDirection", req, res) && obs_data_get_bool(res, "ok");
+		obs_data_release(req);
+		obs_data_release(res);
+		CHECK(ok && transport_request("SetSpeed", "speedPercent", 50) &&
+			      transport_request("Restart", NULL, 0), "seek test transport restore failed");
+		return 0;
+	}
+
+	struct replay_source_status initial;
+	CHECK(replay_source_get_status(ctx, &initial), "seek fixture timeline missing");
+	test->base = initial.effective_start_ns;
+	CHECK(transport_request("MarkIn", "positionMs", 200) &&
+		      transport_request("MarkOut", "positionMs", 800), "seek test marks failed");
+	const int speeds[] = {50, 100, 200};
+	const int64_t positions[] = {-100, 200, 600, 800, 2000};
+	const uint64_t expected[] = {200, 200, 600, 800, 800};
+	for (size_t speed = 0; speed < sizeof speeds / sizeof speeds[0]; speed++) {
+		CHECK(transport_request("SetSpeed", "speedPercent", speeds[speed]), "seek test SetSpeed failed");
+		for (int backward = 0; backward < 2; backward++) {
+			obs_data_t *req = obs_data_create();
+			obs_data_t *res = obs_data_create();
+			obs_data_set_string(req, "direction", backward ? "backward" : "forward");
+			const bool ok = call_ws_request("SetDirection", req, res) && obs_data_get_bool(res, "ok");
+			obs_data_release(req);
+			obs_data_release(res);
+			CHECK(ok, "seek test SetDirection failed");
+			CHECK(transport_request("Restart", NULL, 0) && transport_request("Step", "frames", 1) &&
+				      transport_request("Seek", "positionMs", 600), "Step then Seek failed");
+			CHECK(check_seek_position(source, test->base, 600000000ULL, false, backward) == 0,
+			      "paused seek after Step was not applied");
+			/* A seek holds the frame at/before the requested time; step advances from that actual frame. */
+			uint64_t first_frame = 0;
+			CHECK(replay_source_channel_status(ctx, NULL, NULL, NULL, NULL, NULL, &first_frame, NULL),
+			      "seek fixture first frame missing");
+			const uint64_t interval = 1000000000ULL / 60ULL;
+			const uint64_t next_frame = first_frame +
+				((test->base + 600000000ULL - first_frame) / interval + 1) * interval;
+			CHECK(transport_request("Step", "frames", 1), "Step after Seek failed");
+			uint64_t stepped = 0;
+			CHECK(replay_source_channel_status(ctx, NULL, NULL, NULL, &stepped, NULL, NULL, NULL) &&
+				      stepped + 1000 > next_frame && stepped < next_frame + 1000,
+			      "Step did not advance to the next video frame: %" PRIu64 ", expected %" PRIu64,
+			      stepped, next_frame);
+			for (size_t pos = 0; pos < sizeof positions / sizeof positions[0]; pos++) {
+				CHECK(transport_request("Restart", NULL, 0) && transport_request("Pause", NULL, 0) &&
+					      transport_request("Seek", "positionMs", positions[pos]),
+				      "paused seek with pending Restart failed");
+				const uint64_t offset = expected[pos] * 1000000ULL;
+				CHECK(check_seek_position(source, test->base, offset, false, backward) == 0,
+				      "paused seek/mark clamp failed");
+				replay_source_info.video_tick(ctx, 0.0f);
+				CHECK(check_seek_position(source, test->base, offset, false, backward) == 0,
+				      "paused playback tick replaced the seek");
+			}
+			/* Restart leaves an old pause anchor until rendered; Seek must replace that too, and keep playing. */
+			CHECK(transport_request("Restart", NULL, 0) && transport_request("Seek", "positionMs", 600),
+			      "playing seek with pending Restart failed");
+			CHECK(check_seek_position(source, test->base, 600000000ULL, true, backward) == 0,
+			      "playing seek did not replace Restart");
+			replay_source_info.video_tick(ctx, 0.0f);
+			CHECK(check_seek_position(source, test->base, 600000000ULL, true, backward) == 0,
+			      "playing tick replaced the seek");
+		}
+	}
+	CHECK(transport_request("SetSpeed", "speedPercent", 50) &&
+		      transport_request("Seek", "positionMs", 600), "seek clock setup failed");
+	test->started = obs_get_video_frame_time();
+	return 0;
+}
+
+static void hidden_seek_task(void *param)
+{
+	struct hidden_seek_test *test = param;
+	test->result = check_hidden_seek(test);
 }
 
 static size_t count_fake_events(const char *type)
@@ -1262,6 +1416,19 @@ int main(int argc, char **argv)
 	      clip ? obs_data_get_int(clip, "playheadMs") : -1, clip ? obs_data_get_int(clip, "markInMs") : -1);
 	obs_data_release(clip);
 	obs_data_release(st_res);
+
+	/* Keep live video in program while the replay is neither active nor showing. */
+	obs_source_t *previous_program = obs_get_output_source(0);
+	obs_set_output_source(0, cam_a);
+	struct hidden_seek_test seek_test = {.source = rs_a};
+	obs_queue_task(OBS_TASK_GRAPHICS, hidden_seek_task, &seek_test, true);
+	CHECK(seek_test.result == 0, "hidden consumer seek regression failed");
+	os_sleep_ms(100);
+	seek_test.advancing = true;
+	obs_queue_task(OBS_TASK_GRAPHICS, hidden_seek_task, &seek_test, true);
+	obs_set_output_source(0, previous_program);
+	obs_source_release(previous_program);
+	CHECK(seek_test.result == 0, "hidden consumer seek playback regression failed");
 
 	obs_data_t *mark_req = obs_data_create();
 	obs_data_t *mark_res = obs_data_create();
